@@ -2,7 +2,7 @@
 
 A lightweight, self-hosted internet connection monitor with a live web dashboard. Runs in the background and continuously tracks your connection health — no cloud accounts, no telemetry, no subscriptions.
 
-![Dashboard showing ping chart, speed history, and site status tiles](https://placeholder)
+![Dashboard showing ping chart, speed history, and site status tiles](https://github.com/user-attachments/assets/82040b70-5f58-4dfb-b94f-c4c4e83880b6)
 
 ---
 
@@ -27,6 +27,13 @@ Most people only notice their internet is bad when something breaks. This monito
 - Early warning when a specific service (Xbox Live, a streaming service) is degraded before you blame your own connection
 - A baseline sense of whether your speeds are normal for your connection
 - Jitter and latency trends that explain why video calls feel choppy even when "the internet is working"
+
+---
+
+## Why and how this was created
+
+- Last week I was on a Teams call and all 3 members of my family were freaking out, outside my office, that the internet was down. I was on a video call. Live. I needed better data and evidence either to my family, or to my ISP.
+- I put my BSCS (UT Austin '04) to "good use" by not coding for 20 years and now getting the job done with Claude Code. Wow, the times have changed and for the better.
 
 ---
 
