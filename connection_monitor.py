@@ -66,62 +66,50 @@ _DEFAULT_PING_TARGETS = [
     "amazon.com",
 ]
 
-_FRIENDLY_NAMES: Dict[str, str] = {
-    # Streaming
-    "netflix.com":                                    "Netflix",
-    "disneyplus.com":                                 "Disney+",
-    "primevideo.com":                                 "Prime Video",
-    "hulu.com":                                       "Hulu",
-    "hbomax.com":                                     "Max",
-    "max.com":                                        "Max",
-    "peacocktv.com":                                  "Peacock",
-    "paramountplus.com":                              "Paramount+",
-    "appletv.apple.com":                              "Apple TV+",
-    # Google
-    "google.com":                                     "Google",
-    "youtube.com":                                    "YouTube",
-    # Amazon
-    "amazon.com":                                     "Amazon",
-    # Productivity
-    "outlook.office365.com":                          "Outlook 365",
-    "office.com":                                     "Office 365",
-    "teams.microsoft.com":                            "MS Teams",
-    "zoom.us":                                        "Zoom",
-    "slack.com":                                      "Slack",
-    # Music
-    "spotify.com":                                    "Spotify",
-    "music.apple.com":                                "Apple Music",
-    # Xbox / Microsoft
-    "xboxlive.com":                                   "Xbox Live",
-    "login.live.com":                                 "Xbox Auth",
-    # Epic / Fortnite
-    "epicgames.com":                                  "Epic Games",
-    "account-public-service-prod.ol.epicgames.com":   "Fortnite (EOS)",
-}
-
 def _friendly_name(host: str) -> str:
-    """Return a human-friendly display name for a hostname."""
-    if host in _FRIENDLY_NAMES:
-        return _FRIENDLY_NAMES[host]
-    # Auto-generate: strip www., take first label, title-case
+    """Auto-generate a display name from a hostname (fallback when conf has no name)."""
     h = host.removeprefix("www.")
     return h.split(".")[0].replace("-", " ").title()
 
-def load_ping_targets() -> List[str]:
-    """Load site ping targets from config file; write defaults if absent."""
+def load_ping_targets() -> Tuple[List[str], Dict[str, str]]:
+    """Load site ping targets and optional friendly names from config file.
+
+    Each non-comment line is:  hostname [whitespace friendly name]
+    Returns (list_of_hostnames, dict_of_hostname_to_name).
+    """
     if not os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "w") as f:
-            f.write("# Ping targets — one hostname per line; lines starting with # are ignored\n")
+            f.write(
+                "# Connection Monitor — site targets\n"
+                "#\n"
+                "# One entry per line. Format:\n"
+                "#   hostname\n"
+                "#   hostname  Friendly Name\n"
+                "#\n"
+                "# Everything after the first whitespace is used as the display name.\n"
+                "# If no name is given, one is generated from the hostname.\n"
+                "# Lines starting with # are ignored.\n\n"
+            )
             for t in _DEFAULT_PING_TARGETS:
                 f.write(t + "\n")
-        return list(_DEFAULT_PING_TARGETS)
+        return list(_DEFAULT_PING_TARGETS), {}
+
     targets: List[str] = []
+    names: Dict[str, str] = {}
     with open(CONFIG_FILE) as f:
         for line in f:
             line = line.strip()
-            if line and not line.startswith("#"):
-                targets.append(line)
-    return targets if targets else list(_DEFAULT_PING_TARGETS)
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 1)   # split on first whitespace only
+            host = parts[0]
+            targets.append(host)
+            if len(parts) == 2:
+                names[host] = parts[1].strip()
+
+    if not targets:
+        return list(_DEFAULT_PING_TARGETS), {}
+    return targets, names
 
 
 # ─────────────────────────────────────────────────────────────
@@ -189,7 +177,7 @@ class MonitorState:
         self.events: deque = deque(maxlen=500)
 
         # Multi-site accessibility
-        self.site_targets: List[str] = load_ping_targets()
+        self.site_targets, self.site_names = load_ping_targets()
         self.site_states: Dict[str, bool] = {}          # hostname -> currently up?
         self.current_site_outages: Dict[str, OutageRecord] = {}
         self.site_outages: List[Tuple[str, OutageRecord]] = []
@@ -283,6 +271,7 @@ class MonitorState:
             current_provider = self.current_provider
             provider_colors  = dict(self.provider_colors)
             site_targets_snap = list(self.site_targets)[:12]
+            site_names_snap   = dict(self.site_names)
             site_ping_hist_snap = {
                 h: list(self.site_ping_history.get(h, []))
                 for h in site_targets_snap
@@ -513,7 +502,7 @@ class MonitorState:
             p24h, p10_24h, p50_24h, p90_24h = _site_stats(h24h)
             site_matrix.append({
                 "host":    host,
-                "name":    _friendly_name(host),
+                "name":    site_names_snap.get(host) or _friendly_name(host),
                 "up":      site_states_snap.get(host, True),
                 "pct_5m":  p5m,  "p10_5m":  p10_5m,  "p50_5m":  p50_5m,  "p90_5m":  p90_5m,
                 "pct_1h":  p1h,  "p10_1h":  p10_1h,  "p50_1h":  p50_1h,  "p90_1h":  p90_1h,
