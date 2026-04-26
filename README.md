@@ -30,8 +30,9 @@ Most people only notice their internet is bad when something breaks. This monito
 
 ---
 
-## How it was created
+## Why and how this was created
 
+- Last week I was on a Teams call and all 3 members of my family were freaking out, outside my office, that the internet was down. I was on a video call. Live. I needed better data and evidence either to my family, or to my ISP.
 - I put my BSCS (UT Austin '04) to "good use" by not coding for 20 years and now getting the job done with Claude Code. Wow, the times have changed and for the better.
 
 ---
