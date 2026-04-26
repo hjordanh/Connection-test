@@ -30,6 +30,12 @@ Most people only notice their internet is bad when something breaks. This monito
 
 ---
 
+## How it was created
+
+- I put my BSCS (UT Austin '04) to "good use" by not coding for 20 years and now getting the job done with Claude Code. Wow, the times have changed and for the better.
+
+---
+
 ## Requirements
 
 - **Python 3.8+**
