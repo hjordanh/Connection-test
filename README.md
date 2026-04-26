@@ -2,7 +2,7 @@
 
 A lightweight, self-hosted internet connection monitor with a live web dashboard. Runs in the background and continuously tracks your connection health — no cloud accounts, no telemetry, no subscriptions.
 
-![Dashboard showing ping chart, speed history, and site status tiles](https://placeholder)
+![Dashboard showing ping chart, speed history, and site status tiles](https://github.com/user-attachments/assets/82040b70-5f58-4dfb-b94f-c4c4e83880b6)
 
 ---
 
