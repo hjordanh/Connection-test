@@ -38,10 +38,26 @@ def _pip_install(pkg: str) -> None:
     )
 
 try:
-    from flask import Flask, jsonify
+    from flask import Flask, jsonify, request
 except ImportError:
     _pip_install("flask")
-    from flask import Flask, jsonify
+    from flask import Flask, jsonify, request
+
+# Load configuration from connection_monitor.env (next to this script) before
+# reading any constants. Existing shell environment variables take precedence —
+# load_dotenv() only fills in values that aren't already set.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_FILE   = os.path.join(SCRIPT_DIR, "connection_monitor.env")
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    _pip_install("python-dotenv")
+    from dotenv import load_dotenv
+if os.path.exists(ENV_FILE):
+    load_dotenv(ENV_FILE)
+
+import router_log
+import ai_diagnosis
 
 # Optional: speedtest-cli for more accurate measurements
 try:
@@ -50,10 +66,17 @@ try:
 except ImportError:
     SPEEDTEST_AVAILABLE = False
 
-PORT = 8765
-DATA_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "connection_monitor_data.json")
-CONFIG_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ping_targets.conf")
+PORT = int(os.environ.get("PORT", "8765"))
+DATA_FILE    = os.path.join(SCRIPT_DIR, "connection_monitor_data.json")
+CONFIG_FILE  = os.path.join(SCRIPT_DIR, "ping_targets.conf")
 _24H = timedelta(hours=24)
+_30D = timedelta(days=30)
+
+# Router log scraping (all values from connection_monitor.env or shell env).
+GATEWAY_URL            = os.environ.get("GATEWAY_URL", "")
+ROUTER_PACKET_LOG_PATH = os.environ.get("ROUTER_PACKET_LOG_PATH", "")
+ROUTER_SYSLOG_PATH     = os.environ.get("ROUTER_SYSLOG_PATH", "")
+ROUTER_POLL_INTERVAL   = int(os.environ.get("ROUTER_POLL_INTERVAL", "30"))
 
 _DEFAULT_PING_TARGETS = [
     "netflix.com",
@@ -197,6 +220,21 @@ class MonitorState:
             "#d29922", "#f85149", "#e3b341", "#79c0ff",
         ]
 
+        # Daily history (7-day uptime chart)
+        self.daily_history: List[Dict] = []
+
+        # Router log scraper — stores router_log.RouterEvent objects
+        self.router_events: deque = deque(maxlen=5000)
+        self.last_router_poll: Optional[datetime] = None
+        self.router_poll_error: Optional[str] = None
+        self._router_warned_at: Optional[datetime] = None
+
+        # AI diagnosis — rolling 30-day history, newest first.
+        # Each entry is the dict returned by ai_diagnosis.diagnose() with an
+        # added "id" field (millisecond timestamp string).
+        self.diagnoses: deque = deque(maxlen=500)
+        self.diagnosis_in_progress: bool = False
+
         # Timing
         self.start_time: datetime = datetime.now()
 
@@ -277,6 +315,11 @@ class MonitorState:
                 for h in site_targets_snap
             }
             site_states_snap = dict(self.site_states)
+            daily_history_snap = list(self.daily_history)
+            router_events_snap = list(self.router_events)
+            router_poll_error_snap = self.router_poll_error
+            last_router_poll_snap = self.last_router_poll
+            last_diagnosis_snap = self.diagnoses[0] if self.diagnoses else None
 
         now = datetime.now()
         runtime_secs = (now - start_time).total_seconds()
@@ -509,6 +552,31 @@ class MonitorState:
                 "pct_24h": p24h, "p10_24h": p10_24h, "p50_24h": p50_24h, "p90_24h": p90_24h,
             })
 
+        # Build 7-day calendar array for chart
+        now_date = now.date()
+        uptime_7d = []
+        hist_by_date = {e["date"]: e for e in daily_history_snap}
+        for d_offset in range(6, -1, -1):
+            day = now_date - timedelta(days=d_offset)
+            day_str = day.strftime("%Y-%m-%d")
+            entry = hist_by_date.get(day_str)
+            month = day.month
+            dom = day.day
+            date_label = f"{month}/{dom}"
+            if entry:
+                uptime_7d.append({
+                    "label": day.strftime("%a"),
+                    "date":  date_label,
+                    "uptime_pct": entry["uptime_pct"],
+                    "p10": entry["p10"], "p50": entry["p50"], "p90": entry["p90"],
+                })
+            else:
+                uptime_7d.append({
+                    "label": day.strftime("%a"),
+                    "date":  date_label,
+                    "uptime_pct": None, "p10": None, "p50": None, "p90": None,
+                })
+
         return {
             "connected": connected,
             "last_ping_ms": round(last_ping, 1) if last_ping else None,
@@ -598,6 +666,9 @@ class MonitorState:
             "provider_colors": provider_colors,
             "uptime_pct_24h": uptime_pct_24h,
             "site_matrix": site_matrix,
+            "uptime_7d": uptime_7d,
+            "router": _router_stats(router_events_snap, last_router_poll_snap, router_poll_error_snap, now),
+            "last_diagnosis_at": (last_diagnosis_snap.get("evaluated_at") if last_diagnosis_snap else None),
         }
 
 
@@ -849,6 +920,65 @@ def save_state(state: MonitorState) -> None:
             ]
             provider_uptime = dict(state.provider_uptime_secs)
             provider_colors = dict(state.provider_colors)
+            current_outage = state.current_outage
+            daily_history_snap = list(state.daily_history)
+            router_events_to_save = [
+                ev.to_dict()
+                for ev in state.router_events
+                if ev.timestamp >= cutoff.isoformat()
+            ]
+            cutoff_30d_iso = (datetime.now() - _30D).isoformat()
+            diagnoses_to_save = [
+                d for d in state.diagnoses
+                if (d.get("evaluated_at") or "") >= cutoff_30d_iso
+            ]
+
+        # Compute today's daily summary
+        now_dt = datetime.now()
+        today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_str = today_start.strftime("%Y-%m-%d")
+
+        # Today's outage seconds (from the outages list already read + current_outage)
+        all_today = [o for o in outages if o["start"][:10] == today_str]
+        today_outage_secs = 0.0
+        for o_dict in all_today:
+            o_start = max(datetime.fromisoformat(o_dict["start"]), today_start)
+            o_end_raw = datetime.fromisoformat(o_dict["end"]) if o_dict.get("end") else now_dt
+            o_end = min(o_end_raw, now_dt)
+            if o_end > o_start:
+                today_outage_secs += (o_end - o_start).total_seconds()
+        # Also account for ongoing outage
+        if current_outage and current_outage.start.date() == now_dt.date():
+            o_start = max(current_outage.start, today_start)
+            today_outage_secs += (now_dt - o_start).total_seconds()
+
+        today_window = (now_dt - today_start).total_seconds()
+        today_uptime = round(max(0.0, (today_window - today_outage_secs) / today_window * 100), 2) if today_window > 0 else 100.0
+
+        # Today's pings from the ping_ts list already read in save_state
+        today_pings = sorted(v for ts, v in ping_ts if datetime.fromisoformat(ts) >= today_start)
+
+        def _pct_simple(sorted_vals, p):
+            n = len(sorted_vals)
+            if n == 1:
+                return sorted_vals[0]
+            idx = p / 100 * (n - 1)
+            lo, hi = int(idx), min(int(idx) + 1, n - 1)
+            return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (idx - lo)
+
+        p10_t = round(_pct_simple(today_pings, 10), 1) if len(today_pings) >= 2 else None
+        p50_t = round(_pct_simple(today_pings, 50), 1) if len(today_pings) >= 2 else None
+        p90_t = round(_pct_simple(today_pings, 90), 1) if len(today_pings) >= 2 else None
+
+        today_entry = {"date": today_str, "uptime_pct": today_uptime,
+                       "p10": p10_t, "p50": p50_t, "p90": p90_t}
+
+        cutoff_7d_str = (now_dt - timedelta(days=7)).strftime("%Y-%m-%d")
+        hist_dict = {e["date"]: e for e in daily_history_snap if e["date"] > cutoff_7d_str}
+        hist_dict[today_str] = today_entry
+        new_daily_history = sorted(hist_dict.values(), key=lambda e: e["date"])
+        with state.lock:
+            state.daily_history = new_daily_history
 
         data = {
             "speed_history": speed,
@@ -857,6 +987,9 @@ def save_state(state: MonitorState) -> None:
             "ping_accessibility_ts": access_ts,
             "provider_uptime_secs": provider_uptime,
             "provider_colors": provider_colors,
+            "daily_history": new_daily_history,
+            "router_events": router_events_to_save,
+            "diagnoses": diagnoses_to_save,
             "saved_at": datetime.now().isoformat(),
         }
         tmp = DATA_FILE + ".tmp"
@@ -908,6 +1041,23 @@ def load_state(state: MonitorState) -> None:
             if datetime.fromisoformat(ts) >= cutoff
         ]
 
+        router_events_loaded: List = []
+        for r in data.get("router_events", []):
+            ts = r.get("ts", "")
+            try:
+                if ts and datetime.fromisoformat(ts) < cutoff:
+                    continue
+            except ValueError:
+                continue
+            router_events_loaded.append(router_log.RouterEvent(
+                timestamp=ts,
+                src=r.get("src", ""),
+                dst=r.get("dst", ""),
+                proto=r.get("proto", ""),
+                reason=r.get("reason", ""),
+                source=r.get("source", "packet"),
+            ))
+
         with state.lock:
             state.speed_history = speed
             state.outages = outages
@@ -915,6 +1065,18 @@ def load_state(state: MonitorState) -> None:
             state.ping_accessibility_ts = deque(access_ts, maxlen=43200)
             state.provider_uptime_secs = data.get("provider_uptime_secs", {})
             state.provider_colors = data.get("provider_colors", {})
+            state.daily_history = data.get("daily_history", [])
+            state.router_events = deque(router_events_loaded, maxlen=5000)
+            cutoff_30d_iso = (datetime.now() - _30D).isoformat()
+            history_raw = data.get("diagnoses")
+            if history_raw is None:
+                # Backward-compat: previous schema stored a single last_diagnosis.
+                legacy = data.get("last_diagnosis")
+                history_raw = [legacy] if legacy else []
+            state.diagnoses = deque(
+                (d for d in history_raw if (d.get("evaluated_at") or "") >= cutoff_30d_iso),
+                maxlen=500,
+            )
             if speed:
                 state.last_speed_test = max(s.timestamp for s in speed)
                 successes = [s for s in speed if s.label != "Outage"]
@@ -979,6 +1141,100 @@ def persistence_thread(state: MonitorState) -> None:
         time.sleep(60)
         if state.running:
             save_state(state)
+
+
+def _router_stats(events: List, last_poll: Optional[datetime],
+                  poll_error: Optional[str], now: datetime) -> dict:
+    """Summarize router_events for the dashboard /api/state response."""
+    if not events and last_poll is None:
+        return {
+            "available": False,
+            "poll_error": poll_error,
+            "last_poll": None,
+            "count_1h": 0,
+            "count_24h": 0,
+            "dns_drops_1h": 0,
+            "dns_drops_24h": 0,
+        }
+    cutoff_1h_iso = (now - timedelta(hours=1)).isoformat()
+    cutoff_24h_iso = (now - timedelta(hours=24)).isoformat()
+    c1 = c24 = d1 = d24 = 0
+    for ev in events:
+        is_24h = ev.timestamp >= cutoff_24h_iso
+        is_1h  = ev.timestamp >= cutoff_1h_iso
+        if is_24h:
+            c24 += 1
+            if ev.dst in router_log.DNS_PROBE_TARGETS and "Invalid" in ev.reason:
+                d24 += 1
+        if is_1h:
+            c1 += 1
+            if ev.dst in router_log.DNS_PROBE_TARGETS and "Invalid" in ev.reason:
+                d1 += 1
+    return {
+        "available": True,
+        "poll_error": poll_error,
+        "last_poll": last_poll.isoformat(timespec="seconds") if last_poll else None,
+        "count_1h": c1,
+        "count_24h": c24,
+        "dns_drops_1h": d1,
+        "dns_drops_24h": d24,
+    }
+
+
+def router_log_thread(state: MonitorState) -> None:
+    """Poll the gateway's log pages every ROUTER_POLL_INTERVAL seconds and
+    append new events to state.router_events. Disabled if GATEWAY_URL is empty."""
+    if not GATEWAY_URL or not ROUTER_PACKET_LOG_PATH:
+        state.log("Router log scraping disabled (set GATEWAY_URL and ROUTER_PACKET_LOG_PATH in connection_monitor.env)", "info")
+        return
+
+    time.sleep(8)  # stagger after startup
+    while state.running:
+        try:
+            events = router_log.fetch_and_parse(
+                GATEWAY_URL,
+                packet_path=ROUTER_PACKET_LOG_PATH,
+                syslog_path=ROUTER_SYSLOG_PATH,
+                timeout=5.0,
+            )
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            should_warn = False
+            with state.lock:
+                state.router_poll_error = err
+                if (state._router_warned_at is None
+                        or (datetime.now() - state._router_warned_at).total_seconds() >= 60):
+                    state._router_warned_at = datetime.now()
+                    should_warn = True
+            if should_warn:
+                state.log(f"Router log fetch failed: {err}", "warning")
+            time.sleep(ROUTER_POLL_INTERVAL)
+            continue
+
+        with state.lock:
+            existing_keys = {ev.key() for ev in state.router_events}
+            fresh = router_log.dedupe(existing_keys, events)
+            for ev in fresh:
+                state.router_events.append(ev)
+            state.last_router_poll = datetime.now()
+            had_error = state.router_poll_error
+            state.router_poll_error = None
+
+        if had_error:
+            state.log("Router log fetch recovered", "success")
+        if fresh:
+            # Surface gateway-side rejection of monitor probes immediately.
+            dns_drops = [
+                ev for ev in fresh
+                if ev.dst in router_log.DNS_PROBE_TARGETS and "Invalid" in ev.reason
+            ]
+            if dns_drops:
+                state.log(
+                    f"Gateway rejected {len(dns_drops)} probe packet(s) to DNS targets",
+                    "warning",
+                )
+
+        time.sleep(ROUTER_POLL_INTERVAL)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1277,11 +1533,30 @@ tr:last-child td { border-bottom: none; }
   height: 180px;
 }
 
+/* ── Log link ───────────────────────────────────────────────── */
+.log-link {
+  display: inline-block;
+  padding: 5px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  text-decoration: none;
+  margin-right: 8px;
+  transition: color 0.15s, border-color 0.15s;
+}
+.log-link:hover { color: var(--blue); border-color: var(--blue); }
+
 /* ── Chart split-view layout ────────────────────────────────── */
 .chart-controls-row {
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  gap: 8px;
   padding: 0;
   margin-bottom: 0;
   min-height: 0;
@@ -1328,6 +1603,9 @@ tr:last-child td { border-bottom: none; }
 .ping-panels.view-5m  #panel-24h { display: none; }
 @media (max-width: 700px) {
   .ping-panels { flex-direction: column; }
+  .chart-divider { display: none !important; }
+  .chart-panel { overflow: visible; flex: 0 0 auto; width: 100%; }
+  .speed-row { flex-direction: column; }
 }
 
 /* ── Side-by-side upload / download row ─────────────────────── */
@@ -1521,6 +1799,14 @@ tr:last-child td { border-bottom: none; }
       <span class="stat-label">Next speed test</span>
       <span class="stat-value" id="stat-next-test" style="color:var(--dim)">—</span>
     </div>
+    <div class="stat-row">
+      <span class="stat-label">Router rejections (1h)</span>
+      <span class="stat-value" id="stat-router-1h" style="color:var(--dim)">—</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">↳ to DNS probes</span>
+      <span class="stat-value" id="stat-router-dns" style="color:var(--dim)">—</span>
+    </div>
     <div id="speed-status"></div>
   </div>
 
@@ -1532,19 +1818,23 @@ tr:last-child td { border-bottom: none; }
     </div>
   </div>
 
-  <!-- ── Outage History (top right) ─────────────────────────── -->
+  <!-- ── 7-Day Uptime Chart ─────────────────────────────────── -->
   <div class="card col-3">
-    <div class="card-title">Outage History</div>
-    <table>
-      <thead><tr><th>Started</th><th>Ended</th><th style="text-align:right">Duration</th></tr></thead>
-      <tbody id="outage-tbody">
-        <tr><td colspan="3" style="color:var(--dim)">None detected</td></tr>
-      </tbody>
-    </table>
+    <div class="card-title">7-Day Uptime</div>
+    <div class="chart-wrap" style="height:160px"><canvas id="uptimeChart"></canvas></div>
+    <a href="/diagnose" id="diag-link" style="display:block;margin-top:10px;padding:8px 10px;
+        text-align:center;background:var(--bg);border:1px solid var(--border);
+        border-radius:5px;color:var(--blue);text-decoration:none;font-size:12px">
+      AI-assisted diagnostics →
+    </a>
+    <div id="diag-last-run" style="color:var(--dim);font-size:10px;text-align:center;margin-top:4px">
+      Never run
+    </div>
   </div>
 
   <!-- ── Chart view toggle ────────────────────────────────────── -->
   <div class="chart-controls-row col-12">
+    <a class="log-link" href="/log" target="_blank">Log</a>
     <div class="chart-view-toggle">
       <button id="btn-view-5m"    onclick="setChartView('5m')">5m</button>
       <button id="btn-view-split" onclick="setChartView('split')" class="active">Split</button>
@@ -1587,38 +1877,6 @@ tr:last-child td { border-bottom: none; }
     </div>
   </div>
 
-  <!-- ── Mobile tab bar ───────────────────────────────────────── -->
-  <div class="tab-bar" id="tab-bar">
-    <button class="tab-active" onclick="showTab('speed', this)">Speed</button>
-    <button onclick="showTab('events', this)">Events</button>
-  </div>
-
-  <!-- ── Speed Measurements Table ──────────────────────────── -->
-  <div class="card col-8 tab-panel tab-active" id="tab-speed">
-    <div class="card-title">Speed Measurements — last hour</div>
-    <table>
-      <thead><tr>
-        <th>Time</th><th>Label</th><th>Provider</th>
-        <th style="text-align:right">Download</th>
-        <th style="text-align:right">Upload</th>
-        <th style="text-align:right">Ping</th>
-      </tr></thead>
-      <tbody id="speed-tbody">
-        <tr><td colspan="6" style="color:var(--dim)">Waiting for first speed test…</td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <!-- ── Event Log ─────────────────────────────────────────── -->
-  <div class="card col-4 tab-panel" id="tab-events">
-    <div class="card-title">Event Log — last hour</div>
-    <table>
-      <thead><tr><th style="width:58px">Time</th><th>Event</th></tr></thead>
-      <tbody id="event-tbody">
-        <tr><td colspan="2" style="color:var(--dim)">—</td></tr>
-      </tbody>
-    </table>
-  </div>
 
 </div><!-- /.grid -->
 
@@ -1829,11 +2087,89 @@ function makeSpeedBarConfig(label, defaultColor) {
   };
 }
 
+const sharedPlugins = {
+  legend: sharedLegend,
+  tooltip: sharedTooltip,
+};
+
 const pingChart24h    = new Chart(document.getElementById('pingChart24h'),    makePingConfig24h());
 const pingChart5m     = new Chart(document.getElementById('pingChart5m'),     makePingConfig5m());
 const uploadChartCombined   = new Chart(document.getElementById('uploadChartCombined'),   makeSpeedBarConfig('↑ Upload (Mbps)',   '#3fb950'));
 const downloadChartCombined = new Chart(document.getElementById('downloadChartCombined'), makeSpeedBarConfig('↓ Download (Mbps)', '#58a6ff'));
-const allCharts = [pingChart24h, pingChart5m, uploadChartCombined, downloadChartCombined];
+
+const uptimeChart = new Chart(document.getElementById('uptimeChart'), {
+  type: 'bar',
+  data: {
+    labels: [],
+    datasets: [
+      {
+        type: 'bar',
+        label: 'Uptime %',
+        data: [],
+        backgroundColor: [],
+        borderWidth: 0,
+        borderRadius: 3,
+        yAxisID: 'y',
+      },
+      {
+        type: 'line', label: 'p10 ping', data: [], showLine: false,
+        pointRadius: 3, pointHoverRadius: 5,
+        borderColor: 'rgba(57,197,207,0.5)', backgroundColor: 'rgba(57,197,207,0.5)',
+        yAxisID: 'y1',
+      },
+      {
+        type: 'line', label: 'p50 ping', data: [], showLine: false,
+        pointRadius: 5, pointHoverRadius: 7,
+        borderColor: '#39c5cf', backgroundColor: '#39c5cf',
+        yAxisID: 'y1',
+      },
+      {
+        type: 'line', label: 'p90 ping', data: [], showLine: false,
+        pointRadius: 3, pointHoverRadius: 5,
+        borderColor: 'rgba(57,197,207,0.35)', backgroundColor: 'rgba(57,197,207,0.35)',
+        yAxisID: 'y1',
+      },
+    ],
+  },
+  options: {
+    responsive: true, maintainAspectRatio: false, animation: false,
+    plugins: {
+      ...sharedPlugins,
+      legend: { display: false },
+      tooltip: {
+        ...sharedTooltip,
+        callbacks: {
+          title: ctx => ctx[0]?.label || '',
+          afterBody: ctx => {
+            const i = ctx[0]?.dataIndex;
+            const d = uptimeChart._days?.[i];
+            if (!d) return [];
+            const lines = [`Uptime: ${d.uptime_pct != null ? d.uptime_pct + '%' : '—'}`];
+            if (d.p10 != null) lines.push(`p10: ${d.p10}ms  p50: ${d.p50}ms  p90: ${d.p90}ms`);
+            return lines;
+          },
+          label: () => '',
+        },
+      },
+    },
+    scales: {
+      x: { ...sharedScaleX },
+      y: {
+        position: 'left', min: 0, max: 100,
+        ticks: { ...sharedScaleY.ticks, callback: v => v + '%' },
+        grid: sharedScaleY.grid,
+        title: { display: false },
+      },
+      y1: {
+        position: 'right', min: 0,
+        ticks: { ...sharedScaleY.ticks, callback: v => v + 'ms' },
+        grid: { drawOnChartArea: false },
+      },
+    },
+  },
+});
+
+const allCharts = [pingChart24h, pingChart5m, uploadChartCombined, downloadChartCombined, uptimeChart];
 
 // ── Chart view toggle ─────────────────────────────────────────
 let currentView = 'split';
@@ -1987,6 +2323,25 @@ function update(d) {
   );
   setEl('speed-status', d.speed_in_progress ? (d.speed_status || 'Testing…') : '');
 
+  // ── AI diagnostics "last run" ────────────────────────────────
+  updateDiagLastRun(d.last_diagnosis_at);
+
+  // ── Router rejections tile ───────────────────────────────────
+  const r = d.router || {};
+  if (r.available) {
+    setEl('stat-router-1h', String(r.count_1h || 0));
+    const dnsEl = document.getElementById('stat-router-dns');
+    if (dnsEl) {
+      dnsEl.textContent = String(r.dns_drops_1h || 0);
+      dnsEl.style.color = (r.dns_drops_1h > 0) ? 'var(--red)' : 'var(--dim)';
+    }
+    document.getElementById('stat-router-1h').style.color =
+      (r.count_1h > 50) ? 'var(--yellow)' : 'var(--dim)';
+  } else if (r.poll_error) {
+    setEl('stat-router-1h', 'err');
+    setEl('stat-router-dns', '—');
+  }
+
   // ── 24h Ping chart: hourly stacked bars + % accessible ───────
   if (d.ping_hourly && d.ping_hourly.length > 0) {
     const raw = d.ping_hourly;
@@ -2043,22 +2398,23 @@ function update(d) {
     updateBandwidthCharts(d, currentView);
   }
 
-  const sh1h = d.speed_history_1h || [];
-  if (sh1h.length > 0) {
-    const rows = [...sh1h].reverse().map(s => {
-      const provColor = pc[s.provider] || 'var(--magenta)';
-      return `<tr>
-        <td>${s.timestamp}</td>
-        <td><span class="badge badge-blue">${s.label}</span></td>
-        <td style="color:${provColor}">${s.provider || '—'}</td>
-        <td style="text-align:right;color:var(--cyan)">↓ ${s.download_mbps}</td>
-        <td style="text-align:right;color:var(--green)">↑ ${s.upload_mbps}</td>
-        <td style="text-align:right;color:var(--dim)">${s.ping_ms ? s.ping_ms + ' ms' : '—'}</td>
-      </tr>`;
-    }).join('');
-    setEl('speed-tbody', rows);
-  } else {
-    setEl('speed-tbody', '<tr><td colspan="6" style="color:var(--dim)">No tests in the last hour</td></tr>');
+  // 7-day uptime chart
+  if (d.uptime_7d && d.uptime_7d.length > 0) {
+    const days = d.uptime_7d;
+    uptimeChart._days = days;
+    uptimeChart.data.labels = days.map(d => `${d.label}\n${d.date}`);
+    uptimeChart.data.datasets[0].data = days.map(d => d.uptime_pct);
+    uptimeChart.data.datasets[0].backgroundColor = days.map(d => {
+      if (d.uptime_pct == null) return 'rgba(139,148,158,0.2)';
+      if (d.uptime_pct >= 99.9) return 'rgba(63,185,80,0.7)';
+      if (d.uptime_pct >= 99)   return 'rgba(63,185,80,0.4)';
+      if (d.uptime_pct >= 95)   return 'rgba(210,153,34,0.6)';
+      return 'rgba(248,81,73,0.6)';
+    });
+    uptimeChart.data.datasets[1].data = days.map(d => d.p10);
+    uptimeChart.data.datasets[2].data = days.map(d => d.p50);
+    uptimeChart.data.datasets[3].data = days.map(d => d.p90);
+    uptimeChart.update('none');
   }
 
   // Site status matrix
@@ -2136,47 +2492,22 @@ function update(d) {
     setEl('site-matrix', tiles);
   }
 
-  // Outage table
-  if (d.outages && d.outages.length > 0) {
-    const rows = d.outages.slice().reverse().map(o => {
-      const endCell = o.ongoing
-        ? '<span class="badge badge-red">ongoing</span>'
-        : (o.end || '—');
-      const durStyle = o.ongoing ? 'color:var(--red)' : 'color:var(--yellow)';
-      return `<tr>
-        <td>${o.start}</td>
-        <td>${endCell}</td>
-        <td style="text-align:right;${durStyle}">${o.duration_str}</td>
-      </tr>`;
-    }).join('');
-    setEl('outage-tbody', rows);
-  } else {
-    setEl('outage-tbody',
-      '<tr><td colspan="3" style="color:var(--dim)">None detected</td></tr>');
-  }
-
-  // Event log
-  if (d.events && d.events.length > 0) {
-    const palette = { success: 'var(--green)', error: 'var(--red)',
-                      warning: 'var(--yellow)', info: 'var(--text)' };
-    const rows = d.events.map(e => `<tr>
-      <td style="color:var(--dim)">${e.ts}</td>
-      <td style="color:${palette[e.level] || 'var(--text)'}">${e.msg}</td>
-    </tr>`).join('');
-    setEl('event-tbody', rows);
-  }
 }
 
-// ── Mobile tab switching ──────────────────────────────────────
-function showTab(name, btn) {
-  ['speed', 'events'].forEach(id => {
-    const panel = document.getElementById('tab-' + id);
-    if (panel) panel.classList.remove('tab-active');
-  });
-  const active = document.getElementById('tab-' + name);
-  if (active) active.classList.add('tab-active');
-  document.querySelectorAll('#tab-bar button').forEach(b => b.classList.remove('tab-active'));
-  if (btn) btn.classList.add('tab-active');
+// ── AI Diagnostics last-run subtext ──────────────────────────
+function fmtRelative(iso) {
+  if (!iso) return 'Never run';
+  const then = new Date(iso);
+  if (isNaN(then.getTime())) return 'Never run';
+  const secs = Math.floor((Date.now() - then.getTime()) / 1000);
+  if (secs < 60)   return 'Last run: just now';
+  if (secs < 3600) return 'Last run: ' + Math.floor(secs / 60) + 'm ago';
+  if (secs < 86400) return 'Last run: ' + Math.floor(secs / 3600) + 'h ago';
+  return 'Last run: ' + Math.floor(secs / 86400) + 'd ago';
+}
+function updateDiagLastRun(iso) {
+  const el = document.getElementById('diag-last-run');
+  if (el) el.textContent = fmtRelative(iso);
 }
 
 // ── Polling loop ──────────────────────────────────────────────
@@ -2191,8 +2522,634 @@ async function poll() {
   }
 }
 
+// On narrow screens default to single-panel (5m) so charts always have full width
+if (window.innerWidth <= 700) setChartView('5m');
+
+// Re-fit charts on resize / orientation change
+window.addEventListener('resize', () => allCharts.forEach(c => c.resize()));
+
 poll();
 setInterval(poll, 2000);
+</script>
+</body>
+</html>
+"""
+
+
+LOG_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Connection Monitor — Log</title>
+<style>
+:root {
+  --bg:      #0d1117;
+  --card:    #161b22;
+  --border:  #30363d;
+  --text:    #e6edf3;
+  --dim:     #8b949e;
+  --green:   #3fb950;
+  --red:     #f85149;
+  --yellow:  #d29922;
+  --blue:    #58a6ff;
+  --cyan:    #39c5cf;
+  --magenta: #bc8cff;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, 'SF Mono', 'Fira Code', monospace;
+  font-size: 13px;
+  padding: 14px;
+  min-height: 100vh;
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+.header-title { font-weight: 700; font-size: 13px; letter-spacing: 0.05em; }
+.spacer { flex: 1; }
+#last-updated { color: var(--dim); font-size: 11px; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  margin-bottom: 12px;
+}
+.card-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--dim);
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+table { width: 100%; border-collapse: collapse; }
+th {
+  text-align: left;
+  color: var(--dim);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0 8px 8px 0;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+td {
+  padding: 5px 8px 5px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  vertical-align: middle;
+  font-size: 12px;
+}
+tr:last-child td { border-bottom: none; }
+.badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.badge-green   { background: rgba(63,185,80,0.15);  color: var(--green); }
+.badge-red     { background: rgba(248,81,73,0.15);  color: var(--red); }
+.badge-yellow  { background: rgba(210,153,34,0.15); color: var(--yellow); }
+.badge-blue    { background: rgba(88,166,255,0.15); color: var(--blue); }
+.badge-dim     { background: rgba(139,148,158,0.15); color: var(--dim); }
+a.back-link {
+  display: inline-block;
+  padding: 5px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--dim);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  text-decoration: none;
+  transition: color 0.15s, border-color 0.15s;
+}
+a.back-link:hover { color: var(--blue); border-color: var(--blue); }
+</style>
+</head>
+<body>
+<header>
+  <span class="header-title">Connection Monitor — Log</span>
+  <div class="spacer"></div>
+  <a class="back-link" href="/">Dashboard</a>
+  &nbsp;
+  <span id="last-updated">Loading…</span>
+</header>
+
+<div class="card">
+  <div class="card-title">Speed Tests — last 24h</div>
+  <table>
+    <thead><tr>
+      <th>Time</th><th>Label</th><th>Provider</th>
+      <th style="text-align:right">Download</th>
+      <th style="text-align:right">Upload</th>
+      <th style="text-align:right">Ping</th>
+    </tr></thead>
+    <tbody id="speed-tbody">
+      <tr><td colspan="6" style="color:var(--dim)">Loading…</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <div class="card-title">Outages — last 24h</div>
+  <table>
+    <thead><tr>
+      <th>Started</th><th>Ended</th><th style="text-align:right">Duration</th>
+    </tr></thead>
+    <tbody id="outage-tbody">
+      <tr><td colspan="3" style="color:var(--dim)">Loading…</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <div class="card-title">Event Log — up to 500 events</div>
+  <table>
+    <thead><tr>
+      <th style="width:80px">Time</th><th style="width:80px">Level</th><th>Message</th>
+    </tr></thead>
+    <tbody id="event-tbody">
+      <tr><td colspan="3" style="color:var(--dim)">Loading…</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<script>
+function setEl(id, html) {
+  const el = document.getElementById(id);
+  if (el) el.innerHTML = html;
+}
+
+async function poll() {
+  try {
+    const resp = await fetch('/api/log');
+    if (!resp.ok) return;
+    const d = await resp.json();
+
+    document.getElementById('last-updated').textContent =
+      'Updated ' + new Date().toLocaleTimeString();
+
+    // Speed tests
+    if (d.speed && d.speed.length > 0) {
+      const rows = d.speed.map(s => `<tr>
+        <td style="color:var(--dim)">${s.ts}</td>
+        <td><span class="badge badge-blue">${s.label || '—'}</span></td>
+        <td style="color:var(--magenta)">${s.provider || '—'}</td>
+        <td style="text-align:right;color:var(--cyan)">&#8595; ${s.dl} Mbps</td>
+        <td style="text-align:right;color:var(--green)">&#8593; ${s.ul} Mbps</td>
+        <td style="text-align:right;color:var(--dim)">${s.ping ? s.ping + ' ms' : '—'}</td>
+      </tr>`).join('');
+      setEl('speed-tbody', rows);
+    } else {
+      setEl('speed-tbody', '<tr><td colspan="6" style="color:var(--dim)">No speed tests recorded</td></tr>');
+    }
+
+    // Outages
+    if (d.outages && d.outages.length > 0) {
+      const rows = d.outages.map(o => {
+        const endCell = o.ongoing
+          ? '<span class="badge badge-red">ongoing</span>'
+          : (o.end || '—');
+        const durStyle = o.ongoing ? 'color:var(--red)' : 'color:var(--yellow)';
+        return `<tr>
+          <td>${o.start}</td>
+          <td>${endCell}</td>
+          <td style="text-align:right;${durStyle}">${o.duration}</td>
+        </tr>`;
+      }).join('');
+      setEl('outage-tbody', rows);
+    } else {
+      setEl('outage-tbody', '<tr><td colspan="3" style="color:var(--dim)">None recorded</td></tr>');
+    }
+
+    // Events
+    if (d.events && d.events.length > 0) {
+      const lvlBadge = {
+        success: 'badge-green',
+        error:   'badge-red',
+        warning: 'badge-yellow',
+        info:    'badge-dim',
+      };
+      const rows = d.events.map(e => `<tr>
+        <td style="color:var(--dim)">${e.ts.substring(11, 19)}</td>
+        <td><span class="badge ${lvlBadge[e.level] || 'badge-dim'}">${e.level}</span></td>
+        <td>${e.msg}</td>
+      </tr>`).join('');
+      setEl('event-tbody', rows);
+    } else {
+      setEl('event-tbody', '<tr><td colspan="3" style="color:var(--dim)">No events</td></tr>');
+    }
+  } catch {
+    document.getElementById('last-updated').textContent = 'Error fetching data';
+  }
+}
+
+poll();
+setInterval(poll, 5000);
+</script>
+</body>
+</html>
+"""
+
+
+DIAGNOSE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Connection Monitor — AI Diagnosis</title>
+<style>
+:root {
+  --bg:      #0d1117;
+  --card:    #161b22;
+  --border:  #30363d;
+  --text:    #e6edf3;
+  --dim:     #8b949e;
+  --green:   #3fb950;
+  --red:     #f85149;
+  --yellow:  #d29922;
+  --blue:    #58a6ff;
+  --cyan:    #39c5cf;
+  --magenta: #bc8cff;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, 'SF Mono', 'Fira Code', monospace;
+  font-size: 13px;
+  padding: 14px;
+  min-height: 100vh;
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+.header-title { font-weight: 700; font-size: 13px; letter-spacing: 0.05em; }
+.spacer { flex: 1; }
+.back-link {
+  color: var(--blue);
+  text-decoration: none;
+  font-size: 12px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.back-link:hover { background: var(--card); border-color: var(--blue); }
+.run-controls { display: flex; gap: 6px; align-items: center; }
+.run-controls .label { color: var(--dim); font-size: 11px; }
+.run-btn, .back-link {
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 5px;
+  padding: 5px 10px; font-family: inherit; font-size: 12px; cursor: pointer;
+}
+.run-btn:hover { border-color: var(--blue); color: var(--blue); }
+.run-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+#run-status { color: var(--dim); font-size: 11px; margin-left: 8px; }
+
+.layout {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 12px;
+  min-height: calc(100vh - 90px);
+}
+@media (max-width: 700px) {
+  .layout { grid-template-columns: 1fr; }
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+}
+.card-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--dim);
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+#history { max-height: calc(100vh - 110px); overflow-y: auto; }
+.day-header {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+  padding: 10px 0 4px 0;
+}
+.day-header:first-child { padding-top: 0; }
+.history-item {
+  display: block;
+  padding: 8px 10px;
+  margin: 2px 0;
+  border-radius: 5px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.history-item:hover { background: rgba(255,255,255,0.03); }
+.history-item.selected {
+  background: rgba(88,166,255,0.08);
+  border-color: var(--blue);
+}
+.history-item .row1 {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 12px;
+  margin-bottom: 2px;
+}
+.history-item .time { font-weight: 600; }
+.history-item .window { color: var(--dim); font-size: 11px; }
+.history-item .severity {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.sev-NONE     { color: var(--green); }
+.sev-MINOR    { color: var(--cyan); }
+.sev-MODERATE { color: var(--yellow); }
+.sev-SEVERE   { color: var(--red); }
+.sev-ERROR    { color: var(--red); }
+.sev-UNKNOWN  { color: var(--dim); }
+
+#detail-empty { color: var(--dim); font-size: 12px; padding: 16px; text-align: center; }
+#detail-meta { color: var(--dim); font-size: 11px; margin-bottom: 16px; }
+#detail-summary { font-size: 14px; line-height: 1.55; margin-bottom: 14px; }
+#detail-impact  { color: var(--dim); font-size: 13px; line-height: 1.5; margin-bottom: 16px; }
+.detail-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+}
+@media (max-width: 800px) {
+  .detail-cols { grid-template-columns: 1fr; }
+}
+.detail-cols h3 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+.detail-cols ol { margin: 0; padding-left: 20px; font-size: 13px; line-height: 1.55; }
+.detail-cols li { margin-bottom: 8px; }
+.detail-cols .conf { color: var(--dim); font-size: 10px; margin-left: 4px; }
+.detail-cols .cause-detail { color: var(--dim); display: block; margin-top: 2px; }
+#detail-error {
+  display: none;
+  color: var(--red);
+  background: rgba(248,81,73,0.08);
+  border: 1px solid var(--red);
+  padding: 10px;
+  border-radius: 5px;
+  margin-bottom: 14px;
+  font-size: 12px;
+}
+</style>
+</head>
+<body>
+
+<header>
+  <a class="back-link" href="/">← Monitor</a>
+  <span class="header-title">AI DIAGNOSIS</span>
+  <div class="spacer"></div>
+  <div class="run-controls">
+    <span class="label">Run new:</span>
+    <button class="run-btn" data-window="ongoing">Ongoing (5m)</button>
+    <button class="run-btn" data-window="1h">Last 1h</button>
+    <button class="run-btn" data-window="24h">Last 24h</button>
+    <span id="run-status"></span>
+  </div>
+</header>
+
+<div class="layout">
+
+  <!-- Left: History -->
+  <div class="card" id="history-card">
+    <div class="card-title">History (30 days)</div>
+    <div id="history">
+      <div style="color:var(--dim);font-size:12px">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Right: Detail -->
+  <div class="card" id="detail-card">
+    <div class="card-title" id="detail-title-bar" style="display:flex;justify-content:space-between;align-items:center">
+      <span>Diagnosis</span>
+    </div>
+    <div id="detail-empty">No diagnosis selected. Run a new one or pick from history.</div>
+    <div id="detail-body" style="display:none">
+      <div id="detail-meta"></div>
+      <div id="detail-error"></div>
+      <div id="detail-summary"></div>
+      <div id="detail-impact"></div>
+      <div class="detail-cols">
+        <div>
+          <h3>Likely causes</h3>
+          <ol id="detail-causes"></ol>
+        </div>
+        <div>
+          <h3>Recommendations</h3>
+          <ol id="detail-recs"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let history = [];
+let selectedId = null;
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  return iso.replace('T', ' ').slice(0, 19);
+}
+function fmtDay(iso) {
+  if (!iso) return 'Unknown';
+  const d = new Date(iso);
+  const today = new Date();
+  const yest  = new Date(); yest.setDate(today.getDate() - 1);
+  const sameDay = (a, b) => a.getFullYear()===b.getFullYear() && a.getMonth()===b.getMonth() && a.getDate()===b.getDate();
+  if (sameDay(d, today)) return 'Today';
+  if (sameDay(d, yest))  return 'Yesterday';
+  return d.toLocaleDateString(undefined, {weekday:'short', month:'short', day:'numeric'});
+}
+function severityOf(diag) {
+  if (!diag.ok) return 'ERROR';
+  return ((diag.result || {}).severity || 'unknown').toUpperCase();
+}
+
+function renderHistory() {
+  const container = document.getElementById('history');
+  container.innerHTML = '';
+  if (history.length === 0) {
+    container.innerHTML = '<div style="color:var(--dim);font-size:12px">No diagnoses yet. Run one to start.</div>';
+    return;
+  }
+  let lastDay = null;
+  history.forEach(d => {
+    const day = fmtDay(d.evaluated_at);
+    if (day !== lastDay) {
+      const h = document.createElement('div');
+      h.className = 'day-header';
+      h.textContent = day;
+      container.appendChild(h);
+      lastDay = day;
+    }
+    const item = document.createElement('div');
+    item.className = 'history-item' + (d.id === selectedId ? ' selected' : '');
+    const sev = severityOf(d);
+    const t = (d.evaluated_at || '').slice(11, 16) || '—';
+    item.innerHTML =
+      '<div class="row1"><span class="time">' + t + '</span>' +
+      '<span class="window">' + (d.window || '?') + '</span></div>' +
+      '<div class="severity sev-' + sev + '">' + sev + '</div>';
+    item.addEventListener('click', () => selectDiagnosis(d.id));
+    container.appendChild(item);
+  });
+}
+
+function selectDiagnosis(id) {
+  selectedId = id;
+  const d = history.find(x => x.id === id);
+  renderHistory();
+  renderDetail(d);
+}
+
+function renderDetail(diag) {
+  const empty = document.getElementById('detail-empty');
+  const body  = document.getElementById('detail-body');
+  const err   = document.getElementById('detail-error');
+  if (!diag) {
+    empty.style.display = 'block';
+    body.style.display = 'none';
+    return;
+  }
+  empty.style.display = 'none';
+  body.style.display = 'block';
+  err.style.display = 'none';
+
+  const sev = severityOf(diag);
+  const sevColor = {NONE:'var(--green)', MINOR:'var(--cyan)', MODERATE:'var(--yellow)', SEVERE:'var(--red)', ERROR:'var(--red)'}[sev] || 'var(--dim)';
+  document.getElementById('detail-meta').innerHTML =
+    'Evaluated ' + fmtTime(diag.evaluated_at) +
+    ' · Window: <strong>' + (diag.window || '—') + '</strong>' +
+    ' · Severity: <strong style="color:' + sevColor + '">' + sev + '</strong>' +
+    (diag.model ? (' · Model: ' + diag.model) : '');
+
+  if (!diag.ok) {
+    err.style.display = 'block';
+    err.textContent = diag.error || 'Diagnosis failed.';
+    document.getElementById('detail-summary').textContent = '';
+    document.getElementById('detail-impact').textContent = '';
+    document.getElementById('detail-causes').innerHTML = '';
+    document.getElementById('detail-recs').innerHTML = '';
+    return;
+  }
+  const r = diag.result || {};
+  if (!r.summary && diag.raw_text) {
+    document.getElementById('detail-summary').textContent = diag.raw_text;
+    document.getElementById('detail-impact').textContent = '(model did not return JSON; raw output above)';
+    document.getElementById('detail-causes').innerHTML = '';
+    document.getElementById('detail-recs').innerHTML = '';
+    return;
+  }
+  document.getElementById('detail-summary').textContent = r.summary || '';
+  document.getElementById('detail-impact').textContent = r.household_impact || '';
+  const causesEl = document.getElementById('detail-causes');
+  causesEl.innerHTML = '';
+  (r.likely_causes || []).forEach(c => {
+    const li = document.createElement('li');
+    const conf = c.confidence ? '<span class="conf">(' + c.confidence + ')</span>' : '';
+    li.innerHTML = '<strong>' + (c.cause || '') + '</strong>' + conf +
+      '<span class="cause-detail">' + (c.detail || '') + '</span>';
+    causesEl.appendChild(li);
+  });
+  const recsEl = document.getElementById('detail-recs');
+  recsEl.innerHTML = '';
+  (r.recommendations || []).forEach(text => {
+    const li = document.createElement('li');
+    li.textContent = text;
+    recsEl.appendChild(li);
+  });
+}
+
+async function loadHistory() {
+  try {
+    const resp = await fetch('/api/diagnoses');
+    if (!resp.ok) throw new Error('http ' + resp.status);
+    const data = await resp.json();
+    history = data.items || [];
+    if (!selectedId && history.length > 0) selectedId = history[0].id;
+    renderHistory();
+    renderDetail(history.find(x => x.id === selectedId));
+  } catch (e) {
+    document.getElementById('history').innerHTML =
+      '<div style="color:var(--red);font-size:12px">Failed to load history: ' + e.message + '</div>';
+  }
+}
+
+async function runNew(window) {
+  const status = document.getElementById('run-status');
+  const btns = document.querySelectorAll('.run-btn');
+  btns.forEach(b => b.disabled = true);
+  status.textContent = 'Diagnosing ' + window + '…';
+  try {
+    const resp = await fetch('/api/diagnose', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({window}),
+    });
+    const data = await resp.json();
+    if (data.id) {
+      selectedId = data.id;
+    }
+    await loadHistory();
+    status.textContent = '';
+  } catch (e) {
+    status.textContent = 'Request failed';
+  } finally {
+    btns.forEach(b => b.disabled = false);
+  }
+}
+
+document.querySelectorAll('.run-btn').forEach(btn => {
+  btn.addEventListener('click', () => runNew(btn.dataset.window));
+});
+
+loadHistory();
 </script>
 </body>
 </html>
@@ -2220,6 +3177,86 @@ def api_state():
     return jsonify(_state.to_dict())
 
 
+@app.route("/api/log")
+def api_log():
+    if _state is None:
+        return jsonify({"error": "not ready"}), 503
+    with _state.lock:
+        speed = list(_state.speed_history)
+        outages = list(_state.outages) + ([_state.current_outage] if _state.current_outage else [])
+        events = list(_state.events)
+    return jsonify({
+        "speed": [{"ts": s.timestamp.strftime("%H:%M:%S"), "dl": round(s.download_mbps, 1),
+                   "ul": round(s.upload_mbps, 1), "ping": round(s.ping_ms, 1),
+                   "label": s.label, "provider": s.provider} for s in reversed(speed)],
+        "outages": [{"start": o.start.strftime("%H:%M:%S"),
+                     "end": o.end.strftime("%H:%M:%S") if o.end else None,
+                     "duration": o.duration_str, "ongoing": o.ongoing}
+                    for o in reversed(outages)],
+        "events": [{"ts": ts, "level": lvl, "msg": msg} for ts, lvl, msg in events],
+    })
+
+
+@app.route("/log")
+def log_page():
+    return LOG_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+def _diagnoses_within_30d(state: MonitorState) -> List[dict]:
+    cutoff_iso = (datetime.now() - _30D).isoformat()
+    with state.lock:
+        return [d for d in state.diagnoses if (d.get("evaluated_at") or "") >= cutoff_iso]
+
+
+@app.route("/api/diagnose", methods=["GET", "POST"])
+def api_diagnose():
+    if _state is None:
+        return jsonify({"error": "not ready"}), 503
+
+    if request.method == "GET":
+        with _state.lock:
+            latest = _state.diagnoses[0] if _state.diagnoses else {}
+        return jsonify(latest)
+
+    body = request.get_json(silent=True) or {}
+    window = body.get("window", "1h")
+    if window not in ai_diagnosis.WINDOWS:
+        return jsonify({"ok": False, "error": f"invalid window: {window!r}"}), 400
+
+    with _state.lock:
+        if _state.diagnosis_in_progress:
+            return jsonify({"ok": False, "error": "diagnosis already in progress"}), 429
+        _state.diagnosis_in_progress = True
+
+    try:
+        snapshot = ai_diagnosis.build_snapshot(_state, window)
+        result = ai_diagnosis.diagnose(snapshot)
+        result["id"] = str(int(time.time() * 1000))
+        with _state.lock:
+            _state.diagnoses.appendleft(result)
+        if result.get("ok"):
+            _state.log(f"AI diagnosis ({window}) — severity: "
+                       f"{(result.get('result') or {}).get('severity', '?')}", "info")
+        else:
+            _state.log(f"AI diagnosis failed: {result.get('error')}", "warning")
+        return jsonify(result)
+    finally:
+        with _state.lock:
+            _state.diagnosis_in_progress = False
+
+
+@app.route("/api/diagnoses")
+def api_diagnoses():
+    if _state is None:
+        return jsonify({"error": "not ready"}), 503
+    return jsonify({"items": _diagnoses_within_30d(_state)})
+
+
+@app.route("/diagnose")
+def diagnose_page():
+    return DIAGNOSE_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
 # ─────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────
@@ -2234,10 +3271,12 @@ def main() -> None:
     speed_t   = threading.Thread(target=speed_test_thread,   args=(state,), daemon=True, name="speed")
     persist_t = threading.Thread(target=persistence_thread,  args=(state,), daemon=True, name="persist")
     site_t    = threading.Thread(target=site_check_thread,   args=(state,), daemon=True, name="sites")
+    router_t  = threading.Thread(target=router_log_thread,   args=(state,), daemon=True, name="router")
     conn_t.start()
     speed_t.start()
     persist_t.start()
     site_t.start()
+    router_t.start()
 
     state.log("Monitor started", "info")
     if SPEEDTEST_AVAILABLE:
