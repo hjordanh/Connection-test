@@ -14,6 +14,8 @@ A lightweight, self-hosted internet connection monitor with a live web dashboard
 - **Site status tiles** — monitors named services (Netflix, Xbox Live, Fortnite, etc.) individually and shows a plain-English verdict (GREAT / OK / SLOW / DOWN) with trend arrows
 - **Provider tracking** — detects which ISP or network you're on and tracks per-provider uptime and speed averages
 - **Persistent storage** — history survives restarts; keeps 24 hours of ping data and speed results on disk
+- **Router log scraping** — for any gateway whose firewall/event log is exposed at an HTTP path (configured in `connection_monitor.env`); polls every 30 s and surfaces firewall drops on the dashboard, including drops of the monitor's own DNS probes (a strong gateway-side root-cause signal)
+- **AI diagnosis** — on-demand "what's actually going on?" summary via Claude on its own page (`/diagnose`) with 30 days of history. Pick a window (Ongoing / 1h / 24h) and get a plain-English assessment, ranked likely causes, and concrete next steps
 
 Everything is visible at **http://localhost:8765** in any browser on the same machine.
 
@@ -42,6 +44,8 @@ Most people only notice their internet is bad when something breaks. This monito
 - **Python 3.8+**
 - **Flask** — installed automatically on first run
 - **speedtest-cli** *(optional)* — provides more accurate speed measurements than the built-in HTTP fallback
+- **python-dotenv** — installed automatically; loads `connection_monitor.env`
+- **anthropic** *(optional)* — installed automatically the first time you run AI diagnosis
 
 ---
 
@@ -87,6 +91,29 @@ python3 connection_monitor.py
 ```
 
 Open **http://localhost:8765** in your browser. Press `Ctrl+C` to stop.
+
+---
+
+## Configuration
+
+All per-deployment configuration lives in **`connection_monitor.env`**, a file that sits next to the script. It's gitignored — copy `connection_monitor.env.example` to get started:
+
+```bash
+cp connection_monitor.env.example connection_monitor.env
+```
+
+Then edit `connection_monitor.env` and fill in the values you want. The monitor reads it on startup. Variables already exported in your shell take precedence over the file, so `export GATEWAY_URL=… python3 connection_monitor.py` still overrides on a per-run basis.
+
+| Variable | Required? | Default | What it does |
+|---|---|---|---|
+| `ANTHROPIC_API_KEY` | for AI diagnosis | — | Enables the AI Diagnosis page (`/diagnose`). Get one from <https://console.anthropic.com>. Without this, the diagnosis page renders but every run returns a "key not set" message. |
+| `GATEWAY_URL` | for router-log scraping | — *(blank disables)* | Base URL of the router whose log pages to scrape, e.g. `http://192.168.1.254`. |
+| `ROUTER_PACKET_LOG_PATH` | with `GATEWAY_URL` | — | Path on the gateway for the firewall/packet log HTML page. AT&T-style residential gateways (e.g. BGW320) use `/cgi-bin/logs.ha`. |
+| `ROUTER_SYSLOG_PATH` | optional | — *(blank skips)* | Path for the system event log. AT&T-style gateways use `/cgi-bin/syslog.ha`. |
+| `ROUTER_POLL_INTERVAL` | optional | `30` | Seconds between gateway polls. |
+| `PORT` | optional | `8765` | Port the dashboard listens on. |
+
+> **Never commit `connection_monitor.env`.** It contains secrets. The repo's `.gitignore` already covers `*.env`.
 
 ---
 
