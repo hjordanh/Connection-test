@@ -267,6 +267,7 @@ Snapshot (JSON):
 Respond with a single JSON object, no prose, matching this schema exactly:
 
 {{
+  "title": "6-10 word headline summarizing this incident at a glance, e.g. 'Brief gateway flap during evening peak'",
   "summary": "2-4 sentence plain-English description of what happened in this window",
   "severity": "none" | "minor" | "moderate" | "severe",
   "likely_causes": [
@@ -275,6 +276,9 @@ Respond with a single JSON object, no prose, matching this schema exactly:
   "household_impact": "1-2 sentences on what a person on a video call / game / stream would have experienced",
   "recommendations": ["concrete action 1", "concrete action 2", ...]
 }}
+
+The title is critical — it shows up as the headline in the diagnosis history and \
+in tooltips on the timeline. Keep it factual, specific to this incident, and short.
 
 Rank likely_causes from most to least probable. Limit to 4 causes and 5 \
 recommendations. If router_events.dns_probe_drops is non-empty, the FIRST cause \

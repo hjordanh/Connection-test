@@ -2,7 +2,7 @@
 
 A lightweight, self-hosted internet connection monitor with a live web dashboard. Runs in the background and continuously tracks your connection health — no cloud accounts, no telemetry, no subscriptions.
 
-![Dashboard showing ping chart, speed history, and site status tiles](https://github.com/user-attachments/assets/82040b70-5f58-4dfb-b94f-c4c4e83880b6)
+![Connection Monitor dashboard showing the timeline uptime chart, ping history, speed history, site status tiles, and AI-assisted diagnostics button](screenshot.png)
 
 ---
 
@@ -13,12 +13,19 @@ A lightweight, self-hosted internet connection monitor with a live web dashboard
 - **Speed tests** — automatic download/upload measurements on startup, after outages, and on a periodic schedule; results compared against your hourly baseline so the most recent test is color-coded green/yellow/red
 - **Site status tiles** — monitors named services (Netflix, Xbox Live, Fortnite, etc.) individually and shows a plain-English verdict (GREAT / OK / SLOW / DOWN) with trend arrows
 - **Provider tracking** — detects which ISP or network you're on and tracks per-provider uptime and speed averages
-- **Persistent storage** — history survives restarts; keeps 24 hours of ping data and speed results on disk
+- **Persistent storage** — history survives restarts; keeps 24 hours of ping data and 30 days of outages, degraded periods, and AI diagnoses on disk
 - **Router log scraping** — for any gateway whose firewall/event log is exposed at an HTTP path (configured in `connection_monitor.env`); polls every 30 s and surfaces firewall drops on the dashboard, including drops of the monitor's own DNS probes (a strong gateway-side root-cause signal)
-- **AI diagnosis** — on-demand "what's actually going on?" summary via Claude on its own page (`/diagnose`) with 30 days of history. Pick a window (Ongoing / 1h / 24h) and get a plain-English assessment, ranked likely causes, and concrete next steps
-- **Timeline uptime chart** — 7-day view on the dashboard, 30-day view on the diagnosis page. Vertical bars show actual time-of-day position of outages (red), degraded periods (yellow stripes for slow speeds or high ping), and uptime (green). Click any outage band to ask Claude to diagnose that specific incident; analyzed incidents render in lighter red so you can see at a glance which ones already have notes
+- **Timeline uptime chart** — 7-day view on the dashboard, 30-day view on `/diagnose`. Vertical bars show actual time-of-day position of outages (red), degraded periods (yellow stripes for slow speeds or sustained high ping), and uptime (green). Outages and degraded periods within 30 minutes of each other are clustered into a single incident so the chart is scannable. Already-analyzed incidents render in **magenta** with a hover tooltip showing the AI's headline
+- **AI diagnosis** — on-demand "what's actually going on?" summary via Claude on its own page (`/diagnose`) with 30 days of history. Two ways to run:
+  - **Click any incident on the timeline** to diagnose that specific event (uses a window that includes 30 min of lead-up and 30 min of recovery)
+  - **Pick an ad-hoc window** (Ongoing / Last 1h / Last 24h) for a general assessment
+  - Each diagnosis returns a one-line title, severity, plain-English summary, household-impact statement, ranked likely causes, and concrete recommendations
 
-Everything is visible at **http://localhost:8765** in any browser on the same machine.
+Everything is visible at **http://localhost:8765** in any browser on the same machine. The app exposes three pages:
+
+- **`/`** — main dashboard (status, sites, timeline, ping/speed charts)
+- **`/diagnose`** — 30-day timeline + AI diagnosis history (click incidents to analyze)
+- **`/log`** — chronological event log (outages, speed tests, gateway-log warnings)
 
 ---
 
@@ -59,11 +66,17 @@ git clone https://github.com/yourname/connection-monitor.git
 cd connection-monitor
 ```
 
-Or just download `connection_monitor.py` and `ping_targets.conf` into a folder.
+Or download these files into a folder:
+
+- `connection_monitor.py` — main script
+- `router_log.py` — router-log scraper module
+- `ai_diagnosis.py` — Claude diagnosis module
+- `ping_targets.conf` — list of sites to monitor (auto-created on first run if missing)
+- `connection_monitor.env.example` — template for local configuration
 
 ### 2. Install optional dependencies
 
-Flask installs itself automatically. For better speed tests, also install speedtest-cli:
+Flask, python-dotenv, and (when you first run AI diagnosis) anthropic install themselves automatically on first use. For better speed tests, also install `speedtest-cli` ahead of time:
 
 ```bash
 pip3 install speedtest-cli
@@ -158,6 +171,16 @@ Save the following to `~/Library/LaunchAgents/com.user.connectionmonitor.plist`,
 </dict>
 </plist>
 ```
+
+> **Configuration under launchd.** Because `WorkingDirectory` is set, the monitor will load `connection_monitor.env` from your install folder automatically — that's the recommended place for `ANTHROPIC_API_KEY` and the gateway settings. launchd does **not** inherit your interactive shell's `export` statements, so a value you only `export` in `~/.zshrc` won't be visible. If you'd rather not put a secret in the env file, add an `EnvironmentVariables` block to the plist:
+>
+> ```xml
+> <key>EnvironmentVariables</key>
+> <dict>
+>     <key>ANTHROPIC_API_KEY</key>
+>     <string>sk-ant-api03-…</string>
+> </dict>
+> ```
 
 2. Load it:
 
@@ -291,10 +314,12 @@ Then open `http://192.168.x.x:8765` on the other device. No code changes needed 
 
 ## Data & privacy
 
-- All data stays on your machine — nothing is sent anywhere
-- History is saved to `connection_monitor_data.json` in the same folder as the script
-- Speed tests make outbound HTTP requests to public test servers (Cloudflare, OVH, Tele2) to measure throughput
-- Site monitoring makes TCP connection attempts to the hostnames in `ping_targets.conf`
+- All persistent data stays on your machine in `connection_monitor_data.json` (next to the script). Nothing is sent to any cloud service unless you opt in below.
+- **DNS probes** (every 2 s) make TCP connections to `8.8.8.8`, `1.1.1.1`, and `208.67.222.222` on port 53 to detect outages. No DNS queries are actually issued.
+- **Speed tests** make outbound HTTP requests to public test servers (Cloudflare, OVH, Tele2) to measure throughput.
+- **Site monitoring** makes TCP connections to the hostnames in `ping_targets.conf` on port 443.
+- **Router log scraping** (opt-in via `GATEWAY_URL`) hits your gateway's local LAN IP only.
+- **AI diagnosis** (opt-in via `ANTHROPIC_API_KEY`) sends a *summary* of your monitor data — never raw ping samples — to Anthropic's API when you click "Diagnose." Each call typically uses a few cents of API credit; see <https://www.anthropic.com/pricing>.
 
 ---
 
@@ -314,3 +339,11 @@ Then open `http://192.168.x.x:8765` on the other device. No code changes needed 
 
 **Flask not found**
 - The script attempts to auto-install Flask; if that fails, install it manually: `pip3 install flask`
+
+**AI diagnosis says `ANTHROPIC_API_KEY not set` even though you set it**
+- The monitor reads the env at process start. If you set the key after launching, restart the monitor.
+- Under `launchd`/`systemd`, your shell's `export` won't be inherited — put the key in `connection_monitor.env` (or in the service's environment block).
+
+**Router log shows `available: false` or `poll_error`**
+- Verify the gateway URL is reachable from the host: `curl -I http://192.168.1.254/cgi-bin/logs.ha`.
+- For non-AT&T gateways, the HTML format may differ. The parser expects either `<tr><td>idx</td><td>iso-ts</td><td>src</td><td>dst</td><td>proto</td><td>reason</td></tr>` rows or the same six fields in plain text.

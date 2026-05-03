@@ -277,6 +277,10 @@ class MonitorState:
 
         # Timing
         self.start_time: datetime = datetime.now()
+        # Earliest time we have data for. Persisted across restarts so that the
+        # timeline's "no data" shading reflects when the monitor was first
+        # installed, not the most recent process boot.
+        self.first_seen: datetime = self.start_time
 
     def log(self, msg: str, level: str = "info") -> None:
         ts = datetime.now().isoformat(timespec="seconds")
@@ -1139,6 +1143,7 @@ def save_state(state: MonitorState) -> None:
             "router_events": router_events_to_save,
             "degraded_periods": degraded,
             "diagnoses": diagnoses_to_save,
+            "first_seen": state.first_seen.isoformat(),
             "saved_at": datetime.now().isoformat(),
         }
         tmp = DATA_FILE + ".tmp"
@@ -1233,6 +1238,35 @@ def load_state(state: MonitorState) -> None:
             state.daily_history = data.get("daily_history", [])
             state.router_events = deque(router_events_loaded, maxlen=5000)
             state.degraded_periods = deque(degraded_loaded, maxlen=2000)
+
+            # Restore first_seen — always take the min of (persisted value if
+            # any, current process start, earliest piece of persisted data) so
+            # that long-running installs retain their full history even if the
+            # monitor was restarted recently or this is the first save under
+            # this code version.
+            candidates: List[datetime] = [state.first_seen]
+            try:
+                fs = data.get("first_seen")
+                if fs:
+                    candidates.append(datetime.fromisoformat(fs))
+            except (ValueError, TypeError):
+                pass
+            if outages:           candidates.append(min(o.start for o in outages))
+            if speed:             candidates.append(min(s.timestamp for s in speed))
+            if ping_ts:
+                try:
+                    candidates.append(datetime.fromisoformat(ping_ts[0][0]))
+                except (ValueError, TypeError):
+                    pass
+            if degraded_loaded:   candidates.append(min(d.start for d in degraded_loaded))
+            daily = data.get("daily_history") or []
+            if daily:
+                try:
+                    candidates.append(datetime.strptime(min(e["date"] for e in daily), "%Y-%m-%d"))
+                except (ValueError, KeyError):
+                    pass
+            state.first_seen = min(candidates)
+
             cutoff_30d_iso = (datetime.now() - _30D).isoformat()
             history_raw = data.get("diagnoses")
             if history_raw is None:
@@ -1615,9 +1649,9 @@ window.UptimeTimeline = (function () {
 
   function render(canvas, opts) {
     const days        = opts.days || 7;
-    const outages     = opts.outages   || [];
-    const degraded    = opts.degraded  || [];
+    const clusters    = opts.clusters  || opts.outages || [];
     const analyzedIds = new Set(opts.analyzedIds || []);
+    const titles      = opts.titles || {};
     const monitorStartedAt = opts.monitorStartedAt
       ? new Date(opts.monitorStartedAt) : null;
     const onClick = opts.onIncidentClick || null;
@@ -1632,10 +1666,11 @@ window.UptimeTimeline = (function () {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssW, cssH);
 
-    const marginL = showHourLabels ? 26 : 4;
+    const marginL = showHourLabels ? 26 : 22;
     const marginR = 4;
-    const marginT = 16;   // for severity badges
-    const marginB = 18;   // for day labels
+    const marginT = 14;   // for severity badges
+    // 30d shows a two-line label (weekday letter + date), 7d shows one.
+    const marginB = days <= 7 ? 18 : 32;
     const innerW = cssW - marginL - marginR;
     const innerH = cssH - marginT - marginB;
 
@@ -1645,15 +1680,33 @@ window.UptimeTimeline = (function () {
       const d = new Date(today); d.setDate(today.getDate() - i);
       dayStarts.push(d);
     }
-    const colW = innerW / days;
+
+    // Insert a small visual gap between weeks. We treat "week" as ending on
+    // Saturday — i.e. a gap before each Sunday (other than the first column).
+    const weekGapPx = days > 7 ? Math.max(4, innerW * 0.012) : 0;
+    const numWeekGaps = days > 7
+      ? dayStarts.slice(1).filter(d => d.getDay() === 0).length
+      : 0;
+    const usableW = innerW - weekGapPx * numWeekGaps;
+    const colW = usableW / days;
     const barW = Math.max(2, colW - 2);
 
-    // Y maps minutes-of-day [0..1440] → pixels (top = 0, bottom = 23:59)
-    const yOf = (min) => marginT + (min / 1440) * innerH;
+    // Resolve x-position for each day, accounting for inserted week gaps.
+    const dayX = [];
+    let cursor = marginL;
+    dayStarts.forEach((day, idx) => {
+      if (idx > 0 && days > 7 && day.getDay() === 0) cursor += weekGapPx;
+      dayX.push(cursor);
+      cursor += colW;
+    });
+
+    // Y maps minutes-of-day [0..1440] → pixels.  BOTTOM = midnight (00:00),
+    // TOP = 23:59 — bottom-up reading.
+    const yOf = (min) => marginT + innerH - (min / 1440) * innerH;
     const minutesOfDay = (date) =>
       date.getHours() * 60 + date.getMinutes() + date.getSeconds() / 60;
 
-    const dowName = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    const dowLetter = ['S','M','T','W','T','F','S'];
     const incidentRects = [];
 
     // Bars
@@ -1661,12 +1714,13 @@ window.UptimeTimeline = (function () {
       const dayEnd = new Date(day); dayEnd.setDate(day.getDate() + 1);
       const isToday = day.getTime() === today.getTime();
       const dow = day.getDay();
-      const x = marginL + idx * colW + (colW - barW) / 2;
+      const colX = dayX[idx];
+      const x = colX + (colW - barW) / 2;
 
       // Weekend tint
       if (dow === 0 || dow === 6) {
         ctx.fillStyle = COLORS.weekend;
-        ctx.fillRect(marginL + idx * colW, marginT, colW, innerH);
+        ctx.fillRect(colX, marginT, colW, innerH);
       }
 
       // Determine "covered" portion (we have data) vs "uncovered."
@@ -1680,90 +1734,105 @@ window.UptimeTimeline = (function () {
       // Background: green where covered, dim where not.
       ctx.fillStyle = COLORS.bar_no;
       ctx.fillRect(x, marginT, barW, innerH);
-      const fromMin = (coveredFrom <= day)         ? 0    : minutesOfDay(coveredFrom);
-      const toMin   = (coveredTo   >= dayEnd)      ? 1440 : minutesOfDay(coveredTo);
+      const fromMin = (coveredFrom <= day)    ? 0    : minutesOfDay(coveredFrom);
+      const toMin   = (coveredTo   >= dayEnd) ? 1440 : minutesOfDay(coveredTo);
       if (toMin > fromMin) {
         ctx.fillStyle = COLORS.bar_ok;
-        ctx.fillRect(x, yOf(fromMin), barW, yOf(toMin) - yOf(fromMin));
+        // yOf(toMin) is higher visually than yOf(fromMin), so width = fromMin's y - toMin's y
+        const yA = yOf(toMin);
+        const yB = yOf(fromMin);
+        ctx.fillRect(x, yA, barW, yB - yA);
       }
 
-      // Today: border
-      if (isToday) {
-        ctx.strokeStyle = COLORS.today;
-        ctx.lineWidth = 1;
-        ctx.strokeRect(x + 0.5, marginT + 0.5, barW - 1, innerH - 1);
-      }
-
-      // Day label
+      // Day label(s)
       ctx.fillStyle = COLORS.dim;
-      ctx.font = '10px ui-monospace, monospace';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
-      const label = (days <= 7)
-        ? dowName[dow]
-        : ((idx === 0 || idx === days - 1 || idx % 5 === 0) ? fmtDate(day) : '');
-      if (label) ctx.fillText(label, x + barW / 2, marginT + innerH + 3);
+      if (days <= 7) {
+        ctx.font = '10px ui-monospace, monospace';
+        const dowName = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+        ctx.fillText(dowName[dow], x + barW / 2, marginT + innerH + 3);
+      } else {
+        // 30d: two-line label — weekday letter on top, date below.
+        ctx.font = 'bold 9px ui-monospace, monospace';
+        ctx.fillText(dowLetter[dow], x + barW / 2, marginT + innerH + 3);
+        ctx.font = '9px ui-monospace, monospace';
+        ctx.fillStyle = (dow === 1 || idx === 0 || idx === dayStarts.length - 1)
+          ? COLORS.text : COLORS.dim;
+        // Show date on Mondays + first/last column to anchor without clutter.
+        if (dow === 1 || idx === 0 || idx === dayStarts.length - 1) {
+          ctx.fillText(fmtDate(day), x + barW / 2, marginT + innerH + 16);
+        }
+        ctx.fillStyle = COLORS.dim;
+      }
     });
 
-    // Hour gridlines (7d only)
+    // Hour gridlines (and labels on 7d). Lines span the whole inner area on
+    // both views; labels only on 7d (no room on 30d).
+    ctx.strokeStyle = COLORS.grid;
+    ctx.lineWidth = 1;
+    [0, 6, 12, 18, 24].forEach(h => {
+      const y = yOf(h * 60);
+      ctx.beginPath();
+      ctx.moveTo(marginL, y); ctx.lineTo(cssW - marginR, y);
+      ctx.stroke();
+    });
     if (showHourLabels) {
-      ctx.strokeStyle = COLORS.grid;
       ctx.fillStyle = COLORS.dim;
-      ctx.lineWidth = 1;
       ctx.font = '9px ui-monospace, monospace';
       ctx.textAlign = 'right';
       ctx.textBaseline = 'middle';
-      [0, 6, 12, 18, 24].forEach(h => {
+      [0, 6, 12, 18].forEach(h => {
         const y = yOf(h * 60);
-        ctx.beginPath();
-        ctx.moveTo(marginL, y); ctx.lineTo(cssW - marginR, y);
-        ctx.stroke();
-        if (h !== 24) {
-          const lbl = h === 0 ? '12a' : (h === 12 ? '12p' : (h < 12 ? h + 'a' : (h - 12) + 'p'));
-          ctx.fillText(lbl, marginL - 4, y);
-        }
+        const lbl = h === 0 ? '12a' : (h === 12 ? '12p' : (h < 12 ? h + 'a' : (h - 12) + 'p'));
+        ctx.fillText(lbl, marginL - 4, y);
       });
     }
 
-    // Helper: draw an incident span (possibly crossing midnight) into bars
-    function drawSpan(span, category) {
-      const start = new Date(span.start);
-      const end = span.end ? new Date(span.end) : new Date();
-      const isAnalyzed = analyzedIds.has(span.id);
+    // Helper: draw a cluster span (possibly crossing midnight) into bars.
+    // `cluster.category` is "outage" (red) or "degraded" (yellow with stripes).
+    function drawSpan(cluster) {
+      const start = new Date(cluster.start);
+      const end = cluster.end ? new Date(cluster.end) : new Date();
+      const isAnalyzed = analyzedIds.has(cluster.id);
+      const category = cluster.category || 'outage';
       const baseColor =
         category === 'outage' ? (isAnalyzed ? COLORS.outage_seen   : COLORS.outage)
                               : (isAnalyzed ? COLORS.degraded_seen : COLORS.degraded);
-      let useStripes = (category !== 'outage');
-      let pattern = null;
-      if (useStripes) pattern = makeStripePattern(ctx, baseColor);
+      const useStripes = (category !== 'outage');
+      const pattern = useStripes ? makeStripePattern(ctx, baseColor) : null;
 
       dayStarts.forEach((day, idx) => {
         const dayEnd = new Date(day); dayEnd.setDate(day.getDate() + 1);
         if (end <= day || start >= dayEnd) return;
         const segStart = (start > day) ? start : day;
         const segEnd   = (end   < dayEnd) ? end : dayEnd;
-        const yA = yOf(minutesOfDay(segStart));
-        const yB = yOf(minutesOfDay(segEnd >= dayEnd ? new Date(dayEnd.getTime() - 1) : segEnd));
-        const x = marginL + idx * colW + (colW - barW) / 2;
+        // Bottom-up Y axis: yOf(later) is higher (smaller pixel value) than
+        // yOf(earlier). yA is the top edge of the rect, yB the bottom.
+        const yA = yOf(minutesOfDay(segEnd >= dayEnd ? new Date(dayEnd.getTime() - 1) : segEnd));
+        const yB = yOf(minutesOfDay(segStart));
+        const x = dayX[idx] + (colW - barW) / 2;
         const h = Math.max(2, yB - yA);
         ctx.fillStyle = useStripes ? pattern : baseColor;
         ctx.fillRect(x, yA, barW, h);
         incidentRects.push({
           x, y: yA, w: barW, h,
-          incident: { ...span, category, analyzed: isAnalyzed, dayIndex: idx },
+          incident: { ...cluster, category, analyzed: isAnalyzed,
+                      title: titles[cluster.id] || null, dayIndex: idx },
         });
       });
     }
 
-    // Draw degraded first (so outages render on top)
-    degraded.forEach(d => drawSpan(d, 'degraded'));
-    outages.forEach(o  => drawSpan(o,  'outage'));
+    // Draw degraded clusters first (so outage clusters render on top, just in
+    // case any future data shape allows overlap — server-side they're merged).
+    clusters.filter(c => c.category !== 'outage').forEach(drawSpan);
+    clusters.filter(c => c.category === 'outage').forEach(drawSpan);
 
     // "Now" tick on today's column
     const now = new Date();
     const todayIdx = dayStarts.findIndex(d => d.getTime() === today.getTime());
     if (todayIdx >= 0) {
-      const xL = marginL + todayIdx * colW + (colW - barW) / 2;
+      const xL = dayX[todayIdx] + (colW - barW) / 2;
       const yN = yOf(minutesOfDay(now));
       ctx.strokeStyle = COLORS.now;
       ctx.lineWidth = 1;
@@ -1772,23 +1841,27 @@ window.UptimeTimeline = (function () {
       ctx.stroke();
     }
 
-    // Severity badges (longest outage duration per day)
-    const longestPerDay = {};
-    outages.forEach(o => {
-      const d = startOfDay(new Date(o.start)).getTime();
-      const sec = ((o.end ? new Date(o.end) : new Date()) - new Date(o.start)) / 1000;
-      if (!longestPerDay[d] || sec > longestPerDay[d]) longestPerDay[d] = sec;
-    });
-    ctx.font = 'bold 9px ui-monospace, monospace';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'bottom';
-    ctx.fillStyle = COLORS.outage;
-    dayStarts.forEach((day, idx) => {
-      const sec = longestPerDay[day.getTime()];
-      if (!sec) return;
-      const x = marginL + idx * colW + colW / 2;
-      ctx.fillText(fmtDuration(sec), x, marginT - 1);
-    });
+    // Severity badges: longest *outage* (downtime) per day, derived from
+    // clusters' total_outage_s. Only shown on 7d to avoid clutter.
+    if (days <= 7) {
+      const longestPerDay = {};
+      clusters.forEach(c => {
+        if (c.category !== 'outage') return;
+        const d = startOfDay(new Date(c.start)).getTime();
+        const sec = c.total_outage_s || 0;
+        if (!longestPerDay[d] || sec > longestPerDay[d]) longestPerDay[d] = sec;
+      });
+      ctx.font = 'bold 9px ui-monospace, monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      ctx.fillStyle = COLORS.outage;
+      dayStarts.forEach((day, idx) => {
+        const sec = longestPerDay[day.getTime()];
+        if (!sec) return;
+        const x = dayX[idx] + colW / 2;
+        ctx.fillText(fmtDuration(sec), x, marginT - 1);
+      });
+    }
 
     // Hover/click handlers
     let activeIncident = null;
@@ -1802,6 +1875,11 @@ window.UptimeTimeline = (function () {
       return null;
     }
 
+    function escapeHtml(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
     canvas.onmousemove = (e) => {
       const inc = hitTest(e);
       const tt = getTooltip();
@@ -1810,23 +1888,27 @@ window.UptimeTimeline = (function () {
         const start = new Date(inc.start);
         const end   = inc.end ? new Date(inc.end) : new Date();
         const span  = (end - start) / 1000;
-        const kindLabel = inc.category === 'outage'
-          ? (inc.outage_count && inc.outage_count > 1
-              ? inc.outage_count + ' outages (clustered)'
-              : 'Outage')
-          : (inc.kind === 'high_ping' ? 'High ping'
-             : inc.kind === 'slow' ? 'Slow speed'
-             : 'Degraded');
+        const parts = [];
+        if (inc.outage_count)   parts.push(inc.outage_count + ' outage'    + (inc.outage_count > 1 ? 's' : ''));
+        if (inc.high_ping_count) parts.push(inc.high_ping_count + ' high-ping');
+        if (inc.slow_count)     parts.push(inc.slow_count + ' slow');
+        const headline = parts.length ? parts.join(' · ')
+          : (inc.category === 'outage' ? 'Outage' : 'Degraded');
         const lines = [];
-        lines.push('<strong>' + kindLabel + '</strong>');
+        if (inc.analyzed && inc.title) {
+          lines.push('<strong style="color:#bc8cff">' + escapeHtml(inc.title) + '</strong>');
+          lines.push('<span style="color:var(--dim)">' + escapeHtml(headline) + '</span>');
+        } else {
+          lines.push('<strong>' + escapeHtml(headline) + '</strong>');
+        }
         lines.push(start.toLocaleDateString() + ' ' +
           fmtTimeOfDay(inc.start) + ' → ' + fmtTimeOfDay(inc.end || ''));
         lines.push('Span: ' + fmtDuration(span));
-        if (inc.total_outage_s != null && inc.outage_count > 1) {
-          lines.push('Total downtime in cluster: ' + fmtDuration(inc.total_outage_s));
+        if (inc.total_outage_s) {
+          lines.push('Outage time in cluster: ' + fmtDuration(inc.total_outage_s));
         }
         if (inc.analyzed) {
-          lines.push('<span style="color:#bc8cff">✓ Analyzed (click to view)</span>');
+          lines.push('<span style="color:#bc8cff">✓ Click to view analysis</span>');
         } else if (inc.category === 'outage') {
           lines.push('<span style="color:var(--dim)">Click to diagnose</span>');
         }
@@ -2953,9 +3035,9 @@ function paintTimeline() {
   if (!_timelineCache) return;
   UptimeTimeline.render(uptimeTimelineCanvas, {
     days: 7,
-    outages: _timelineCache.outages,
-    degraded: _timelineCache.degraded,
+    clusters: _timelineCache.clusters,
     analyzedIds: _timelineCache.analyzed_ids,
+    titles: _timelineCache.titles || {},
     monitorStartedAt: _timelineCache.monitor_started_at,
     onIncidentClick: onTimelineClick,
   });
@@ -3362,11 +3444,20 @@ header {
   background: rgba(88,166,255,0.08);
   border-color: var(--blue);
 }
+.history-item .title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 4px;
+  line-height: 1.3;
+  overflow-wrap: break-word;
+}
 .history-item .row1 {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
-  font-size: 12px;
+  font-size: 11px;
+  color: var(--dim);
   margin-bottom: 2px;
 }
 .history-item .time { font-weight: 600; }
@@ -3510,6 +3601,11 @@ function severityOf(diag) {
   return ((diag.result || {}).severity || 'unknown').toUpperCase();
 }
 
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function renderHistory() {
   const container = document.getElementById('history');
   container.innerHTML = '';
@@ -3531,7 +3627,12 @@ function renderHistory() {
     item.className = 'history-item' + (d.id === selectedId ? ' selected' : '');
     const sev = severityOf(d);
     const t = (d.evaluated_at || '').slice(11, 16) || '—';
+    const title = (d.result && d.result.title) ? d.result.title : null;
+    const titleRow = title
+      ? '<div class="title">' + escapeHtml(title) + '</div>'
+      : '';
     item.innerHTML =
+      titleRow +
       '<div class="row1"><span class="time">' + t + '</span>' +
       '<span class="window">' + (d.window || '?') + '</span></div>' +
       '<div class="severity sev-' + sev + '">' + sev + '</div>';
@@ -3562,7 +3663,13 @@ function renderDetail(diag) {
 
   const sev = severityOf(diag);
   const sevColor = {NONE:'var(--green)', MINOR:'var(--cyan)', MODERATE:'var(--yellow)', SEVERE:'var(--red)', ERROR:'var(--red)'}[sev] || 'var(--dim)';
+  const r0 = diag.result || {};
+  const titleHtml = r0.title
+    ? '<div style="font-size:16px;font-weight:600;color:var(--text);margin-bottom:6px">' +
+      escapeHtml(r0.title) + '</div>'
+    : '';
   document.getElementById('detail-meta').innerHTML =
+    titleHtml +
     'Evaluated ' + fmtTime(diag.evaluated_at) +
     ' · Window: <strong>' + (diag.window || '—') + '</strong>' +
     ' · Severity: <strong style="color:' + sevColor + '">' + sev + '</strong>' +
@@ -3684,13 +3791,13 @@ function paintTimeline() {
   if (!_timelineData) return;
   UptimeTimeline.render(document.getElementById('timelineCanvas'), {
     days: 30,
-    outages: _timelineData.outages,
-    degraded: _timelineData.degraded,
+    clusters: _timelineData.clusters,
     analyzedIds: _timelineData.analyzed_ids,
+    titles: _timelineData.titles || {},
     monitorStartedAt: _timelineData.monitor_started_at,
     onIncidentClick: onTimelineClick,
   });
-  const total = (_timelineData.outages || []).length;
+  const total = (_timelineData.clusters || []).length;
   const seen = (_timelineData.analyzed_ids || []).length;
   const stats = document.getElementById('timeline-stats');
   if (stats) stats.textContent = total + ' incidents · ' + seen + ' analyzed';
@@ -3724,7 +3831,7 @@ async function handleUrlParams() {
     }
     // Need the outage's start/end from the timeline data
     if (!_timelineData) await refreshTimeline();
-    const inc = (_timelineData?.outages || []).find(o => o.id === runId);
+    const inc = (_timelineData?.clusters || []).find(o => o.id === runId);
     if (inc) {
       window.history.replaceState({}, '', '/diagnose');
       runOutage({ ...inc, kind: 'outage' });
@@ -3887,44 +3994,81 @@ def api_diagnoses():
     return jsonify({"items": _diagnoses_within_30d(_state)})
 
 
-CLUSTER_GAP_SECS = 300  # outages within 5 min of each other = one incident
+CLUSTER_GAP_SECS = 1800  # outages OR degraded periods within 30 min = one incident
 
 
-def _cluster_outages(outages: List[OutageRecord], now: datetime) -> List[Dict]:
-    """Group nearby outages into clusters. Returns a list of cluster dicts ready
-    to ship to the client (with per-cluster ID and member list)."""
-    if not outages:
+def _cluster_events(outages: List[OutageRecord],
+                    degraded: List[DegradedPeriod],
+                    now: datetime) -> List[Dict]:
+    """Merge outages and degraded periods into unified clusters with a 30-min
+    gap. Each cluster's `category` is "outage" if any outage is inside (red);
+    otherwise "degraded" (yellow). Members preserve their original kind so the
+    tooltip can describe the mix."""
+    events: List[Dict] = []
+    for o in outages:
+        events.append({
+            "_kind": "outage",   # high severity
+            "start": o.start,
+            "end":   o.end or now,
+            "ongoing": o.ongoing,
+            "id":    o.id,
+        })
+    for d in degraded:
+        events.append({
+            "_kind": d.kind,     # "slow" | "high_ping"
+            "start": d.start,
+            "end":   d.end or now,
+            "ongoing": d.ongoing,
+            "id":    d.id,
+            "detail": d.detail,
+        })
+    if not events:
         return []
-    sorted_o = sorted(outages, key=lambda o: o.start)
-    clusters: List[List[OutageRecord]] = [[sorted_o[0]]]
-    for o in sorted_o[1:]:
-        prev = clusters[-1][-1]
-        prev_end = prev.end or now
-        gap = (o.start - prev_end).total_seconds()
+    events.sort(key=lambda e: e["start"])
+
+    clusters: List[List[Dict]] = [[events[0]]]
+    for ev in events[1:]:
+        prev_end = max(m["end"] for m in clusters[-1])
+        gap = (ev["start"] - prev_end).total_seconds()
         if gap <= CLUSTER_GAP_SECS:
-            clusters[-1].append(o)
+            clusters[-1].append(ev)
         else:
-            clusters.append([o])
+            clusters.append([ev])
+
     out: List[Dict] = []
     for members in clusters:
-        first = members[0]
-        last_end = max((m.end or now) for m in members)
-        ongoing = any(m.ongoing for m in members)
-        total_outage_s = sum(int((m.end or now - m.start if not m.ongoing else now - m.start).total_seconds() if False else (m.end - m.start if m.end else now - m.start).total_seconds()) for m in members)
-        # The above expression is convoluted; recompute cleanly:
-        total_outage_s = 0
-        for m in members:
-            end = m.end or now
-            total_outage_s += int((end - m.start).total_seconds())
+        first_start = min(m["start"] for m in members)
+        last_end    = max(m["end"]   for m in members)
+        ongoing     = any(m["ongoing"] for m in members)
+        # Counts and total downtime per kind
+        n_out = sum(1 for m in members if m["_kind"] == "outage")
+        n_slow = sum(1 for m in members if m["_kind"] == "slow")
+        n_hp  = sum(1 for m in members if m["_kind"] == "high_ping")
+        outage_secs = sum(int((m["end"] - m["start"]).total_seconds())
+                          for m in members if m["_kind"] == "outage")
+        degraded_secs = sum(int((m["end"] - m["start"]).total_seconds())
+                            for m in members if m["_kind"] != "outage")
+        category = "outage" if n_out > 0 else "degraded"
+        if n_out:
+            dominant_kind = "outage"
+        elif n_hp >= n_slow:
+            dominant_kind = "high_ping"
+        else:
+            dominant_kind = "slow"
         out.append({
-            "id": "cluster:" + first.start.isoformat(timespec="seconds"),
-            "start": first.start.isoformat(timespec="seconds"),
+            "id": "cluster:" + first_start.isoformat(timespec="seconds"),
+            "category": category,
+            "dominant_kind": dominant_kind,
+            "start": first_start.isoformat(timespec="seconds"),
             "end": last_end.isoformat(timespec="seconds") if not ongoing else None,
             "ongoing": ongoing,
-            "duration_s": int((last_end - first.start).total_seconds()),
-            "outage_count": len(members),
-            "total_outage_s": total_outage_s,
-            "member_ids": [m.id for m in members],
+            "duration_s": int((last_end - first_start).total_seconds()),
+            "outage_count": n_out,
+            "slow_count": n_slow,
+            "high_ping_count": n_hp,
+            "total_outage_s": outage_secs,
+            "total_degraded_s": degraded_secs,
+            "member_ids": [m["id"] for m in members],
         })
     return out
 
@@ -3941,48 +4085,68 @@ def api_timeline():
     now = datetime.now()
     cutoff = now - timedelta(days=days)
     with _state.lock:
-        in_window = [
+        in_outages = [
             o for o in (list(_state.outages) + ([_state.current_outage] if _state.current_outage else []))
             if o.start >= cutoff
         ]
-        clusters = _cluster_outages(in_window, now)
+        in_degraded = [d for d in list(_state.degraded_periods) if d.start >= cutoff]
+        clusters = _cluster_events(in_outages, in_degraded, now)
 
-        degraded: List[Dict] = []
-        for d in list(_state.degraded_periods):
-            if d.start < cutoff:
+        # For each saved diagnosis, capture its outage_id, the timestamp
+        # implied by that id (the "anchor"), and its title. The anchor lets us
+        # match a saved diagnosis against today's clusters even when the cluster
+        # boundaries have shifted between code versions (e.g. older 5-min
+        # clusters now subsumed into a wider 30-min cluster).
+        diag_anchors: List[Tuple[str, Optional[datetime], str]] = []
+        for d in _state.diagnoses:
+            oid = d.get("outage_id")
+            if not oid:
                 continue
-            degraded.append({
-                "id": d.id,
-                "kind": d.kind,
-                "start": d.start.isoformat(timespec="seconds"),
-                "end": d.end.isoformat(timespec="seconds") if d.end else None,
-                "ongoing": d.ongoing,
-                "detail": d.detail,
-            })
+            iso = ""
+            if oid.startswith("cluster:"):
+                iso = oid[len("cluster:"):]
+            elif oid.startswith("out:"):
+                iso = oid[len("out:"):]
+            elif oid.startswith("deg:"):
+                rest = oid[len("deg:"):]
+                if ":" in rest:
+                    iso = rest.split(":", 1)[1]
+            anchor: Optional[datetime] = None
+            if iso:
+                try:
+                    anchor = datetime.fromisoformat(iso)
+                except ValueError:
+                    anchor = None
+            title = (d.get("result") or {}).get("title") or ""
+            diag_anchors.append((oid, anchor, title))
+        first_seen = _state.first_seen
 
-        # All outage_ids referenced by saved diagnoses (cluster IDs from new
-        # runs, individual out:... IDs from older ones).
-        diag_outage_ids = {
-            (d.get("outage_id") or "")
-            for d in _state.diagnoses
-            if d.get("outage_id")
-        }
-        start_time = _state.start_time
-
-    # A cluster is "analyzed" if its own id appears, or if any member's
-    # individual outage id appears (back-compat with pre-cluster diagnoses).
-    analyzed_ids = sorted({
-        c["id"] for c in clusters
-        if c["id"] in diag_outage_ids or any(m in diag_outage_ids for m in c["member_ids"])
-    })
+    analyzed_ids: List[str] = []
+    titles_by_cluster: Dict[str, str] = {}
+    for c in clusters:
+        c_start = datetime.fromisoformat(c["start"])
+        c_end = datetime.fromisoformat(c["end"]) if c.get("end") else now
+        member_set = set([c["id"]] + c["member_ids"])
+        matched_title = ""
+        is_analyzed = False
+        # state.diagnoses iterates newest-first; first matching title wins.
+        for oid, anchor, title in diag_anchors:
+            if oid in member_set or (anchor is not None and c_start <= anchor <= c_end):
+                is_analyzed = True
+                if title and not matched_title:
+                    matched_title = title
+        if is_analyzed:
+            analyzed_ids.append(c["id"])
+            if matched_title:
+                titles_by_cluster[c["id"]] = matched_title
 
     return jsonify({
         "days": days,
         "generated_at": now.isoformat(timespec="seconds"),
-        "monitor_started_at": start_time.isoformat(timespec="seconds"),
-        "outages": clusters,
-        "degraded": degraded,
+        "monitor_started_at": first_seen.isoformat(timespec="seconds"),
+        "clusters": clusters,
         "analyzed_ids": analyzed_ids,
+        "titles": titles_by_cluster,
     })
 
 
