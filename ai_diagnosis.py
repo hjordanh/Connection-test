@@ -28,7 +28,10 @@ WINDOWS = {
     "ongoing": timedelta(minutes=5),
     "1h":      timedelta(hours=1),
     "24h":     timedelta(hours=24),
+    # "outage": handled specially in build_snapshot — start/end come from caller.
 }
+OUTAGE_LEAD = timedelta(minutes=30)
+OUTAGE_TAIL = timedelta(minutes=30)
 
 SYSTEM_PROMPT = """\
 You are a senior network-diagnosis assistant analyzing data from a home internet \
@@ -54,8 +57,11 @@ Prefer gateway-side root causes (firmware, MTU/MSS, uRPF, dual-stack churn) over
 upstream-ISP-flap hypotheses in this case.
 2. Distinguish real degradation (collapsed throughput, sustained high latency) \
 from monitoring artifacts (probes dropped at gateway).
-3. Keep recommendations concrete and ranked. Do not speculate beyond the data.
-4. Output STRICT JSON matching the schema in the user message — no prose outside it.
+3. If the snapshot includes an `incident` block, focus the diagnosis on that \
+specific event — what caused it, how it manifested, what to check — and use the \
+broader window only as context for what was normal/abnormal around it.
+4. Keep recommendations concrete and ranked. Do not speculate beyond the data.
+5. Output STRICT JSON matching the schema in the user message — no prose outside it.
 """
 
 
@@ -91,14 +97,40 @@ def _percentiles(values: List[float]) -> Dict[str, Optional[float]]:
     }
 
 
-def build_snapshot(state, window: str) -> Dict[str, Any]:
+def build_snapshot(state, window: str,
+                   incident_start: Optional[datetime] = None,
+                   incident_end: Optional[datetime] = None,
+                   incident_id: Optional[str] = None) -> Dict[str, Any]:
     """Build a JSON-safe snapshot for the AI. `state` is a MonitorState; we read
-    under its lock and never hold it during the API call."""
-    if window not in WINDOWS:
-        window = "1h"
-    delta = WINDOWS[window]
+    under its lock and never hold it during the API call.
+
+    For window == "outage", incident_start and incident_end define the event;
+    the snapshot covers [incident_start - OUTAGE_LEAD, incident_end + OUTAGE_TAIL].
+    """
     now = datetime.now()
-    cutoff = now - delta
+    incident: Optional[Dict[str, Any]] = None
+    if window == "outage":
+        if incident_start is None or incident_end is None:
+            raise ValueError("outage window requires incident_start and incident_end")
+        cutoff = incident_start - OUTAGE_LEAD
+        end_at = min(now, incident_end + OUTAGE_TAIL)
+        # Window seconds is the snapshot span, not the outage span.
+        window_secs = (end_at - cutoff).total_seconds()
+        incident = {
+            "id": incident_id,
+            "start": incident_start.isoformat(timespec="seconds"),
+            "end": incident_end.isoformat(timespec="seconds"),
+            "duration_s": int((incident_end - incident_start).total_seconds()),
+            "lead_window_min": int(OUTAGE_LEAD.total_seconds() / 60),
+            "tail_window_min": int(OUTAGE_TAIL.total_seconds() / 60),
+        }
+    else:
+        if window not in WINDOWS:
+            window = "1h"
+        delta = WINDOWS[window]
+        cutoff = now - delta
+        end_at = now
+        window_secs = delta.total_seconds()
 
     with state.lock:
         ping_ts = list(state.ping_history_ts)
@@ -115,10 +147,14 @@ def build_snapshot(state, window: str) -> Dict[str, Any]:
         last_router_poll = getattr(state, "last_router_poll", None)
 
     # Pings in window
-    pings_in_window = [
-        v for ts, v in ping_ts
-        if datetime.fromisoformat(ts) >= cutoff
-    ]
+    def _in_window(ts_str: str) -> bool:
+        try:
+            t = datetime.fromisoformat(ts_str)
+        except ValueError:
+            return False
+        return cutoff <= t <= end_at
+
+    pings_in_window = [v for ts, v in ping_ts if _in_window(ts)]
     ping_stats = _percentiles(pings_in_window)
     if len(pings_in_window) > 1:
         ping_stats["jitter_stdev"] = round(statistics.pstdev(pings_in_window), 2)
@@ -131,24 +167,24 @@ def build_snapshot(state, window: str) -> Dict[str, Any]:
     outages_in_window = []
     total_downtime_s = 0.0
     for o in all_outages:
-        o_start = max(o.start, cutoff)
-        o_end = min(o.end if o.end else now, now)
-        if o.start < cutoff and (o.end and o.end < cutoff):
+        eff_end = o.end if o.end else end_at
+        if eff_end < cutoff or o.start > end_at:
             continue
-        if o_end > o_start:
-            total_downtime_s += (o_end - o_start).total_seconds()
+        clipped_start = max(o.start, cutoff)
+        clipped_end = min(eff_end, end_at)
+        if clipped_end > clipped_start:
+            total_downtime_s += (clipped_end - clipped_start).total_seconds()
         outages_in_window.append({
             "start": o.start.isoformat(timespec="seconds"),
             "end": o.end.isoformat(timespec="seconds") if o.end else None,
-            "duration_s": int((o.end - o.start).total_seconds()) if o.end else int((now - o.start).total_seconds()),
+            "duration_s": int((eff_end - o.start).total_seconds()),
             "ongoing": o.end is None,
         })
 
-    window_secs = delta.total_seconds()
     uptime_pct = round(max(0.0, (window_secs - total_downtime_s) / window_secs * 100), 2)
 
     # Speed tests in window
-    speeds = [s for s in speed_history if s.timestamp >= cutoff]
+    speeds = [s for s in speed_history if cutoff <= s.timestamp <= end_at]
     speed_summary = {
         "count": len(speeds),
         "download_mbps": _percentiles([s.download_mbps for s in speeds]),
@@ -171,7 +207,7 @@ def build_snapshot(state, window: str) -> Dict[str, Any]:
     site_summary = []
     for host in site_targets:
         hist = site_ping_hist.get(host, [])
-        in_win = [(t, ms) for t, ms in hist if datetime.fromisoformat(t) >= cutoff]
+        in_win = [(t, ms) for t, ms in hist if _in_window(t)]
         if not in_win:
             continue
         successes = [ms for _, ms in in_win if ms is not None]
@@ -184,20 +220,24 @@ def build_snapshot(state, window: str) -> Dict[str, Any]:
         })
 
     # Router events in window
+    cutoff_iso = cutoff.isoformat()
+    end_at_iso = end_at.isoformat()
     router_in_window = [
         ev for ev in router_events
-        if ev.timestamp >= cutoff.isoformat()
+        if cutoff_iso <= ev.timestamp <= end_at_iso
     ]
     router_summary = router_log.summarize(router_in_window)
     router_summary["available"] = bool(router_events) or router_poll_error is None
     router_summary["poll_error"] = router_poll_error
     router_summary["last_poll"] = last_router_poll.isoformat() if last_router_poll else None
 
-    return {
+    snapshot = {
         "schema_version": 1,
         "generated_at": now.isoformat(timespec="seconds"),
         "window": window,
         "window_seconds": int(window_secs),
+        "window_start": cutoff.isoformat(timespec="seconds"),
+        "window_end": end_at.isoformat(timespec="seconds"),
         "current_provider": provider,
         "provider_uptime_secs_24h": provider_uptime,
         "ping": ping_stats,
@@ -211,6 +251,9 @@ def build_snapshot(state, window: str) -> Dict[str, Any]:
         "sites": site_summary,
         "router_events": router_summary,
     }
+    if incident is not None:
+        snapshot["incident"] = incident
+    return snapshot
 
 
 USER_TEMPLATE = """\

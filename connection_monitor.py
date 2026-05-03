@@ -78,6 +78,15 @@ ROUTER_PACKET_LOG_PATH = os.environ.get("ROUTER_PACKET_LOG_PATH", "")
 ROUTER_SYSLOG_PATH     = os.environ.get("ROUTER_SYSLOG_PATH", "")
 ROUTER_POLL_INTERVAL   = int(os.environ.get("ROUTER_POLL_INTERVAL", "30"))
 
+# Degraded-period detection thresholds (tuning knobs, not deployment config).
+SLOW_OPEN_MULT   = 0.50   # download below 50% of 7d median → open "slow"
+SLOW_CLOSE_MULT  = 0.75   # download above 75% of 7d median → close "slow"
+SLOW_MIN_HISTORY = 5      # need at least N prior samples to use median
+HIGH_PING_OPEN_MULT  = 3.0   # p90 above 3× 7d median ping → candidate high_ping
+HIGH_PING_CLOSE_MULT = 1.5   # p90 back below 1.5× → candidate close
+HIGH_PING_FLOOR_MS   = 100.0 # never trigger if absolute p90 below this
+HIGH_PING_DURATION_S = 60    # must hold above/below threshold this long
+
 _DEFAULT_PING_TARGETS = [
     "netflix.com",
     "disneyplus.com",
@@ -168,6 +177,28 @@ class OutageRecord:
     def ongoing(self) -> bool:
         return self.end is None
 
+    @property
+    def id(self) -> str:
+        # Stable identifier — pinned to the start instant. If an in-progress
+        # outage's start ever shifted (which it doesn't), this would change.
+        return "out:" + self.start.isoformat(timespec="seconds")
+
+
+@dataclass
+class DegradedPeriod:
+    start: datetime
+    kind: str   # "slow" | "high_ping"
+    end: Optional[datetime] = None
+    detail: str = ""
+
+    @property
+    def ongoing(self) -> bool:
+        return self.end is None
+
+    @property
+    def id(self) -> str:
+        return f"deg:{self.kind}:" + self.start.isoformat(timespec="seconds")
+
 
 # ─────────────────────────────────────────────────────────────
 # Shared state (thread-safe)
@@ -222,6 +253,15 @@ class MonitorState:
 
         # Daily history (7-day uptime chart)
         self.daily_history: List[Dict] = []
+
+        # Degraded periods (yellow on timeline)
+        self.degraded_periods: deque = deque(maxlen=2000)
+        self.current_slow: Optional[DegradedPeriod] = None
+        self.current_high_ping: Optional[DegradedPeriod] = None
+        # Rolling latency window for high-ping detection (last 30 samples ≈ 60s @ 2s)
+        self._recent_pings: deque = deque(maxlen=30)
+        self._high_ping_started_above: Optional[datetime] = None
+        self._high_ping_below_since: Optional[datetime] = None
 
         # Router log scraper — stores router_log.RouterEvent objects
         self.router_events: deque = deque(maxlen=5000)
@@ -859,13 +899,17 @@ def run_speed_test(state: MonitorState, label: str) -> None:
                 label=label,
                 provider=provider,
             )
+            slow_event: Optional[Tuple[str, str]] = None
             with state.lock:
                 state.speed_history.append(sample)
                 state.last_speed_success = now
+                slow_event = _update_slow_degraded(state, sample, now)
 
             dl_str = f"↓{dl:.1f}" if dl else "↓?"
             ul_str = f"↑{ul:.1f}" if ul else "↑?"
             state.log(f"Speed [{label}] via {provider}: {dl_str} {ul_str} Mbps")
+            if slow_event:
+                state.log(*slow_event)
         else:
             state.log("Speed test: no results (network error?)", "warning")
 
@@ -881,12 +925,106 @@ def run_speed_test(state: MonitorState, label: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
+# Degraded-period detectors (call with state.lock held)
+# ─────────────────────────────────────────────────────────────
+def _median_recent_downloads(state: "MonitorState", days: int = 7) -> Optional[float]:
+    cutoff = datetime.now() - timedelta(days=days)
+    vals = [s.download_mbps for s in state.speed_history
+            if s.timestamp >= cutoff and s.download_mbps > 0]
+    if len(vals) < SLOW_MIN_HISTORY:
+        return None
+    return statistics.median(vals)
+
+
+def _update_slow_degraded(state: "MonitorState", sample: SpeedSample,
+                          now: datetime) -> Optional[Tuple[str, str]]:
+    """Open or close a 'slow' DegradedPeriod based on this speed sample.
+    Returns an optional (msg, level) for state.log() (called outside the lock).
+    """
+    median = _median_recent_downloads(state)
+    if median is None:
+        return None
+    open_below  = SLOW_OPEN_MULT  * median
+    close_above = SLOW_CLOSE_MULT * median
+    dl = sample.download_mbps
+    if state.current_slow is None and dl < open_below:
+        period = DegradedPeriod(
+            start=now, kind="slow",
+            detail=f"download {dl:.1f} Mbps < {open_below:.1f} Mbps (50% of 7d median {median:.1f})",
+        )
+        state.current_slow = period
+        state.degraded_periods.append(period)
+        return (f"Degraded: slow ({dl:.1f} Mbps, baseline {median:.1f})", "warning")
+    if state.current_slow is not None and dl >= close_above:
+        state.current_slow.end = now
+        msg = f"Degraded ended: speed recovered to {dl:.1f} Mbps"
+        state.current_slow = None
+        return (msg, "success")
+    return None
+
+
+def _update_high_ping_degraded(state: "MonitorState", latency_ms: Optional[float],
+                               now: datetime) -> Optional[Tuple[str, str]]:
+    """Track high-ping windows. Called from connectivity_thread under state.lock.
+    Returns optional (msg, level) to log outside the lock.
+    """
+    if latency_ms is not None:
+        state._recent_pings.append(latency_ms)
+    if len(state._recent_pings) < state._recent_pings.maxlen:
+        return None
+
+    pings = sorted(state._recent_pings)
+    p90 = pings[int(0.9 * (len(pings) - 1))]
+
+    # Need a 7d median baseline to size the threshold; fall back to floor only.
+    baseline = None
+    cutoff = now - timedelta(days=7)
+    medians = [s.ping_ms for s in state.speed_history
+               if s.timestamp >= cutoff and s.ping_ms > 0]
+    if len(medians) >= SLOW_MIN_HISTORY:
+        baseline = statistics.median(medians)
+    open_threshold  = max(HIGH_PING_FLOOR_MS,
+                          (HIGH_PING_OPEN_MULT  * baseline) if baseline else HIGH_PING_FLOOR_MS)
+    close_threshold = max(HIGH_PING_FLOOR_MS * 0.6,
+                          (HIGH_PING_CLOSE_MULT * baseline) if baseline else HIGH_PING_FLOOR_MS * 0.6)
+
+    if state.current_high_ping is None:
+        if p90 >= open_threshold:
+            if state._high_ping_started_above is None:
+                state._high_ping_started_above = now
+            elif (now - state._high_ping_started_above).total_seconds() >= HIGH_PING_DURATION_S:
+                period = DegradedPeriod(
+                    start=state._high_ping_started_above, kind="high_ping",
+                    detail=f"p90 {p90:.0f}ms ≥ {open_threshold:.0f}ms threshold",
+                )
+                state.current_high_ping = period
+                state.degraded_periods.append(period)
+                state._high_ping_started_above = None
+                return (f"Degraded: high ping (p90 {p90:.0f}ms)", "warning")
+        else:
+            state._high_ping_started_above = None
+    else:
+        if p90 <= close_threshold:
+            if state._high_ping_below_since is None:
+                state._high_ping_below_since = now
+            elif (now - state._high_ping_below_since).total_seconds() >= HIGH_PING_DURATION_S:
+                state.current_high_ping.end = now
+                state.current_high_ping = None
+                state._high_ping_below_since = None
+                return (f"Degraded ended: ping recovered (p90 {p90:.0f}ms)", "success")
+        else:
+            state._high_ping_below_since = None
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
 # Persistence — save/load to disk, purge data older than 24 h
 # ─────────────────────────────────────────────────────────────
 def save_state(state: MonitorState) -> None:
     """Write speed history, outages, and ping history to disk (atomic write)."""
     try:
         cutoff = datetime.now() - _24H
+        cutoff_30d = datetime.now() - _30D
         with state.lock:
             speed = [
                 {
@@ -906,7 +1044,17 @@ def save_state(state: MonitorState) -> None:
                     "end": o.end.isoformat() if o.end else None,
                 }
                 for o in state.outages
-                if o.start >= cutoff
+                if o.start >= cutoff_30d
+            ]
+            degraded = [
+                {
+                    "start": d.start.isoformat(),
+                    "end": d.end.isoformat() if d.end else None,
+                    "kind": d.kind,
+                    "detail": d.detail,
+                }
+                for d in state.degraded_periods
+                if d.start >= cutoff_30d
             ]
             ping_ts = [
                 [ts, v]
@@ -989,6 +1137,7 @@ def save_state(state: MonitorState) -> None:
             "provider_colors": provider_colors,
             "daily_history": new_daily_history,
             "router_events": router_events_to_save,
+            "degraded_periods": degraded,
             "diagnoses": diagnoses_to_save,
             "saved_at": datetime.now().isoformat(),
         }
@@ -1008,6 +1157,7 @@ def load_state(state: MonitorState) -> None:
         with open(DATA_FILE) as f:
             data = json.load(f)
         cutoff = datetime.now() - _24H
+        cutoff_30d = datetime.now() - _30D
 
         speed: List[SpeedSample] = []
         for s in data.get("speed_history", []):
@@ -1025,9 +1175,24 @@ def load_state(state: MonitorState) -> None:
         outages: List[OutageRecord] = []
         for o in data.get("outages", []):
             start = datetime.fromisoformat(o["start"])
-            if start >= cutoff:
+            if start >= cutoff_30d:
                 end = datetime.fromisoformat(o["end"]) if o.get("end") else None
                 outages.append(OutageRecord(start=start, end=end))
+
+        degraded_loaded: List[DegradedPeriod] = []
+        for d in data.get("degraded_periods", []):
+            try:
+                start = datetime.fromisoformat(d["start"])
+            except (KeyError, ValueError):
+                continue
+            if start < cutoff_30d:
+                continue
+            end = datetime.fromisoformat(d["end"]) if d.get("end") else None
+            degraded_loaded.append(DegradedPeriod(
+                start=start, end=end,
+                kind=d.get("kind", "slow"),
+                detail=d.get("detail", ""),
+            ))
 
         ping_ts: List[Tuple[str, float]] = [
             (ts, v)
@@ -1067,6 +1232,7 @@ def load_state(state: MonitorState) -> None:
             state.provider_colors = data.get("provider_colors", {})
             state.daily_history = data.get("daily_history", [])
             state.router_events = deque(router_events_loaded, maxlen=5000)
+            state.degraded_periods = deque(degraded_loaded, maxlen=2000)
             cutoff_30d_iso = (datetime.now() - _30D).isoformat()
             history_raw = data.get("diagnoses")
             if history_raw is None:
@@ -1244,33 +1410,39 @@ def connectivity_thread(state: MonitorState) -> None:
     while state.running:
         online, latency = check_connectivity()
         event: Optional[Tuple[str, str]] = None
+        ping_event: Optional[Tuple[str, str]] = None
 
         with state.lock:
             was_connected = state.connected
             state.connected = online
+            now = datetime.now()
 
             if latency is not None:
                 state.last_ping_ms = latency
                 state.ping_history.append(latency)
                 state.ping_history_ts.append(
-                    (datetime.now().isoformat(timespec="seconds"), latency)
+                    (now.isoformat(timespec="seconds"), latency)
                 )
             elif not online:
                 state.last_ping_ms = None
 
             if online and not was_connected:
                 if state.current_outage:
-                    state.current_outage.end = datetime.now()
+                    state.current_outage.end = now
                     state.outages.append(state.current_outage)
                     state.current_outage = None
                     state.trigger_post_outage_test = True
                 event = ("Connection restored!", "success")
             elif not online and was_connected:
-                state.current_outage = OutageRecord(start=datetime.now())
+                state.current_outage = OutageRecord(start=now)
                 event = ("Connection LOST!", "error")
+
+            ping_event = _update_high_ping_degraded(state, latency, now)
 
         if event:
             state.log(*event)
+        if ping_event:
+            state.log(*ping_event)
 
         time.sleep(2)
 
@@ -1347,6 +1519,340 @@ def speed_test_thread(state: MonitorState) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
+# Shared timeline JS component
+# ─────────────────────────────────────────────────────────────
+# Inlined into both DASHBOARD_HTML (7d view) and DIAGNOSE_HTML (30d view).
+# Renders a per-day vertical bar timeline on a <canvas>, with hit-testing and
+# tooltips. The caller passes `onIncidentClick(incident)`; the component does
+# not assume how clicks are handled (confirm, navigate, etc.).
+TIMELINE_JS = r"""
+window.UptimeTimeline = (function () {
+  const COLORS = {
+    bg:       '#0d1117',
+    bar_ok:   'rgba(63,185,80,0.55)',   // muted green
+    bar_no:   '#161b22',                 // future / no data
+    outage:   '#f85149',
+    outage_seen: '#bc8cff',              // distinct: magenta = "annotated"
+    degraded: '#d29922',
+    degraded_seen: 'rgba(188,140,255,0.65)',
+    today:    '#58a6ff',
+    text:     '#e6edf3',
+    dim:      '#8b949e',
+    grid:     'rgba(255,255,255,0.06)',
+    weekend:  'rgba(255,255,255,0.04)',
+    now:      '#39c5cf',
+  };
+
+  // Tooltip lives once at body level, fixed-positioned, so it never affects
+  // page layout (and therefore never causes the canvas to resize-loop).
+  let _tooltip = null;
+  function getTooltip() {
+    if (_tooltip) return _tooltip;
+    _tooltip = document.createElement('div');
+    _tooltip.className = 'timeline-tooltip';
+    _tooltip.style.cssText =
+      'position:fixed;display:none;z-index:1000;' +
+      'background:#1c2128;border:1px solid #30363d;border-radius:5px;' +
+      'padding:7px 10px;font-size:11px;line-height:1.5;color:#e6edf3;' +
+      'pointer-events:none;white-space:nowrap;' +
+      'box-shadow:0 4px 14px rgba(0,0,0,0.5);max-width:280px;';
+    document.body.appendChild(_tooltip);
+    return _tooltip;
+  }
+  function placeTooltip(clientX, clientY) {
+    const tt = getTooltip();
+    tt.style.display = 'block';
+    // Measure after display.
+    const w = tt.offsetWidth, h = tt.offsetHeight;
+    const margin = 8;
+    let left = clientX + 14;
+    let top  = clientY + 14;
+    const vw = window.innerWidth, vh = window.innerHeight;
+    if (left + w + margin > vw) left = clientX - w - 14;
+    if (left < margin) left = margin;
+    if (top + h + margin > vh)  top = clientY - h - 14;
+    if (top < margin) top = margin;
+    tt.style.left = left + 'px';
+    tt.style.top  = top  + 'px';
+  }
+  function hideTooltip() {
+    if (_tooltip) _tooltip.style.display = 'none';
+  }
+
+  function startOfDay(d) {
+    const x = new Date(d);
+    x.setHours(0, 0, 0, 0);
+    return x;
+  }
+  function fmtDuration(s) {
+    s = Math.max(0, Math.floor(s));
+    if (s < 60) return s + 's';
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + 'm ' + (s % 60).toString().padStart(2, '0') + 's';
+    const h = Math.floor(m / 60);
+    return h + 'h ' + (m % 60).toString().padStart(2, '0') + 'm';
+  }
+  function fmtTimeOfDay(iso) {
+    if (!iso) return '—';
+    return iso.slice(11, 19);
+  }
+  function fmtDate(d) {
+    return (d.getMonth() + 1) + '/' + d.getDate();
+  }
+
+  function makeStripePattern(ctx, color) {
+    const off = document.createElement('canvas');
+    off.width = 8; off.height = 8;
+    const c = off.getContext('2d');
+    c.strokeStyle = color;
+    c.lineWidth = 2;
+    c.beginPath();
+    c.moveTo(-2, 10); c.lineTo(10, -2);
+    c.moveTo(-2, 18); c.lineTo(18, -2);
+    c.stroke();
+    return ctx.createPattern(off, 'repeat');
+  }
+
+  function render(canvas, opts) {
+    const days        = opts.days || 7;
+    const outages     = opts.outages   || [];
+    const degraded    = opts.degraded  || [];
+    const analyzedIds = new Set(opts.analyzedIds || []);
+    const monitorStartedAt = opts.monitorStartedAt
+      ? new Date(opts.monitorStartedAt) : null;
+    const onClick = opts.onIncidentClick || null;
+    const showHourLabels = days <= 7;
+
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth || canvas.offsetWidth;
+    const cssH = canvas.clientHeight || canvas.offsetHeight;
+    canvas.width  = Math.floor(cssW * dpr);
+    canvas.height = Math.floor(cssH * dpr);
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    const marginL = showHourLabels ? 26 : 4;
+    const marginR = 4;
+    const marginT = 16;   // for severity badges
+    const marginB = 18;   // for day labels
+    const innerW = cssW - marginL - marginR;
+    const innerH = cssH - marginT - marginB;
+
+    const today = startOfDay(new Date());
+    const dayStarts = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(today); d.setDate(today.getDate() - i);
+      dayStarts.push(d);
+    }
+    const colW = innerW / days;
+    const barW = Math.max(2, colW - 2);
+
+    // Y maps minutes-of-day [0..1440] → pixels (top = 0, bottom = 23:59)
+    const yOf = (min) => marginT + (min / 1440) * innerH;
+    const minutesOfDay = (date) =>
+      date.getHours() * 60 + date.getMinutes() + date.getSeconds() / 60;
+
+    const dowName = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    const incidentRects = [];
+
+    // Bars
+    dayStarts.forEach((day, idx) => {
+      const dayEnd = new Date(day); dayEnd.setDate(day.getDate() + 1);
+      const isToday = day.getTime() === today.getTime();
+      const dow = day.getDay();
+      const x = marginL + idx * colW + (colW - barW) / 2;
+
+      // Weekend tint
+      if (dow === 0 || dow === 6) {
+        ctx.fillStyle = COLORS.weekend;
+        ctx.fillRect(marginL + idx * colW, marginT, colW, innerH);
+      }
+
+      // Determine "covered" portion (we have data) vs "uncovered."
+      // Today: covered up to "now". Past days: covered if monitor was running.
+      const now = new Date();
+      let coveredFrom = day;
+      let coveredTo   = isToday ? now : dayEnd;
+      if (monitorStartedAt && monitorStartedAt > coveredFrom) coveredFrom = monitorStartedAt;
+      if (coveredTo < coveredFrom) coveredTo = coveredFrom;
+
+      // Background: green where covered, dim where not.
+      ctx.fillStyle = COLORS.bar_no;
+      ctx.fillRect(x, marginT, barW, innerH);
+      const fromMin = (coveredFrom <= day)         ? 0    : minutesOfDay(coveredFrom);
+      const toMin   = (coveredTo   >= dayEnd)      ? 1440 : minutesOfDay(coveredTo);
+      if (toMin > fromMin) {
+        ctx.fillStyle = COLORS.bar_ok;
+        ctx.fillRect(x, yOf(fromMin), barW, yOf(toMin) - yOf(fromMin));
+      }
+
+      // Today: border
+      if (isToday) {
+        ctx.strokeStyle = COLORS.today;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x + 0.5, marginT + 0.5, barW - 1, innerH - 1);
+      }
+
+      // Day label
+      ctx.fillStyle = COLORS.dim;
+      ctx.font = '10px ui-monospace, monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      const label = (days <= 7)
+        ? dowName[dow]
+        : ((idx === 0 || idx === days - 1 || idx % 5 === 0) ? fmtDate(day) : '');
+      if (label) ctx.fillText(label, x + barW / 2, marginT + innerH + 3);
+    });
+
+    // Hour gridlines (7d only)
+    if (showHourLabels) {
+      ctx.strokeStyle = COLORS.grid;
+      ctx.fillStyle = COLORS.dim;
+      ctx.lineWidth = 1;
+      ctx.font = '9px ui-monospace, monospace';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      [0, 6, 12, 18, 24].forEach(h => {
+        const y = yOf(h * 60);
+        ctx.beginPath();
+        ctx.moveTo(marginL, y); ctx.lineTo(cssW - marginR, y);
+        ctx.stroke();
+        if (h !== 24) {
+          const lbl = h === 0 ? '12a' : (h === 12 ? '12p' : (h < 12 ? h + 'a' : (h - 12) + 'p'));
+          ctx.fillText(lbl, marginL - 4, y);
+        }
+      });
+    }
+
+    // Helper: draw an incident span (possibly crossing midnight) into bars
+    function drawSpan(span, category) {
+      const start = new Date(span.start);
+      const end = span.end ? new Date(span.end) : new Date();
+      const isAnalyzed = analyzedIds.has(span.id);
+      const baseColor =
+        category === 'outage' ? (isAnalyzed ? COLORS.outage_seen   : COLORS.outage)
+                              : (isAnalyzed ? COLORS.degraded_seen : COLORS.degraded);
+      let useStripes = (category !== 'outage');
+      let pattern = null;
+      if (useStripes) pattern = makeStripePattern(ctx, baseColor);
+
+      dayStarts.forEach((day, idx) => {
+        const dayEnd = new Date(day); dayEnd.setDate(day.getDate() + 1);
+        if (end <= day || start >= dayEnd) return;
+        const segStart = (start > day) ? start : day;
+        const segEnd   = (end   < dayEnd) ? end : dayEnd;
+        const yA = yOf(minutesOfDay(segStart));
+        const yB = yOf(minutesOfDay(segEnd >= dayEnd ? new Date(dayEnd.getTime() - 1) : segEnd));
+        const x = marginL + idx * colW + (colW - barW) / 2;
+        const h = Math.max(2, yB - yA);
+        ctx.fillStyle = useStripes ? pattern : baseColor;
+        ctx.fillRect(x, yA, barW, h);
+        incidentRects.push({
+          x, y: yA, w: barW, h,
+          incident: { ...span, category, analyzed: isAnalyzed, dayIndex: idx },
+        });
+      });
+    }
+
+    // Draw degraded first (so outages render on top)
+    degraded.forEach(d => drawSpan(d, 'degraded'));
+    outages.forEach(o  => drawSpan(o,  'outage'));
+
+    // "Now" tick on today's column
+    const now = new Date();
+    const todayIdx = dayStarts.findIndex(d => d.getTime() === today.getTime());
+    if (todayIdx >= 0) {
+      const xL = marginL + todayIdx * colW + (colW - barW) / 2;
+      const yN = yOf(minutesOfDay(now));
+      ctx.strokeStyle = COLORS.now;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(xL - 1, yN); ctx.lineTo(xL + barW + 1, yN);
+      ctx.stroke();
+    }
+
+    // Severity badges (longest outage duration per day)
+    const longestPerDay = {};
+    outages.forEach(o => {
+      const d = startOfDay(new Date(o.start)).getTime();
+      const sec = ((o.end ? new Date(o.end) : new Date()) - new Date(o.start)) / 1000;
+      if (!longestPerDay[d] || sec > longestPerDay[d]) longestPerDay[d] = sec;
+    });
+    ctx.font = 'bold 9px ui-monospace, monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillStyle = COLORS.outage;
+    dayStarts.forEach((day, idx) => {
+      const sec = longestPerDay[day.getTime()];
+      if (!sec) return;
+      const x = marginL + idx * colW + colW / 2;
+      ctx.fillText(fmtDuration(sec), x, marginT - 1);
+    });
+
+    // Hover/click handlers
+    let activeIncident = null;
+    function hitTest(evt) {
+      const rect = canvas.getBoundingClientRect();
+      const px = evt.clientX - rect.left;
+      const py = evt.clientY - rect.top;
+      for (const r of incidentRects) {
+        if (px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h) return r.incident;
+      }
+      return null;
+    }
+
+    canvas.onmousemove = (e) => {
+      const inc = hitTest(e);
+      const tt = getTooltip();
+      if (inc) {
+        canvas.style.cursor = 'pointer';
+        const start = new Date(inc.start);
+        const end   = inc.end ? new Date(inc.end) : new Date();
+        const span  = (end - start) / 1000;
+        const kindLabel = inc.category === 'outage'
+          ? (inc.outage_count && inc.outage_count > 1
+              ? inc.outage_count + ' outages (clustered)'
+              : 'Outage')
+          : (inc.kind === 'high_ping' ? 'High ping'
+             : inc.kind === 'slow' ? 'Slow speed'
+             : 'Degraded');
+        const lines = [];
+        lines.push('<strong>' + kindLabel + '</strong>');
+        lines.push(start.toLocaleDateString() + ' ' +
+          fmtTimeOfDay(inc.start) + ' → ' + fmtTimeOfDay(inc.end || ''));
+        lines.push('Span: ' + fmtDuration(span));
+        if (inc.total_outage_s != null && inc.outage_count > 1) {
+          lines.push('Total downtime in cluster: ' + fmtDuration(inc.total_outage_s));
+        }
+        if (inc.analyzed) {
+          lines.push('<span style="color:#bc8cff">✓ Analyzed (click to view)</span>');
+        } else if (inc.category === 'outage') {
+          lines.push('<span style="color:var(--dim)">Click to diagnose</span>');
+        }
+        tt.innerHTML = lines.join('<br>');
+        placeTooltip(e.clientX, e.clientY);
+      } else {
+        canvas.style.cursor = 'default';
+        hideTooltip();
+      }
+    };
+    canvas.onmouseleave = hideTooltip;
+    canvas.onclick = (e) => {
+      const inc = hitTest(e);
+      if (inc && onClick) {
+        hideTooltip();
+        onClick(inc);
+      }
+    };
+  }
+
+  return { render };
+})();
+"""
+
+
+# ─────────────────────────────────────────────────────────────
 # Web dashboard (HTML template)
 # ─────────────────────────────────────────────────────────────
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -1356,6 +1862,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Connection Monitor</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="/static/timeline.js"></script>
 <style>
 :root {
   --bg:      #0d1117;
@@ -1818,10 +2325,12 @@ tr:last-child td { border-bottom: none; }
     </div>
   </div>
 
-  <!-- ── 7-Day Uptime Chart ─────────────────────────────────── -->
-  <div class="card col-3">
+  <!-- ── 7-Day Uptime Timeline ──────────────────────────────── -->
+  <div class="card col-3" id="uptime-card" style="display:flex;flex-direction:column">
     <div class="card-title">7-Day Uptime</div>
-    <div class="chart-wrap" style="height:160px"><canvas id="uptimeChart"></canvas></div>
+    <div class="chart-wrap" style="height:280px;flex:1;position:relative">
+      <canvas id="uptimeTimeline" style="width:100%;height:100%"></canvas>
+    </div>
     <a href="/diagnose" id="diag-link" style="display:block;margin-top:10px;padding:8px 10px;
         text-align:center;background:var(--bg);border:1px solid var(--border);
         border-radius:5px;color:var(--blue);text-decoration:none;font-size:12px">
@@ -2097,79 +2606,10 @@ const pingChart5m     = new Chart(document.getElementById('pingChart5m'),     ma
 const uploadChartCombined   = new Chart(document.getElementById('uploadChartCombined'),   makeSpeedBarConfig('↑ Upload (Mbps)',   '#3fb950'));
 const downloadChartCombined = new Chart(document.getElementById('downloadChartCombined'), makeSpeedBarConfig('↓ Download (Mbps)', '#58a6ff'));
 
-const uptimeChart = new Chart(document.getElementById('uptimeChart'), {
-  type: 'bar',
-  data: {
-    labels: [],
-    datasets: [
-      {
-        type: 'bar',
-        label: 'Uptime %',
-        data: [],
-        backgroundColor: [],
-        borderWidth: 0,
-        borderRadius: 3,
-        yAxisID: 'y',
-      },
-      {
-        type: 'line', label: 'p10 ping', data: [], showLine: false,
-        pointRadius: 3, pointHoverRadius: 5,
-        borderColor: 'rgba(57,197,207,0.5)', backgroundColor: 'rgba(57,197,207,0.5)',
-        yAxisID: 'y1',
-      },
-      {
-        type: 'line', label: 'p50 ping', data: [], showLine: false,
-        pointRadius: 5, pointHoverRadius: 7,
-        borderColor: '#39c5cf', backgroundColor: '#39c5cf',
-        yAxisID: 'y1',
-      },
-      {
-        type: 'line', label: 'p90 ping', data: [], showLine: false,
-        pointRadius: 3, pointHoverRadius: 5,
-        borderColor: 'rgba(57,197,207,0.35)', backgroundColor: 'rgba(57,197,207,0.35)',
-        yAxisID: 'y1',
-      },
-    ],
-  },
-  options: {
-    responsive: true, maintainAspectRatio: false, animation: false,
-    plugins: {
-      ...sharedPlugins,
-      legend: { display: false },
-      tooltip: {
-        ...sharedTooltip,
-        callbacks: {
-          title: ctx => ctx[0]?.label || '',
-          afterBody: ctx => {
-            const i = ctx[0]?.dataIndex;
-            const d = uptimeChart._days?.[i];
-            if (!d) return [];
-            const lines = [`Uptime: ${d.uptime_pct != null ? d.uptime_pct + '%' : '—'}`];
-            if (d.p10 != null) lines.push(`p10: ${d.p10}ms  p50: ${d.p50}ms  p90: ${d.p90}ms`);
-            return lines;
-          },
-          label: () => '',
-        },
-      },
-    },
-    scales: {
-      x: { ...sharedScaleX },
-      y: {
-        position: 'left', min: 0, max: 100,
-        ticks: { ...sharedScaleY.ticks, callback: v => v + '%' },
-        grid: sharedScaleY.grid,
-        title: { display: false },
-      },
-      y1: {
-        position: 'right', min: 0,
-        ticks: { ...sharedScaleY.ticks, callback: v => v + 'ms' },
-        grid: { drawOnChartArea: false },
-      },
-    },
-  },
-});
+// 7-day uptime is now a custom-canvas timeline (see updateUptimeTimeline below).
+const uptimeTimelineCanvas = document.getElementById('uptimeTimeline');
 
-const allCharts = [pingChart24h, pingChart5m, uploadChartCombined, downloadChartCombined, uptimeChart];
+const allCharts = [pingChart24h, pingChart5m, uploadChartCombined, downloadChartCombined];
 
 // ── Chart view toggle ─────────────────────────────────────────
 let currentView = 'split';
@@ -2398,24 +2838,7 @@ function update(d) {
     updateBandwidthCharts(d, currentView);
   }
 
-  // 7-day uptime chart
-  if (d.uptime_7d && d.uptime_7d.length > 0) {
-    const days = d.uptime_7d;
-    uptimeChart._days = days;
-    uptimeChart.data.labels = days.map(d => `${d.label}\n${d.date}`);
-    uptimeChart.data.datasets[0].data = days.map(d => d.uptime_pct);
-    uptimeChart.data.datasets[0].backgroundColor = days.map(d => {
-      if (d.uptime_pct == null) return 'rgba(139,148,158,0.2)';
-      if (d.uptime_pct >= 99.9) return 'rgba(63,185,80,0.7)';
-      if (d.uptime_pct >= 99)   return 'rgba(63,185,80,0.4)';
-      if (d.uptime_pct >= 95)   return 'rgba(210,153,34,0.6)';
-      return 'rgba(248,81,73,0.6)';
-    });
-    uptimeChart.data.datasets[1].data = days.map(d => d.p10);
-    uptimeChart.data.datasets[2].data = days.map(d => d.p50);
-    uptimeChart.data.datasets[3].data = days.map(d => d.p90);
-    uptimeChart.update('none');
-  }
+  // 7-day uptime timeline rendered separately via /api/timeline (see below).
 
   // Site status matrix
   if (d.site_matrix && d.site_matrix.length > 0) {
@@ -2494,6 +2917,61 @@ function update(d) {
 
 }
 
+// ── Uptime timeline (7d) ─────────────────────────────────────
+function fmtIncidentDuration(s) {
+  s = Math.max(0, Math.floor(s));
+  if (s < 60) return s + ' seconds';
+  if (s < 3600) return Math.floor(s / 60) + ' minutes';
+  return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+}
+
+function onTimelineClick(inc) {
+  if (!inc) return;
+  if (inc.category === 'outage') {
+    if (inc.analyzed) {
+      window.location = '/diagnose?show=' + encodeURIComponent(inc.id);
+      return;
+    }
+    const start = new Date(inc.start);
+    const end   = inc.end ? new Date(inc.end) : new Date();
+    const sec   = (end - start) / 1000;
+    const ok = window.confirm(
+      'Run AI diagnosis on this ' + fmtIncidentDuration(sec) +
+      ' outage at ' + start.toLocaleString() + '?\\n\\n' +
+      'This will use ~$0.02 of API credit and take ~5–10 seconds.'
+    );
+    if (!ok) return;
+    window.location = '/diagnose?run=' + encodeURIComponent(inc.id);
+  } else {
+    // Degraded periods: jump to /diagnose page to inspect; no auto-run for now.
+    window.location = '/diagnose';
+  }
+}
+
+let _timelineCache = null;
+function paintTimeline() {
+  if (!_timelineCache) return;
+  UptimeTimeline.render(uptimeTimelineCanvas, {
+    days: 7,
+    outages: _timelineCache.outages,
+    degraded: _timelineCache.degraded,
+    analyzedIds: _timelineCache.analyzed_ids,
+    monitorStartedAt: _timelineCache.monitor_started_at,
+    onIncidentClick: onTimelineClick,
+  });
+}
+async function refreshTimeline() {
+  try {
+    const resp = await fetch('/api/timeline?days=7');
+    if (!resp.ok) return;
+    _timelineCache = await resp.json();
+    paintTimeline();
+  } catch (e) {}
+}
+// Resize re-renders from cache; never refetches (avoids the layout-thrash loop
+// that caused tooltip flicker on the rightmost bar).
+window.addEventListener('resize', paintTimeline);
+
 // ── AI Diagnostics last-run subtext ──────────────────────────
 function fmtRelative(iso) {
   if (!iso) return 'Never run';
@@ -2530,6 +3008,10 @@ window.addEventListener('resize', () => allCharts.forEach(c => c.resize()));
 
 poll();
 setInterval(poll, 2000);
+
+// Timeline refreshes less often; outages don't change every 2 seconds.
+refreshTimeline();
+setInterval(refreshTimeline, 30000);
 </script>
 </body>
 </html>
@@ -2776,6 +3258,7 @@ DIAGNOSE_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Connection Monitor — AI Diagnosis</title>
+<script src="/static/timeline.js"></script>
 <style>
 :root {
   --bg:      #0d1117;
@@ -2952,6 +3435,22 @@ header {
   </div>
 </header>
 
+<div class="card" id="timeline-card" style="margin-bottom:12px">
+  <div class="card-title" style="display:flex;justify-content:space-between;align-items:baseline">
+    <span>30-day Uptime Timeline</span>
+    <span id="timeline-stats" style="color:var(--dim);font-size:11px;font-weight:normal"></span>
+  </div>
+  <div style="height:160px;position:relative">
+    <canvas id="timelineCanvas" style="width:100%;height:100%"></canvas>
+  </div>
+  <div style="color:var(--dim);font-size:10px;margin-top:6px;display:flex;gap:14px;flex-wrap:wrap">
+    <span><span style="color:var(--red)">█</span> outage</span>
+    <span><span style="color:var(--yellow)">▨</span> degraded (slow / high ping)</span>
+    <span><span style="color:rgba(248,81,73,0.45)">█</span> already analyzed (click to view)</span>
+    <span><span style="color:var(--cyan)">─</span> now</span>
+  </div>
+</div>
+
 <div class="layout">
 
   <!-- Left: History -->
@@ -3121,6 +3620,120 @@ async function loadHistory() {
   }
 }
 
+function fmtIncidentDuration(s) {
+  s = Math.max(0, Math.floor(s));
+  if (s < 60) return s + ' seconds';
+  if (s < 3600) return Math.floor(s / 60) + ' minutes';
+  return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+}
+
+function findDiagnosisForOutage(outageId) {
+  return history.find(d => d.outage_id === outageId) || null;
+}
+
+function onTimelineClick(inc) {
+  if (!inc) return;
+  if (inc.category === 'outage') {
+    const existing = findDiagnosisForOutage(inc.id);
+    if (existing) {
+      selectDiagnosis(existing.id);
+      return;
+    }
+    const start = new Date(inc.start);
+    const sec   = ((inc.end ? new Date(inc.end) : new Date()) - start) / 1000;
+    const ok = window.confirm(
+      'Run AI diagnosis on this ' + fmtIncidentDuration(sec) +
+      ' outage at ' + start.toLocaleString() + '?\\n\\n' +
+      'This will use ~$0.02 of API credit and take ~5–10 seconds.'
+    );
+    if (!ok) return;
+    runOutage(inc);
+  }
+}
+
+async function runOutage(inc) {
+  const status = document.getElementById('run-status');
+  const btns = document.querySelectorAll('.run-btn');
+  btns.forEach(b => b.disabled = true);
+  status.textContent = 'Diagnosing outage…';
+  try {
+    const resp = await fetch('/api/diagnose', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        window: 'outage',
+        start: inc.start,
+        end:   inc.end || new Date().toISOString(),
+        outage_id: inc.id,
+      }),
+    });
+    const data = await resp.json();
+    if (data.id) selectedId = data.id;
+    await loadHistory();
+    await refreshTimeline();
+    status.textContent = '';
+  } catch (e) {
+    status.textContent = 'Request failed';
+  } finally {
+    btns.forEach(b => b.disabled = false);
+  }
+}
+
+let _timelineData = null;
+function paintTimeline() {
+  if (!_timelineData) return;
+  UptimeTimeline.render(document.getElementById('timelineCanvas'), {
+    days: 30,
+    outages: _timelineData.outages,
+    degraded: _timelineData.degraded,
+    analyzedIds: _timelineData.analyzed_ids,
+    monitorStartedAt: _timelineData.monitor_started_at,
+    onIncidentClick: onTimelineClick,
+  });
+  const total = (_timelineData.outages || []).length;
+  const seen = (_timelineData.analyzed_ids || []).length;
+  const stats = document.getElementById('timeline-stats');
+  if (stats) stats.textContent = total + ' incidents · ' + seen + ' analyzed';
+}
+async function refreshTimeline() {
+  try {
+    const resp = await fetch('/api/timeline?days=30');
+    if (!resp.ok) return;
+    _timelineData = await resp.json();
+    paintTimeline();
+  } catch (e) {}
+}
+window.addEventListener('resize', paintTimeline);
+
+async function handleUrlParams() {
+  const params = new URLSearchParams(window.location.search);
+  const showId = params.get('show');
+  const runId  = params.get('run');
+  if (showId) {
+    const existing = findDiagnosisForOutage(showId);
+    if (existing) selectDiagnosis(existing.id);
+    window.history.replaceState({}, '', '/diagnose');
+    return;
+  }
+  if (runId) {
+    const existing = findDiagnosisForOutage(runId);
+    if (existing) {
+      selectDiagnosis(existing.id);
+      window.history.replaceState({}, '', '/diagnose');
+      return;
+    }
+    // Need the outage's start/end from the timeline data
+    if (!_timelineData) await refreshTimeline();
+    const inc = (_timelineData?.outages || []).find(o => o.id === runId);
+    if (inc) {
+      window.history.replaceState({}, '', '/diagnose');
+      runOutage({ ...inc, kind: 'outage' });
+    } else {
+      window.history.replaceState({}, '', '/diagnose');
+    }
+  }
+}
+
 async function runNew(window) {
   const status = document.getElementById('run-status');
   const btns = document.querySelectorAll('.run-btn');
@@ -3149,7 +3762,12 @@ document.querySelectorAll('.run-btn').forEach(btn => {
   btn.addEventListener('click', () => runNew(btn.dataset.window));
 });
 
-loadHistory();
+(async () => {
+  await loadHistory();
+  await refreshTimeline();
+  await handleUrlParams();
+})();
+setInterval(refreshTimeline, 30000);
 </script>
 </body>
 </html>
@@ -3220,7 +3838,16 @@ def api_diagnose():
 
     body = request.get_json(silent=True) or {}
     window = body.get("window", "1h")
-    if window not in ai_diagnosis.WINDOWS:
+    incident_start = incident_end = None
+    outage_id = None
+    if window == "outage":
+        try:
+            incident_start = datetime.fromisoformat(body["start"])
+            incident_end   = datetime.fromisoformat(body["end"])
+        except (KeyError, TypeError, ValueError):
+            return jsonify({"ok": False, "error": "outage window requires ISO start and end"}), 400
+        outage_id = body.get("outage_id")
+    elif window not in ai_diagnosis.WINDOWS:
         return jsonify({"ok": False, "error": f"invalid window: {window!r}"}), 400
 
     with _state.lock:
@@ -3229,13 +3856,21 @@ def api_diagnose():
         _state.diagnosis_in_progress = True
 
     try:
-        snapshot = ai_diagnosis.build_snapshot(_state, window)
+        snapshot = ai_diagnosis.build_snapshot(
+            _state, window,
+            incident_start=incident_start,
+            incident_end=incident_end,
+            incident_id=outage_id,
+        )
         result = ai_diagnosis.diagnose(snapshot)
         result["id"] = str(int(time.time() * 1000))
+        if outage_id:
+            result["outage_id"] = outage_id
         with _state.lock:
             _state.diagnoses.appendleft(result)
         if result.get("ok"):
-            _state.log(f"AI diagnosis ({window}) — severity: "
+            label = f"outage {outage_id}" if outage_id else window
+            _state.log(f"AI diagnosis ({label}) — severity: "
                        f"{(result.get('result') or {}).get('severity', '?')}", "info")
         else:
             _state.log(f"AI diagnosis failed: {result.get('error')}", "warning")
@@ -3252,9 +3887,113 @@ def api_diagnoses():
     return jsonify({"items": _diagnoses_within_30d(_state)})
 
 
+CLUSTER_GAP_SECS = 300  # outages within 5 min of each other = one incident
+
+
+def _cluster_outages(outages: List[OutageRecord], now: datetime) -> List[Dict]:
+    """Group nearby outages into clusters. Returns a list of cluster dicts ready
+    to ship to the client (with per-cluster ID and member list)."""
+    if not outages:
+        return []
+    sorted_o = sorted(outages, key=lambda o: o.start)
+    clusters: List[List[OutageRecord]] = [[sorted_o[0]]]
+    for o in sorted_o[1:]:
+        prev = clusters[-1][-1]
+        prev_end = prev.end or now
+        gap = (o.start - prev_end).total_seconds()
+        if gap <= CLUSTER_GAP_SECS:
+            clusters[-1].append(o)
+        else:
+            clusters.append([o])
+    out: List[Dict] = []
+    for members in clusters:
+        first = members[0]
+        last_end = max((m.end or now) for m in members)
+        ongoing = any(m.ongoing for m in members)
+        total_outage_s = sum(int((m.end or now - m.start if not m.ongoing else now - m.start).total_seconds() if False else (m.end - m.start if m.end else now - m.start).total_seconds()) for m in members)
+        # The above expression is convoluted; recompute cleanly:
+        total_outage_s = 0
+        for m in members:
+            end = m.end or now
+            total_outage_s += int((end - m.start).total_seconds())
+        out.append({
+            "id": "cluster:" + first.start.isoformat(timespec="seconds"),
+            "start": first.start.isoformat(timespec="seconds"),
+            "end": last_end.isoformat(timespec="seconds") if not ongoing else None,
+            "ongoing": ongoing,
+            "duration_s": int((last_end - first.start).total_seconds()),
+            "outage_count": len(members),
+            "total_outage_s": total_outage_s,
+            "member_ids": [m.id for m in members],
+        })
+    return out
+
+
+@app.route("/api/timeline")
+def api_timeline():
+    if _state is None:
+        return jsonify({"error": "not ready"}), 503
+    try:
+        days = int(request.args.get("days", "7"))
+    except ValueError:
+        return jsonify({"error": "days must be an integer"}), 400
+    days = max(1, min(days, 60))
+    now = datetime.now()
+    cutoff = now - timedelta(days=days)
+    with _state.lock:
+        in_window = [
+            o for o in (list(_state.outages) + ([_state.current_outage] if _state.current_outage else []))
+            if o.start >= cutoff
+        ]
+        clusters = _cluster_outages(in_window, now)
+
+        degraded: List[Dict] = []
+        for d in list(_state.degraded_periods):
+            if d.start < cutoff:
+                continue
+            degraded.append({
+                "id": d.id,
+                "kind": d.kind,
+                "start": d.start.isoformat(timespec="seconds"),
+                "end": d.end.isoformat(timespec="seconds") if d.end else None,
+                "ongoing": d.ongoing,
+                "detail": d.detail,
+            })
+
+        # All outage_ids referenced by saved diagnoses (cluster IDs from new
+        # runs, individual out:... IDs from older ones).
+        diag_outage_ids = {
+            (d.get("outage_id") or "")
+            for d in _state.diagnoses
+            if d.get("outage_id")
+        }
+        start_time = _state.start_time
+
+    # A cluster is "analyzed" if its own id appears, or if any member's
+    # individual outage id appears (back-compat with pre-cluster diagnoses).
+    analyzed_ids = sorted({
+        c["id"] for c in clusters
+        if c["id"] in diag_outage_ids or any(m in diag_outage_ids for m in c["member_ids"])
+    })
+
+    return jsonify({
+        "days": days,
+        "generated_at": now.isoformat(timespec="seconds"),
+        "monitor_started_at": start_time.isoformat(timespec="seconds"),
+        "outages": clusters,
+        "degraded": degraded,
+        "analyzed_ids": analyzed_ids,
+    })
+
+
 @app.route("/diagnose")
 def diagnose_page():
     return DIAGNOSE_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/static/timeline.js")
+def static_timeline_js():
+    return TIMELINE_JS, 200, {"Content-Type": "application/javascript; charset=utf-8"}
 
 
 # ─────────────────────────────────────────────────────────────

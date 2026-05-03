@@ -16,6 +16,7 @@ A lightweight, self-hosted internet connection monitor with a live web dashboard
 - **Persistent storage** — history survives restarts; keeps 24 hours of ping data and speed results on disk
 - **Router log scraping** — for any gateway whose firewall/event log is exposed at an HTTP path (configured in `connection_monitor.env`); polls every 30 s and surfaces firewall drops on the dashboard, including drops of the monitor's own DNS probes (a strong gateway-side root-cause signal)
 - **AI diagnosis** — on-demand "what's actually going on?" summary via Claude on its own page (`/diagnose`) with 30 days of history. Pick a window (Ongoing / 1h / 24h) and get a plain-English assessment, ranked likely causes, and concrete next steps
+- **Timeline uptime chart** — 7-day view on the dashboard, 30-day view on the diagnosis page. Vertical bars show actual time-of-day position of outages (red), degraded periods (yellow stripes for slow speeds or high ping), and uptime (green). Click any outage band to ask Claude to diagnose that specific incident; analyzed incidents render in lighter red so you can see at a glance which ones already have notes
 
 Everything is visible at **http://localhost:8765** in any browser on the same machine.
 
