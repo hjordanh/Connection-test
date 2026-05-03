@@ -1,0 +1,16 @@
+# Runtime data
+connection_monitor_data.json
+
+# Vim swap files
+*.swp
+
+# Claude Code config
+.claude/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environmental configuration
+*.env
