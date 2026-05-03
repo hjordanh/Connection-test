@@ -2,7 +2,7 @@
 
 A lightweight, self-hosted internet connection monitor with a live web dashboard. Runs in the background and continuously tracks your connection health — no cloud accounts, no telemetry, no subscriptions.
 
-![Connection Monitor dashboard showing the timeline uptime chart, ping history, speed history, site status tiles, and AI-assisted diagnostics button](screenshot.png)
+![Connection Monitor dashboard showing the timeline uptime chart, ping history, speed history, site status tiles, and AI-assisted diagnostics button](https://github.com/hjordanh/Connection-test/blob/main/connection_monitor-screenshot.png?raw=true)
 
 ---
 

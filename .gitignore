@@ -12,5 +12,6 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Environmental configuration
+# Environmental and OS configuration
 *.env
+.DS_Store
