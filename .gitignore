@@ -15,3 +15,7 @@ __pycache__/
 # Environmental and OS configuration
 *.env
 .DS_Store
+
+# launchd management script (machine-local) and runtime logs
+monitor.sh
+monitor.*.log

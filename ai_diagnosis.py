@@ -32,6 +32,100 @@ WINDOWS = {
 }
 OUTAGE_LEAD = timedelta(minutes=30)
 OUTAGE_TAIL = timedelta(minutes=30)
+# When chaining post-outage degraded periods to find the "true" recovery point.
+RECOVERY_GAP = timedelta(minutes=30)   # max gap between chained events
+RECOVERY_TAIL = timedelta(minutes=15)  # clean-time shown after recovery
+RECOVERY_MAX  = timedelta(hours=6)     # cap on how far we'll extend a window
+
+
+def _detect_speed_recovery(incident_end: datetime, speed_history,
+                           cap: datetime) -> Optional[datetime]:
+    """Find when download speed actually returned to baseline after an outage,
+    using the speed test history directly (since degraded-period records may
+    not exist for older incidents that predate the slow-detection thresholds
+    being seeded).
+
+    Baseline = median of non-Outage, non-zero speed samples in the 24h before
+    `incident_end - 5min`. Recovery = first sample where this and the next two
+    samples (3 in a row) all hit >= 50% of baseline. If no sustained recovery
+    inside `cap`, returns the last available sample timestamp so the window
+    extends to show the failure to recover.
+
+    Returns None when there's not enough baseline data to compute a threshold.
+    """
+    pre = [s.download_mbps for s in speed_history
+           if s.timestamp < incident_end - timedelta(minutes=5)
+           and s.timestamp >= incident_end - timedelta(hours=24)
+           and (s.label or "") != "Outage"
+           and s.download_mbps > 5]
+    if len(pre) < 3:
+        return None
+    pre_sorted = sorted(pre)
+    baseline = pre_sorted[len(pre_sorted) // 2]
+    threshold = baseline * 0.5
+
+    post = sorted(
+        [s for s in speed_history
+         if s.timestamp >= incident_end and s.timestamp <= cap
+         and (s.label or "") != "Outage"],
+        key=lambda s: s.timestamp,
+    )
+    if not post:
+        return None
+
+    K = 3  # require 3 consecutive samples above threshold to call it sustained
+    for i in range(len(post) - K + 1):
+        if all(post[j].download_mbps >= threshold for j in range(i, i + K)):
+            return post[i].timestamp
+
+    # Never sustained recovery within cap — extend to the latest evidence so
+    # the user can see the prolonged degradation, not a misleading "resolved."
+    return min(post[-1].timestamp, cap)
+
+
+def compute_recovery_end(incident_end: datetime, outages, degraded,
+                         speed_history=None) -> datetime:
+    """Estimate when things truly returned to normal after an outage.
+
+    Combines two signals and returns whichever is LATER:
+    1. Speed-based: walk forward through the actual speed test history and
+       find a sustained run of samples back at >= 50% of pre-incident baseline.
+    2. Event-chain: walk forward through outage + degraded period records,
+       chaining any whose start is within RECOVERY_GAP of the running tail.
+
+    The speed-based signal handles incidents that predate degraded-period
+    detection (or where it didn't trigger). The event-chain signal handles
+    cases where speed tests are sparse but degraded windows are recorded.
+    """
+    cap = incident_end + RECOVERY_MAX
+    candidates = [incident_end]
+
+    if speed_history:
+        sr = _detect_speed_recovery(incident_end, speed_history, cap)
+        if sr is not None:
+            candidates.append(sr)
+
+    events = []
+    for o in outages:
+        events.append((o.start, o.end))
+    for d in degraded:
+        events.append((d.start, d.end))
+    events.sort(key=lambda e: e[0])
+
+    true_end = incident_end
+    for start, end in events:
+        if start > true_end + RECOVERY_GAP:
+            break
+        if end is None:
+            true_end = cap
+            break
+        if end > true_end:
+            true_end = min(end, cap)
+        if true_end >= cap:
+            break
+    candidates.append(true_end)
+
+    return max(candidates)
 
 SYSTEM_PROMPT = """\
 You are a senior network-diagnosis assistant analyzing data from a home internet \
@@ -59,9 +153,30 @@ upstream-ISP-flap hypotheses in this case.
 from monitoring artifacts (probes dropped at gateway).
 3. If the snapshot includes an `incident` block, focus the diagnosis on that \
 specific event — what caused it, how it manifested, what to check — and use the \
-broader window only as context for what was normal/abnormal around it.
+broader window only as context for what was normal/abnormal around it. For an \
+outage incident, `incident.start` and `incident.end` mark the connectivity \
+drop; `incident.recovery_end` marks when speeds and latency actually returned \
+to baseline (often later than connectivity restoration, when degraded periods \
+chained after the outage). When `recovery_lag_s` is non-trivial (> 60s), \
+treat the gap between `end` and `recovery_end` as the "aftermath" and explain \
+why full recovery lagged restored connectivity.
 4. Keep recommendations concrete and ranked. Do not speculate beyond the data.
 5. Output STRICT JSON matching the schema in the user message — no prose outside it.
+6. **Never recommend the user "go check" data we already collected.** The \
+snapshot you receive IS the data they would otherwise look up:
+   - `router_events` is the gateway's packet/firewall log — do NOT recommend \
+"look at the router event log at 192.168.1.1" or "check the gateway log for \
+restarts." If `router_events.total` is 0 AND `router_events.available` is true, \
+the log was scraped successfully and contained nothing in this window — say \
+that directly instead of recommending a re-check. Only recommend manual log \
+inspection if `router_events.available` is false.
+   - `ping`, `outages`, `speed`, `sites` are similarly already-collected \
+signals — interpret them, do not tell the user to re-collect them.
+Recommendations should be NEW actions the user could take outside this \
+monitor: physical checks (cabling, modem reboot, line tester, ISP call), \
+environmental observations (peak hours, weather, household usage), or \
+configuration changes (router firmware update, swap DNS, contact ISP about \
+line stats they can pull from their side).
 """
 
 
@@ -97,6 +212,166 @@ def _percentiles(values: List[float]) -> Dict[str, Optional[float]]:
     }
 
 
+CHART_PING_BINS = 180
+
+
+def build_chart_data(state, window: str,
+                     incident_start: Optional[datetime] = None,
+                     incident_end: Optional[datetime] = None) -> Dict[str, Any]:
+    """Build a JSON-safe time-series payload for the diagnosis chart.
+
+    Same windowing rules as build_snapshot. Combines the global 2s connectivity
+    pings with every per-site ping sample inside the window, then bins them
+    into ~CHART_PING_BINS buckets and emits p10/p50/p90 per bucket. This is
+    persisted on the diagnosis record so the chart can be re-rendered for
+    historical diagnoses long after the live ping buffer has rolled over.
+    """
+    now = datetime.now()
+    with state.lock:
+        ping_ts = list(state.ping_history_ts)
+        speed_history = list(state.speed_history)
+        outages = list(state.outages)
+        cur_outage = state.current_outage
+        degraded_periods = list(getattr(state, "degraded_periods", []))
+        site_targets = list(state.site_targets)
+        site_ping_hist = {h: list(state.site_ping_history.get(h, [])) for h in site_targets}
+
+    # Resolve the analysis window. For an outage incident, walk forward from
+    # incident_end through chained degraded periods to find when things truly
+    # returned to normal, then extend the window to cover that recovery + a
+    # small clean-time tail.
+    recovery_end: Optional[datetime] = None
+    if window == "outage":
+        if incident_start is None or incident_end is None:
+            raise ValueError("outage window requires incident_start and incident_end")
+        cutoff = incident_start - OUTAGE_LEAD
+        chain_pool = list(outages) + ([cur_outage] if cur_outage else [])
+        recovery_end = compute_recovery_end(
+            incident_end, chain_pool, degraded_periods,
+            speed_history=speed_history,
+        )
+        end_at = min(now, max(incident_end + OUTAGE_TAIL, recovery_end + RECOVERY_TAIL))
+    else:
+        delta = WINDOWS.get(window, WINDOWS["1h"])
+        cutoff = now - delta
+        end_at = now
+
+    # Collect every (datetime, ms) sample in the window from BOTH the global
+    # connectivity probes and every per-site ping check.
+    samples: List = []  # list of (datetime, ms)
+    def _ingest(ts_str, v):
+        if v is None:
+            return
+        try:
+            t = datetime.fromisoformat(ts_str)
+        except (ValueError, TypeError):
+            return
+        if cutoff <= t <= end_at:
+            samples.append((t, v))
+
+    for ts_str, v in ping_ts:
+        _ingest(ts_str, v)
+    for hist in site_ping_hist.values():
+        for ts_str, v in hist:
+            _ingest(ts_str, v)
+
+    samples.sort(key=lambda x: x[0])
+
+    # Bin into time buckets and compute p10/p50/p90 per bin. Empty bins emit
+    # nulls so outage gaps stay visible on the chart.
+    window_secs = max(1.0, (end_at - cutoff).total_seconds())
+    bin_secs = max(2.0, window_secs / CHART_PING_BINS)
+
+    def _pct(sorted_vals, q):
+        if len(sorted_vals) == 1:
+            return sorted_vals[0]
+        idx = q / 100 * (len(sorted_vals) - 1)
+        lo, hi = int(idx), min(int(idx) + 1, len(sorted_vals) - 1)
+        return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (idx - lo)
+
+    ping_bands: List[List[Any]] = []
+    i = 0
+    n_bins = int(window_secs / bin_secs) + 1
+    for b in range(n_bins):
+        bin_start = cutoff + timedelta(seconds=b * bin_secs)
+        bin_end   = bin_start + timedelta(seconds=bin_secs)
+        if bin_start >= end_at:
+            break
+        bin_vals: List[float] = []
+        while i < len(samples) and samples[i][0] < bin_end:
+            if samples[i][0] >= bin_start:
+                bin_vals.append(samples[i][1])
+            i += 1
+        ts_iso = bin_start.isoformat(timespec="seconds")
+        if bin_vals:
+            s = sorted(bin_vals)
+            ping_bands.append([
+                ts_iso,
+                round(_pct(s, 10), 1),
+                round(_pct(s, 50), 1),
+                round(_pct(s, 90), 1),
+                len(bin_vals),
+            ])
+        else:
+            ping_bands.append([ts_iso, None, None, None, 0])
+
+    # Speed samples in window.
+    speed_series = [
+        {
+            "ts": s.timestamp.isoformat(timespec="seconds"),
+            "dl": round(s.download_mbps, 1),
+            "ul": round(s.upload_mbps, 1),
+            "ping": round(s.ping_ms, 1) if s.ping_ms else None,
+            "label": s.label,
+        }
+        for s in speed_history
+        if cutoff <= s.timestamp <= end_at
+    ]
+
+    # Outage spans clipped to window.
+    all_outages = list(outages) + ([cur_outage] if cur_outage else [])
+    outage_spans = []
+    for o in all_outages:
+        eff_end = o.end if o.end else end_at
+        if eff_end < cutoff or o.start > end_at:
+            continue
+        outage_spans.append({
+            "start": o.start.isoformat(timespec="seconds"),
+            "end": o.end.isoformat(timespec="seconds") if o.end else None,
+        })
+
+    # Degraded spans (slow / high_ping) clipped to window.
+    degraded_spans = []
+    for d in degraded_periods:
+        eff_end = d.end if d.end else end_at
+        if eff_end < cutoff or d.start > end_at:
+            continue
+        degraded_spans.append({
+            "start": d.start.isoformat(timespec="seconds"),
+            "end": d.end.isoformat(timespec="seconds") if d.end else None,
+            "kind": d.kind,
+        })
+
+    incident = None
+    if window == "outage" and incident_start and incident_end:
+        incident = {
+            "start": incident_start.isoformat(timespec="seconds"),
+            "end":   incident_end.isoformat(timespec="seconds"),
+            "recovery_end": (recovery_end.isoformat(timespec="seconds")
+                             if recovery_end else None),
+        }
+
+    return {
+        "window_start": cutoff.isoformat(timespec="seconds"),
+        "window_end":   end_at.isoformat(timespec="seconds"),
+        "incident":     incident,
+        "ping_bands":   ping_bands,    # [[ts, p10, p50, p90, n], ...]
+        "speed_series": speed_series,
+        "outages":      outage_spans,
+        "degraded":     degraded_spans,
+    }
+
+
 def build_snapshot(state, window: str,
                    incident_start: Optional[datetime] = None,
                    incident_end: Optional[datetime] = None,
@@ -108,35 +383,12 @@ def build_snapshot(state, window: str,
     the snapshot covers [incident_start - OUTAGE_LEAD, incident_end + OUTAGE_TAIL].
     """
     now = datetime.now()
-    incident: Optional[Dict[str, Any]] = None
-    if window == "outage":
-        if incident_start is None or incident_end is None:
-            raise ValueError("outage window requires incident_start and incident_end")
-        cutoff = incident_start - OUTAGE_LEAD
-        end_at = min(now, incident_end + OUTAGE_TAIL)
-        # Window seconds is the snapshot span, not the outage span.
-        window_secs = (end_at - cutoff).total_seconds()
-        incident = {
-            "id": incident_id,
-            "start": incident_start.isoformat(timespec="seconds"),
-            "end": incident_end.isoformat(timespec="seconds"),
-            "duration_s": int((incident_end - incident_start).total_seconds()),
-            "lead_window_min": int(OUTAGE_LEAD.total_seconds() / 60),
-            "tail_window_min": int(OUTAGE_TAIL.total_seconds() / 60),
-        }
-    else:
-        if window not in WINDOWS:
-            window = "1h"
-        delta = WINDOWS[window]
-        cutoff = now - delta
-        end_at = now
-        window_secs = delta.total_seconds()
-
     with state.lock:
         ping_ts = list(state.ping_history_ts)
         speed_history = list(state.speed_history)
         outages = list(state.outages)
         cur_outage = state.current_outage
+        degraded_periods = list(getattr(state, "degraded_periods", []))
         site_targets = list(state.site_targets)
         site_names = dict(state.site_names)
         site_ping_hist = {h: list(state.site_ping_history.get(h, [])) for h in site_targets}
@@ -145,6 +397,36 @@ def build_snapshot(state, window: str,
         router_events = list(getattr(state, "router_events", []))
         router_poll_error = getattr(state, "router_poll_error", None)
         last_router_poll = getattr(state, "last_router_poll", None)
+
+    incident: Optional[Dict[str, Any]] = None
+    if window == "outage":
+        if incident_start is None or incident_end is None:
+            raise ValueError("outage window requires incident_start and incident_end")
+        cutoff = incident_start - OUTAGE_LEAD
+        chain_pool = list(outages) + ([cur_outage] if cur_outage else [])
+        recovery_end = compute_recovery_end(
+            incident_end, chain_pool, degraded_periods,
+            speed_history=speed_history,
+        )
+        end_at = min(now, max(incident_end + OUTAGE_TAIL, recovery_end + RECOVERY_TAIL))
+        window_secs = (end_at - cutoff).total_seconds()
+        incident = {
+            "id": incident_id,
+            "start": incident_start.isoformat(timespec="seconds"),
+            "end": incident_end.isoformat(timespec="seconds"),
+            "recovery_end": recovery_end.isoformat(timespec="seconds"),
+            "duration_s": int((incident_end - incident_start).total_seconds()),
+            "recovery_lag_s": int((recovery_end - incident_end).total_seconds()),
+            "lead_window_min": int(OUTAGE_LEAD.total_seconds() / 60),
+            "tail_window_min": int((end_at - incident_end).total_seconds() / 60),
+        }
+    else:
+        if window not in WINDOWS:
+            window = "1h"
+        delta = WINDOWS[window]
+        cutoff = now - delta
+        end_at = now
+        window_secs = delta.total_seconds()
 
     # Pings in window
     def _in_window(ts_str: str) -> bool:
@@ -267,22 +549,35 @@ Snapshot (JSON):
 Respond with a single JSON object, no prose, matching this schema exactly:
 
 {{
-  "title": "6-10 word headline summarizing this incident at a glance, e.g. 'Brief gateway flap during evening peak'",
-  "summary": "2-4 sentence plain-English description of what happened in this window",
+  "title": "6-10 word headline a non-technical household member would understand, e.g. 'Internet briefly dropped during dinner' — avoid jargon (no 'gateway', 'flap', 'MTU', 'DNS', acronyms)",
+  "summary": "2-3 sentences in plain household language describing what happened and when. Translate technical signals into everyday terms (say 'connection dropped' not 'DNS probes failed', 'speeds dipped' not 'throughput collapsed').",
   "severity": "none" | "minor" | "moderate" | "severe",
   "likely_causes": [
-    {{"cause": "short label", "detail": "1-2 sentence explanation", "confidence": "low" | "medium" | "high"}}
+    {{"cause": "short label", "detail": "1-2 sentence explanation", "confidence": "low" | "medium" | "high", "signals": ["dotted.path.to.snapshot.field", ...]}}
   ],
   "household_impact": "1-2 sentences on what a person on a video call / game / stream would have experienced",
-  "recommendations": ["concrete action 1", "concrete action 2", ...]
+  "recommendations": ["concrete action 1", "concrete action 2"]
 }}
 
-The title is critical — it shows up as the headline in the diagnosis history and \
-in tooltips on the timeline. Keep it factual, specific to this incident, and short.
+The title and summary are read by non-technical household members. Use plain \
+language, not networking jargon. The title is critical — it shows up as the \
+headline in the diagnosis history and in tooltips on the timeline.
 
-Rank likely_causes from most to least probable. Limit to 4 causes and 5 \
-recommendations. If router_events.dns_probe_drops is non-empty, the FIRST cause \
-must be gateway-side.\
+Rank likely_causes from most to least probable. **Hard limit: 2 likely_causes \
+and 2 recommendations. Only include a 3rd of either if it adds genuinely \
+distinct value — otherwise stop at 2.** If router_events.dns_probe_drops is \
+non-empty, the FIRST cause must be gateway-side (but phrase it in plain terms, \
+e.g. "router rejecting the monitor's check-ins" rather than "uRPF dropping \
+DNS probes").
+
+**For each cause, populate `signals` with 1-3 dotted-path references to the \
+specific snapshot fields that grounded your conclusion** (e.g. \
+"router_events.dns_probe_drop_count", "ping.p90", "ping.jitter_stdev", \
+"outages.count", "outages.total_downtime_s", "speed.download_mbps.p10", \
+"sites[*].reachable_pct"). These are the verifiable evidence trail. If you \
+cannot point to a specific snapshot field, drop the cause — every cause must \
+be grounded in named evidence. Do not invent field names; only cite paths \
+that actually exist in the snapshot above.\
 """
 
 
@@ -358,6 +653,12 @@ def diagnose(snapshot: Dict[str, Any], api_key: Optional[str] = None) -> Dict[st
         "snapshot_summary": {
             "outages": snapshot["outages"]["count"],
             "downtime_s": snapshot["outages"]["total_downtime_s"],
+            "ping_samples": snapshot.get("ping", {}).get("sample_count", 0),
+            "speed_tests": snapshot.get("speed", {}).get("count", 0),
+            "sites_checked": len(snapshot.get("sites", []) or []),
+            "router_available": bool(snapshot["router_events"].get("available")),
+            "router_last_poll": snapshot["router_events"].get("last_poll"),
+            "router_poll_error": snapshot["router_events"].get("poll_error"),
             "router_events": snapshot["router_events"].get("total", 0),
             "dns_probe_drops": snapshot["router_events"].get("dns_probe_drop_count", 0),
         },

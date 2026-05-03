@@ -1273,10 +1273,17 @@ def load_state(state: MonitorState) -> None:
                 # Backward-compat: previous schema stored a single last_diagnosis.
                 legacy = data.get("last_diagnosis")
                 history_raw = [legacy] if legacy else []
-            state.diagnoses = deque(
-                (d for d in history_raw if (d.get("evaluated_at") or "") >= cutoff_30d_iso),
-                maxlen=500,
-            )
+            kept = []
+            for d in history_raw:
+                if (d.get("evaluated_at") or "") < cutoff_30d_iso:
+                    continue
+                # Backfill missing ids on legacy records so the delete UI can
+                # target them. Synthesize from evaluated_at + a short hash.
+                if not d.get("id"):
+                    base = d.get("evaluated_at") or "unknown"
+                    d["id"] = "legacy-" + str(abs(hash(base)) % 10_000_000)
+                kept.append(d)
+            state.diagnoses = deque(kept, maxlen=500)
             if speed:
                 state.last_speed_test = max(s.timestamp for s in speed)
                 successes = [s for s in speed if s.label != "Outage"]
@@ -1566,9 +1573,9 @@ window.UptimeTimeline = (function () {
     bar_ok:   'rgba(63,185,80,0.55)',   // muted green
     bar_no:   '#161b22',                 // future / no data
     outage:   '#f85149',
-    outage_seen: '#bc8cff',              // distinct: magenta = "annotated"
+    outage_seen: 'rgba(248,81,73,0.45)',   // lighter red = "analyzed" (matches legend)
     degraded: '#d29922',
-    degraded_seen: 'rgba(188,140,255,0.65)',
+    degraded_seen: 'rgba(248,81,73,0.45)',
     today:    '#58a6ff',
     text:     '#e6edf3',
     dim:      '#8b949e',
@@ -1812,11 +1819,24 @@ window.UptimeTimeline = (function () {
         const yA = yOf(minutesOfDay(segEnd >= dayEnd ? new Date(dayEnd.getTime() - 1) : segEnd));
         const yB = yOf(minutesOfDay(segStart));
         const x = dayX[idx] + (colW - barW) / 2;
-        const h = Math.max(2, yB - yA);
+        // 30d view bumps bar height by 50% (and a slightly higher floor) so
+        // short incidents are easier to see and click. Bars stay centered on
+        // the actual time of the event.
+        const heightMult = days > 7 ? 1.5 : 1.0;
+        const minH = days > 7 ? 3 : 2;
+        const baseH = Math.max(minH, yB - yA);
+        const h = baseH * heightMult;
+        const yTop = yA - (h - (yB - yA)) / 2;
         ctx.fillStyle = useStripes ? pattern : baseColor;
-        ctx.fillRect(x, yA, barW, h);
+        ctx.fillRect(x, yTop, barW, h);
+        // Hit region is padded a few pixels beyond the visual bar — short bars
+        // are otherwise hard to land the cursor on (felt ~3px off above).
+        const HIT_PAD_TOP = 4, HIT_PAD_BOT = 3, HIT_PAD_X = 1;
         incidentRects.push({
-          x, y: yA, w: barW, h,
+          x: x - HIT_PAD_X,
+          y: yTop - HIT_PAD_TOP,
+          w: barW + 2 * HIT_PAD_X,
+          h: h + HIT_PAD_TOP + HIT_PAD_BOT,
           incident: { ...cluster, category, analyzed: isAnalyzed,
                       title: titles[cluster.id] || null, dayIndex: idx },
         });
@@ -3009,25 +3029,21 @@ function fmtIncidentDuration(s) {
 
 function onTimelineClick(inc) {
   if (!inc) return;
-  if (inc.category === 'outage') {
-    if (inc.analyzed) {
-      window.location = '/diagnose?show=' + encodeURIComponent(inc.id);
-      return;
-    }
-    const start = new Date(inc.start);
-    const end   = inc.end ? new Date(inc.end) : new Date();
-    const sec   = (end - start) / 1000;
-    const ok = window.confirm(
-      'Run AI diagnosis on this ' + fmtIncidentDuration(sec) +
-      ' outage at ' + start.toLocaleString() + '?\\n\\n' +
-      'This will use ~$0.02 of API credit and take ~5–10 seconds.'
-    );
-    if (!ok) return;
-    window.location = '/diagnose?run=' + encodeURIComponent(inc.id);
-  } else {
-    // Degraded periods: jump to /diagnose page to inspect; no auto-run for now.
-    window.location = '/diagnose';
+  if (inc.analyzed) {
+    window.location = '/diagnose?show=' + encodeURIComponent(inc.id);
+    return;
   }
+  const start = new Date(inc.start);
+  const end   = inc.end ? new Date(inc.end) : new Date();
+  const sec   = (end - start) / 1000;
+  const kindLabel = inc.category === 'outage' ? 'outage' : 'degraded period';
+  const ok = window.confirm(
+    'Run AI diagnosis on this ' + fmtIncidentDuration(sec) +
+    ' ' + kindLabel + ' at ' + start.toLocaleString() + '?\\n\\n' +
+    'This will use ~$0.02 of API credit and take ~5–10 seconds.'
+  );
+  if (!ok) return;
+  window.location = '/diagnose?run=' + encodeURIComponent(inc.id);
 }
 
 let _timelineCache = null;
@@ -3509,6 +3525,154 @@ header {
   margin-bottom: 14px;
   font-size: 12px;
 }
+.diag-chart-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+.diag-chart-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--dim);
+}
+.diag-chart-stats {
+  font-size: 11px;
+  color: var(--dim);
+}
+.diag-chart-stats strong { color: var(--text); font-weight: 600; }
+.diag-chart-canvas-wrap {
+  position: relative;
+  width: 100%;
+  height: 200px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+#diag-chart {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.diag-chart-tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: rgba(13,17,23,0.94);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-size: 11px;
+  color: var(--text);
+  line-height: 1.4;
+  white-space: nowrap;
+  display: none;
+  z-index: 5;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+.diag-chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--dim);
+}
+.diag-chart-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.lg-swatch {
+  display: inline-block;
+  width: 14px; height: 10px;
+  border-radius: 2px;
+}
+.lg-line {
+  display: inline-block;
+  width: 14px; height: 2px;
+}
+.lg-band {
+  display: inline-block;
+  width: 16px; height: 8px;
+  border-radius: 1px;
+}
+.diag-delete-btn {
+  background: var(--bg);
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 9px;
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.diag-delete-btn:hover {
+  border-color: var(--red);
+  color: var(--red);
+  background: rgba(248,81,73,0.08);
+}
+.diag-delete-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.analyzed-strip {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--dim);
+  line-height: 1.55;
+}
+.analyzed-label {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+  margin-right: 4px;
+}
+.analyzed-strip strong { color: var(--text); font-weight: 600; }
+.analyzed-zero strong { color: var(--dim); font-weight: 400; }
+.analyzed-warn { color: var(--yellow); }
+.analyzed-warn strong { color: var(--yellow); }
+
+.signal-chips {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--dim);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+.signal-chips-label {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 9px;
+  margin-right: 2px;
+}
+.signal-chip {
+  background: rgba(57,197,207,0.10);
+  color: var(--cyan);
+  border: 1px solid rgba(57,197,207,0.25);
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-family: ui-monospace, 'SF Mono', monospace;
+  font-size: 10px;
+}
+.lg-dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+}
+.lg-vline {
+  display: inline-block;
+  width: 0; height: 12px;
+  border-left: 1px dashed var(--text);
+}
 </style>
 </head>
 <body>
@@ -3556,10 +3720,29 @@ header {
   <div class="card" id="detail-card">
     <div class="card-title" id="detail-title-bar" style="display:flex;justify-content:space-between;align-items:center">
       <span>Diagnosis</span>
+      <button id="diag-delete-btn" class="diag-delete-btn" style="display:none" title="Delete this diagnosis (cluster becomes re-runnable)">Delete</button>
     </div>
     <div id="detail-empty">No diagnosis selected. Run a new one or pick from history.</div>
     <div id="detail-body" style="display:none">
       <div id="detail-meta"></div>
+      <div id="diag-chart-wrap" style="display:none;margin-bottom:16px">
+        <div class="diag-chart-head">
+          <span class="diag-chart-label">Window analyzed</span>
+          <span class="diag-chart-stats" id="diag-chart-stats"></span>
+        </div>
+        <div class="diag-chart-canvas-wrap">
+          <canvas id="diag-chart"></canvas>
+          <div id="diag-chart-tooltip" class="diag-chart-tooltip"></div>
+        </div>
+        <div class="diag-chart-legend">
+          <span><span class="lg-swatch" style="background:rgba(63,185,80,0.18)"></span>normal</span>
+          <span><span class="lg-swatch" style="background:rgba(210,153,34,0.22)"></span>degraded</span>
+          <span><span class="lg-swatch" style="background:rgba(248,81,73,0.28)"></span>outage</span>
+          <span><span class="lg-band" style="background:rgba(57,197,207,0.18);border-top:1.5px solid var(--cyan);border-bottom:1.5px solid var(--cyan)"></span>ping p10–p90 / median (ms · left)</span>
+          <span><span class="lg-dot" style="background:var(--magenta)"></span>speed test (Mbps · right)</span>
+          <span><span class="lg-vline"></span>event marker</span>
+        </div>
+      </div>
       <div id="detail-error"></div>
       <div id="detail-summary"></div>
       <div id="detail-impact"></div>
@@ -3606,6 +3789,52 @@ function escapeHtml(s) {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// Compact "Analyzed:" strip showing what data was actually fed to the model
+// for this diagnosis. Anything zero is shown dimmed; the router section calls
+// out missing-data conditions explicitly so we can tell config issues from
+// honest "no events in window."
+function renderAnalyzedStrip(s) {
+  if (!s || typeof s !== 'object') return '';
+  const dim = (label, val) => '<span class="' + (val ? '' : 'analyzed-zero') + '">'
+    + label + ' <strong>' + (val == null ? '0' : val) + '</strong></span>';
+  let routerPart;
+  if (!s.router_available) {
+    routerPart = '<span class="analyzed-warn">router log: <strong>not configured</strong></span>';
+  } else if (s.router_poll_error) {
+    routerPart = '<span class="analyzed-warn">router log: <strong>poll error</strong> ('
+      + escapeHtml(String(s.router_poll_error).slice(0, 80)) + ')</span>';
+  } else if (!s.router_last_poll) {
+    routerPart = '<span class="analyzed-warn">router log: <strong>never polled</strong></span>';
+  } else {
+    routerPart = dim('router events', s.router_events) +
+                 ' &nbsp;·&nbsp; ' + dim('DNS-probe drops', s.dns_probe_drops);
+  }
+  return '<div class="analyzed-strip">'
+    + '<span class="analyzed-label">Analyzed:</span> '
+    + dim('outages', s.outages)
+    + ' &nbsp;·&nbsp; ' + dim('ping samples', s.ping_samples)
+    + ' &nbsp;·&nbsp; ' + dim('speed tests', s.speed_tests)
+    + ' &nbsp;·&nbsp; ' + dim('sites', s.sites_checked)
+    + ' &nbsp;·&nbsp; ' + routerPart
+    + '</div>';
+}
+
+// When did the analyzed event actually happen? Prefer the incident's start
+// (real-world event time) over evaluated_at (when the human ran the analysis).
+// Fall back to window_end, then evaluated_at, then 0.
+function eventTimeOf(d) {
+  const cd = d && d.chart_data;
+  if (cd && cd.incident && cd.incident.start) return new Date(cd.incident.start).getTime();
+  if (cd && cd.window_end) return new Date(cd.window_end).getTime();
+  return new Date(d && d.evaluated_at || 0).getTime();
+}
+function eventIsoOf(d) {
+  const cd = d && d.chart_data;
+  if (cd && cd.incident && cd.incident.start) return cd.incident.start;
+  if (cd && cd.window_end) return cd.window_end;
+  return d && d.evaluated_at;
+}
+
 function renderHistory() {
   const container = document.getElementById('history');
   container.innerHTML = '';
@@ -3615,7 +3844,8 @@ function renderHistory() {
   }
   let lastDay = null;
   history.forEach(d => {
-    const day = fmtDay(d.evaluated_at);
+    const eventIso = eventIsoOf(d);
+    const day = fmtDay(eventIso);
     if (day !== lastDay) {
       const h = document.createElement('div');
       h.className = 'day-header';
@@ -3626,7 +3856,7 @@ function renderHistory() {
     const item = document.createElement('div');
     item.className = 'history-item' + (d.id === selectedId ? ' selected' : '');
     const sev = severityOf(d);
-    const t = (d.evaluated_at || '').slice(11, 16) || '—';
+    const t = (eventIso || '').slice(11, 16) || '—';
     const title = (d.result && d.result.title) ? d.result.title : null;
     const titleRow = title
       ? '<div class="title">' + escapeHtml(title) + '</div>'
@@ -3652,14 +3882,22 @@ function renderDetail(diag) {
   const empty = document.getElementById('detail-empty');
   const body  = document.getElementById('detail-body');
   const err   = document.getElementById('detail-error');
+  const delBtn = document.getElementById('diag-delete-btn');
   if (!diag) {
     empty.style.display = 'block';
     body.style.display = 'none';
+    if (delBtn) delBtn.style.display = 'none';
+    renderDiagChart(null);
     return;
   }
   empty.style.display = 'none';
   body.style.display = 'block';
   err.style.display = 'none';
+  if (delBtn) {
+    delBtn.style.display = 'inline-block';
+    delBtn.dataset.id = diag.id || '';
+  }
+  renderDiagChart(diag.chart_data || null);
 
   const sev = severityOf(diag);
   const sevColor = {NONE:'var(--green)', MINOR:'var(--cyan)', MODERATE:'var(--yellow)', SEVERE:'var(--red)', ERROR:'var(--red)'}[sev] || 'var(--dim)';
@@ -3673,7 +3911,8 @@ function renderDetail(diag) {
     'Evaluated ' + fmtTime(diag.evaluated_at) +
     ' · Window: <strong>' + (diag.window || '—') + '</strong>' +
     ' · Severity: <strong style="color:' + sevColor + '">' + sev + '</strong>' +
-    (diag.model ? (' · Model: ' + diag.model) : '');
+    (diag.model ? (' · Model: ' + diag.model) : '') +
+    renderAnalyzedStrip(diag.snapshot_summary);
 
   if (!diag.ok) {
     err.style.display = 'block';
@@ -3699,8 +3938,16 @@ function renderDetail(diag) {
   (r.likely_causes || []).forEach(c => {
     const li = document.createElement('li');
     const conf = c.confidence ? '<span class="conf">(' + c.confidence + ')</span>' : '';
-    li.innerHTML = '<strong>' + (c.cause || '') + '</strong>' + conf +
-      '<span class="cause-detail">' + (c.detail || '') + '</span>';
+    const sigs = (c.signals || []).filter(Boolean);
+    const sigHtml = sigs.length
+      ? '<div class="signal-chips">' +
+          '<span class="signal-chips-label">based on:</span>' +
+          sigs.map(s => '<code class="signal-chip">' + escapeHtml(s) + '</code>').join('') +
+        '</div>'
+      : '';
+    li.innerHTML = '<strong>' + escapeHtml(c.cause || '') + '</strong>' + conf +
+      '<span class="cause-detail">' + escapeHtml(c.detail || '') + '</span>' +
+      sigHtml;
     causesEl.appendChild(li);
   });
   const recsEl = document.getElementById('detail-recs');
@@ -3712,12 +3959,359 @@ function renderDetail(diag) {
   });
 }
 
+// ── Diagnosis chart ─────────────────────────────────────────────
+let _diagChartState = null;
+
+function renderDiagChart(data) {
+  const wrap = document.getElementById('diag-chart-wrap');
+  if (!data || !data.window_start || !data.window_end) {
+    wrap.style.display = 'none';
+    _diagChartState = null;
+    return;
+  }
+  wrap.style.display = 'block';
+  _diagChartState = data;
+  paintDiagChart();
+}
+
+function _diagChartCss(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function paintDiagChart() {
+  const data = _diagChartState;
+  if (!data) return;
+  const canvas = document.getElementById('diag-chart');
+  if (!canvas || !canvas.offsetParent) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth;
+  const cssH = canvas.clientHeight;
+  if (cssW <= 0 || cssH <= 0) return;
+  canvas.width  = Math.floor(cssW * dpr);
+  canvas.height = Math.floor(cssH * dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const COLORS = {
+    text:     _diagChartCss('--text'),
+    dim:      _diagChartCss('--dim'),
+    border:   _diagChartCss('--border'),
+    green:    _diagChartCss('--green'),
+    yellow:   _diagChartCss('--yellow'),
+    red:      _diagChartCss('--red'),
+    cyan:     _diagChartCss('--cyan'),
+    magenta:  _diagChartCss('--magenta'),
+  };
+  // Background tints (slightly stronger than chart-card so the bands read).
+  const BG_NORMAL   = 'rgba(63,185,80,0.10)';
+  const BG_DEGRADED = 'rgba(210,153,34,0.18)';
+  const BG_OUTAGE   = 'rgba(248,81,73,0.22)';
+
+  const ML = 40, MR = 44, MT = 10, MB = 22;
+  const W = cssW - ML - MR;
+  const H = cssH - MT - MB;
+  if (W <= 10 || H <= 20) return;
+
+  const t0 = new Date(data.window_start).getTime();
+  const t1 = new Date(data.window_end).getTime();
+  const span = Math.max(1, t1 - t0);
+  const xOf = (ms) => ML + ((ms - t0) / span) * W;
+
+  // ── Y-scale (left): ping ms — derived from band p90 + speed pings ──
+  const bands = data.ping_bands || [];
+  const p50s = bands.map(b => b[2]).filter(v => v != null && isFinite(v));
+  const p90s = bands.map(b => b[3]).filter(v => v != null && isFinite(v));
+  const speedPings = (data.speed_series || [])
+    .map(s => s.ping).filter(v => v != null && isFinite(v));
+  const pingPool = p90s.concat(speedPings);
+  let yMaxMs = 100;
+  if (pingPool.length) {
+    const sorted = [...pingPool].sort((a, b) => a - b);
+    const p99 = sorted[Math.floor(0.99 * (sorted.length - 1))];
+    yMaxMs = Math.max(100, Math.ceil(p99 * 1.15 / 50) * 50);
+  }
+  const yOfMs = (ms) => MT + H - (Math.min(Math.max(0, ms), yMaxMs) / yMaxMs) * H;
+
+  // ── Y-scale (right): speed Mbps — from speed_series dl values ──
+  const dlVals = (data.speed_series || [])
+    .map(s => s.dl).filter(v => v != null && isFinite(v));
+  let yMaxMbps = 100;
+  if (dlVals.length) {
+    const m = Math.max(...dlVals);
+    // Round up to a nice scale.
+    const step = m <= 50 ? 10 : m <= 200 ? 50 : m <= 500 ? 100 : 200;
+    yMaxMbps = Math.max(step, Math.ceil(m * 1.1 / step) * step);
+  }
+  const yOfMbps = (mbps) => MT + H - (Math.min(Math.max(0, mbps), yMaxMbps) / yMaxMbps) * H;
+
+  // ── 1. Background bands ────────────────────────────────────────
+  ctx.fillStyle = BG_NORMAL;
+  ctx.fillRect(ML, MT, W, H);
+
+  function drawSpan(start, end, color) {
+    if (!start) return;
+    const sMs = new Date(start).getTime();
+    const eMs = end ? new Date(end).getTime() : t1;
+    const x0 = Math.max(ML, xOf(Math.max(t0, sMs)));
+    const x1 = Math.min(ML + W, xOf(Math.min(t1, eMs)));
+    if (x1 <= x0) return;
+    ctx.fillStyle = color;
+    ctx.fillRect(x0, MT, x1 - x0, H);
+  }
+  (data.degraded || []).forEach(d => drawSpan(d.start, d.end, BG_DEGRADED));
+  (data.outages  || []).forEach(o => drawSpan(o.start, o.end, BG_OUTAGE));
+
+  // ── 2. Y gridlines + left axis (ms) + right axis (Mbps) ─────────
+  ctx.strokeStyle = COLORS.border;
+  ctx.font = '9px ui-monospace, monospace';
+  ctx.lineWidth = 1;
+  const yTicks = 4;
+  for (let i = 0; i <= yTicks; i++) {
+    const frac = i / yTicks;
+    const y = MT + H - frac * H;
+    ctx.beginPath();
+    ctx.moveTo(ML, y); ctx.lineTo(ML + W, y);
+    ctx.globalAlpha = i === 0 ? 0.6 : 0.2;
+    ctx.strokeStyle = COLORS.border;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    // Left: ms
+    ctx.fillStyle = COLORS.cyan;
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    ctx.fillText(Math.round(yMaxMs * frac) + 'ms', ML - 4, y);
+    // Right: Mbps
+    ctx.fillStyle = COLORS.magenta;
+    ctx.textAlign = 'left';
+    ctx.fillText(Math.round(yMaxMbps * frac) + 'M', ML + W + 4, y);
+  }
+
+  // ── 3. X tick labels (HH:MM) ────────────────────────────────────
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  const spanMin = span / 60000;
+  let stepMin;
+  if (spanMin <= 15)       stepMin = 2;
+  else if (spanMin <= 60)  stepMin = 10;
+  else if (spanMin <= 180) stepMin = 30;
+  else if (spanMin <= 720) stepMin = 60;
+  else                     stepMin = 120;
+  const stepMs = stepMin * 60000;
+  let firstTick = Math.ceil(t0 / stepMs) * stepMs;
+  for (let tx = firstTick; tx <= t1; tx += stepMs) {
+    const x = xOf(tx);
+    if (x < ML || x > ML + W) continue;
+    const d = new Date(tx);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    ctx.fillStyle = COLORS.dim;
+    ctx.fillText(hh + ':' + mm, x, MT + H + 4);
+  }
+
+  // ── 4. Ping bands: filled p10–p90 area + p50 line ───────────────
+  // Walk bands; break the path into segments wherever a band is null
+  // (so outage gaps stay visible). Each contiguous run becomes one fill
+  // (forward through p90, back through p10) and one p50 stroke.
+  const bandFill = 'rgba(57,197,207,0.18)';   // cyan-ish translucent
+  function flushSegment(seg) {
+    if (seg.length < 2) return;
+    // Filled band p10 → p90.
+    ctx.beginPath();
+    ctx.moveTo(seg[0].x, yOfMs(seg[0].p90));
+    for (let i = 1; i < seg.length; i++) ctx.lineTo(seg[i].x, yOfMs(seg[i].p90));
+    for (let i = seg.length - 1; i >= 0; i--) ctx.lineTo(seg[i].x, yOfMs(seg[i].p10));
+    ctx.closePath();
+    ctx.fillStyle = bandFill;
+    ctx.fill();
+    // p50 line.
+    ctx.beginPath();
+    ctx.moveTo(seg[0].x, yOfMs(seg[0].p50));
+    for (let i = 1; i < seg.length; i++) ctx.lineTo(seg[i].x, yOfMs(seg[i].p50));
+    ctx.strokeStyle = COLORS.cyan;
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+  }
+  let seg = [];
+  bands.forEach(([ts, p10, p50, p90, n]) => {
+    if (p50 == null) { flushSegment(seg); seg = []; return; }
+    seg.push({ x: xOf(new Date(ts).getTime()), p10, p50, p90, n, ts });
+  });
+  flushSegment(seg);
+
+  // ── 5. Speed test markers (positioned on right Mbps axis) ──────
+  const speedMarks = [];
+  (data.speed_series || []).forEach(s => {
+    const x = xOf(new Date(s.ts).getTime());
+    if (x < ML || x > ML + W) return;
+    if (s.dl == null) return;
+    const y = yOfMbps(s.dl);
+    ctx.fillStyle = COLORS.magenta;
+    ctx.strokeStyle = COLORS.text;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    speedMarks.push({ x, y, sample: s });
+  });
+
+  // ── 6. Vertical reference lines ────────────────────────────────
+  function earliestStart(items) {
+    let best = null;
+    (items || []).forEach(it => {
+      const s = new Date(it.start).getTime();
+      if (best == null || s < best) best = s;
+    });
+    return best;
+  }
+  function latestEnd(items) {
+    let best = null;
+    (items || []).forEach(it => {
+      if (!it.end) return;
+      const e = new Date(it.end).getTime();
+      if (best == null || e > best) best = e;
+    });
+    return best;
+  }
+  const inc = data.incident || null;
+  const degStart = earliestStart(data.degraded);
+  const outStart = inc ? new Date(inc.start).getTime() : earliestStart(data.outages);
+  // Connectivity-restored marker (when DNS probes started succeeding again).
+  const reconnected = inc ? new Date(inc.end).getTime() : latestEnd(data.outages);
+  // True return-to-normal: extended past reconnected if degraded periods
+  // chained on after the outage. Falls back to reconnected if backend didn't
+  // supply it (older diagnoses).
+  const recovered = (inc && inc.recovery_end) ? new Date(inc.recovery_end).getTime() : reconnected;
+  const refs = [];
+  if (degStart != null && (outStart == null || degStart < outStart)) {
+    refs.push({ ms: degStart, color: COLORS.yellow, label: 'degraded' });
+  }
+  if (outStart != null) refs.push({ ms: outStart, color: COLORS.red, label: 'start' });
+  // Show reconnected separately from recovered if there's a meaningful gap
+  // (>60s). Otherwise just one "resolved" marker at recovered.
+  if (recovered != null && reconnected != null && (recovered - reconnected) > 60000) {
+    refs.push({ ms: reconnected, color: COLORS.yellow, label: 'reconnected', dashed: true });
+    refs.push({ ms: recovered,   color: COLORS.green,  label: 'recovered' });
+  } else if (recovered != null) {
+    refs.push({ ms: recovered, color: COLORS.green, label: 'resolved' });
+  }
+  refs.push({ ms: t1, color: COLORS.dim, label: 'window end', dashed: true });
+
+  ctx.font = '9px ui-monospace, monospace';
+  refs.forEach(r => {
+    const x = xOf(r.ms);
+    if (x < ML || x > ML + W) return;
+    ctx.strokeStyle = r.color;
+    ctx.globalAlpha = r.dashed ? 0.5 : 0.85;
+    ctx.lineWidth = 1;
+    if (r.dashed) ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, MT); ctx.lineTo(x, MT + H);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = r.color;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(r.label, x + 3, MT + 1);
+  });
+
+  // ── 7. Stats strip above chart ─────────────────────────────────
+  const statsEl = document.getElementById('diag-chart-stats');
+  if (statsEl) {
+    let downSec = 0;
+    (data.outages || []).forEach(o => {
+      const s = new Date(o.start).getTime();
+      const e = (o.end ? new Date(o.end).getTime() : t1);
+      downSec += Math.max(0, (Math.min(t1, e) - Math.max(t0, s)) / 1000);
+    });
+    const fmtDur = (s) => s < 60 ? Math.round(s) + 's'
+                       : s < 3600 ? Math.floor(s/60) + 'm ' + Math.round(s%60) + 's'
+                       : Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+    const med = p50s.length ? Math.round(p50s.reduce((a,b)=>a+b,0) / p50s.length) : null;
+    const p90Max = p90s.length ? Math.round(Math.max(...p90s)) : null;
+    const slowest = dlVals.length ? Math.min(...dlVals) : null;
+    const spanMs = t1 - t0;
+    const winLabel = spanMs >= 3600000
+      ? (Math.round(spanMs / 3600000 * 10) / 10) + 'h'
+      : Math.round(spanMs / 60000) + 'm';
+    const parts = [
+      'span <strong>' + winLabel + '</strong>',
+      'downtime <strong>' + (downSec > 0 ? fmtDur(downSec) : '0s') + '</strong>',
+    ];
+    if (med != null)     parts.push('median ping <strong>' + med + 'ms</strong>');
+    if (p90Max != null)  parts.push('p90 peak <strong>' + p90Max + 'ms</strong>');
+    if (slowest != null) parts.push('slowest <strong>' + slowest + ' Mbps</strong>');
+    statsEl.innerHTML = parts.join(' · ');
+  }
+
+  // ── 8. Hover tooltip ───────────────────────────────────────────
+  const tt = document.getElementById('diag-chart-tooltip');
+  canvas.onmousemove = (evt) => {
+    const rect = canvas.getBoundingClientRect();
+    const px = evt.clientX - rect.left;
+    const py = evt.clientY - rect.top;
+    // Speed marker hit first.
+    let hit = null;
+    for (const m of speedMarks) {
+      const dx = px - m.x, dy = py - m.y;
+      if (dx*dx + dy*dy <= 36) { hit = m; break; }
+    }
+    if (hit) {
+      const s = hit.sample;
+      const tStr = s.ts.replace('T', ' ').slice(11, 19);
+      tt.innerHTML = '<strong style="color:' + COLORS.magenta + '">Speed test</strong>'
+        + '<br>' + tStr
+        + '<br>↓ ' + s.dl + ' Mbps · ↑ ' + s.ul + ' Mbps'
+        + (s.ping != null ? '<br>ping ' + s.ping + 'ms' : '')
+        + (s.label ? '<br><span style="color:var(--dim)">' + s.label + '</span>' : '');
+    } else if (px >= ML && px <= ML + W && py >= MT && py <= MT + H) {
+      // Find nearest band bin.
+      const tHere = t0 + ((px - ML) / W) * span;
+      let nearest = null, nearestDt = Infinity;
+      bands.forEach(b => {
+        const dt = Math.abs(new Date(b[0]).getTime() - tHere);
+        if (dt < nearestDt) { nearestDt = dt; nearest = b; }
+      });
+      if (!nearest) { tt.style.display = 'none'; return; }
+      const [ts, p10, p50, p90, n] = nearest;
+      const tStr = ts.replace('T', ' ').slice(11, 19);
+      if (p50 == null) {
+        tt.innerHTML = '<strong style="color:' + COLORS.cyan + '">' + tStr + '</strong>'
+          + '<br><span style="color:var(--red)">no response</span>';
+      } else {
+        tt.innerHTML = '<strong style="color:' + COLORS.cyan + '">' + tStr + '</strong>'
+          + '<br>p10 ' + p10 + 'ms'
+          + '<br>p50 ' + p50 + 'ms'
+          + '<br>p90 ' + p90 + 'ms'
+          + '<br><span style="color:var(--dim)">' + n + ' samples</span>';
+      }
+    } else {
+      tt.style.display = 'none';
+      return;
+    }
+    tt.style.display = 'block';
+    const ttW = tt.offsetWidth, ttH = tt.offsetHeight;
+    let lx = px + 10, ly = py + 10;
+    if (lx + ttW > cssW) lx = px - ttW - 10;
+    if (ly + ttH > cssH) ly = py - ttH - 10;
+    tt.style.left = Math.max(0, lx) + 'px';
+    tt.style.top  = Math.max(0, ly) + 'px';
+  };
+  canvas.onmouseleave = () => { tt.style.display = 'none'; };
+}
+
+window.addEventListener('resize', () => { if (_diagChartState) paintDiagChart(); });
+
 async function loadHistory() {
   try {
     const resp = await fetch('/api/diagnoses');
     if (!resp.ok) throw new Error('http ' + resp.status);
     const data = await resp.json();
     history = data.items || [];
+    // Sort newest event first by when the event actually happened, not by
+    // when the user ran the analysis.
+    history.sort((a, b) => eventTimeOf(b) - eventTimeOf(a));
     if (!selectedId && history.length > 0) selectedId = history[0].id;
     renderHistory();
     renderDetail(history.find(x => x.id === selectedId));
@@ -3740,22 +4334,21 @@ function findDiagnosisForOutage(outageId) {
 
 function onTimelineClick(inc) {
   if (!inc) return;
-  if (inc.category === 'outage') {
-    const existing = findDiagnosisForOutage(inc.id);
-    if (existing) {
-      selectDiagnosis(existing.id);
-      return;
-    }
-    const start = new Date(inc.start);
-    const sec   = ((inc.end ? new Date(inc.end) : new Date()) - start) / 1000;
-    const ok = window.confirm(
-      'Run AI diagnosis on this ' + fmtIncidentDuration(sec) +
-      ' outage at ' + start.toLocaleString() + '?\\n\\n' +
-      'This will use ~$0.02 of API credit and take ~5–10 seconds.'
-    );
-    if (!ok) return;
-    runOutage(inc);
+  const existing = findDiagnosisForOutage(inc.id);
+  if (existing) {
+    selectDiagnosis(existing.id);
+    return;
   }
+  const start = new Date(inc.start);
+  const sec   = ((inc.end ? new Date(inc.end) : new Date()) - start) / 1000;
+  const kindLabel = inc.category === 'outage' ? 'outage' : 'degraded period';
+  const ok = window.confirm(
+    'Run AI diagnosis on this ' + fmtIncidentDuration(sec) +
+    ' ' + kindLabel + ' at ' + start.toLocaleString() + '?\\n\\n' +
+    'This will use ~$0.02 of API credit and take ~5–10 seconds.'
+  );
+  if (!ok) return;
+  runOutage(inc);
 }
 
 async function runOutage(inc) {
@@ -3869,6 +4462,27 @@ document.querySelectorAll('.run-btn').forEach(btn => {
   btn.addEventListener('click', () => runNew(btn.dataset.window));
 });
 
+document.getElementById('diag-delete-btn').addEventListener('click', async (evt) => {
+  const btn = evt.currentTarget;
+  const id = btn.dataset.id;
+  if (!id) return;
+  const diag = history.find(d => d.id === id);
+  const title = (diag && diag.result && diag.result.title) || 'this diagnosis';
+  if (!window.confirm('Delete "' + title + '"?\\n\\nThe cluster will go back to un-analyzed and can be re-evaluated later.')) return;
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/diagnoses/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (!resp.ok) throw new Error('http ' + resp.status);
+    if (selectedId === id) selectedId = null;
+    await loadHistory();
+    await refreshTimeline();
+  } catch (e) {
+    window.alert('Delete failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 (async () => {
   await loadHistory();
   await refreshTimeline();
@@ -3973,6 +4587,14 @@ def api_diagnose():
         result["id"] = str(int(time.time() * 1000))
         if outage_id:
             result["outage_id"] = outage_id
+        try:
+            result["chart_data"] = ai_diagnosis.build_chart_data(
+                _state, window,
+                incident_start=incident_start,
+                incident_end=incident_end,
+            )
+        except Exception as exc:
+            logging.warning("build_chart_data failed: %s", exc)
         with _state.lock:
             _state.diagnoses.appendleft(result)
         if result.get("ok"):
@@ -3992,6 +4614,23 @@ def api_diagnoses():
     if _state is None:
         return jsonify({"error": "not ready"}), 503
     return jsonify({"items": _diagnoses_within_30d(_state)})
+
+
+@app.route("/api/diagnoses/<diag_id>", methods=["DELETE"])
+def api_delete_diagnosis(diag_id):
+    if _state is None:
+        return jsonify({"error": "not ready"}), 503
+    with _state.lock:
+        before = len(_state.diagnoses)
+        _state.diagnoses = deque(
+            (d for d in _state.diagnoses if d.get("id") != diag_id),
+            maxlen=_state.diagnoses.maxlen,
+        )
+        removed = before - len(_state.diagnoses)
+    if not removed:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    _state.log(f"Deleted diagnosis {diag_id} (cluster reset to un-analyzed)", "info")
+    return jsonify({"ok": True, "removed": removed})
 
 
 CLUSTER_GAP_SECS = 1800  # outages OR degraded periods within 30 min = one incident
@@ -4038,8 +4677,6 @@ def _cluster_events(outages: List[OutageRecord],
     out: List[Dict] = []
     for members in clusters:
         first_start = min(m["start"] for m in members)
-        last_end    = max(m["end"]   for m in members)
-        ongoing     = any(m["ongoing"] for m in members)
         # Counts and total downtime per kind
         n_out = sum(1 for m in members if m["_kind"] == "outage")
         n_slow = sum(1 for m in members if m["_kind"] == "slow")
@@ -4049,6 +4686,12 @@ def _cluster_events(outages: List[OutageRecord],
         degraded_secs = sum(int((m["end"] - m["start"]).total_seconds())
                             for m in members if m["_kind"] != "outage")
         category = "outage" if n_out > 0 else "degraded"
+        # Ongoing reflects only members of the cluster's category. An open
+        # degraded period inside an outage-categorized cluster shouldn't make
+        # the bar render as a current outage when connectivity is fine.
+        relevant = [m for m in members if m["_kind"] == "outage"] if category == "outage" else members
+        ongoing  = any(m["ongoing"] for m in relevant)
+        last_end = max(m["end"] for m in relevant)
         if n_out:
             dominant_kind = "outage"
         elif n_hp >= n_slow:
