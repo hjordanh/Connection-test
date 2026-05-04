@@ -15,7 +15,7 @@ A lightweight, self-hosted internet connection monitor with a live web dashboard
 - **Provider tracking** — detects which ISP or network you're on and tracks per-provider uptime and speed averages
 - **Persistent storage** — history survives restarts; keeps 24 hours of ping data and 30 days of outages, degraded periods, and AI diagnoses on disk
 - **Router log scraping** — for any gateway whose firewall/event log is exposed at an HTTP path (configured in `connection_monitor.env`); polls every 30 s and surfaces firewall drops on the dashboard, including drops of the monitor's own DNS probes (a strong gateway-side root-cause signal)
-- **Timeline uptime chart** — 7-day view on the dashboard, 30-day view on `/diagnose`. Vertical bars show actual time-of-day position of outages (red), degraded periods (yellow stripes for slow speeds or sustained high ping), and uptime (green). Outages and degraded periods within 30 minutes of each other are clustered into a single incident so the chart is scannable. Already-analyzed incidents render in **magenta** with a hover tooltip showing the AI's headline
+- **Timeline uptime chart** — 7-day view on the dashboard, 30-day view on `/diagnose`. Vertical bars show actual time-of-day position of outages (red), degraded periods (yellow stripes for slow speeds or sustained high ping), site-loss periods (teal stripes — a single tracked site flaky while everything else looks fine), and uptime (green). Outages and degraded periods within 30 minutes of each other are clustered into a single incident so the chart is scannable; each member still renders in its own color. Already-analyzed incidents render in a **lighter shade of their category color** with a hover tooltip showing the AI's headline
 - **AI diagnosis** — on-demand "what's actually going on?" summary via Claude on its own page (`/diagnose`) with 30 days of history. Two ways to run:
   - **Click any incident on the timeline** to diagnose that specific event (uses a window that includes 30 min of lead-up and 30 min of recovery)
   - **Pick an ad-hoc window** (Ongoing / Last 1h / Last 24h) for a general assessment
@@ -37,6 +37,50 @@ Most people only notice their internet is bad when something breaks. This monito
 - Early warning when a specific service (Xbox Live, a streaming service) is degraded before you blame your own connection
 - A baseline sense of whether your speeds are normal for your connection
 - Jitter and latency trends that explain why video calls feel choppy even when "the internet is working"
+
+---
+
+## How outages and degradation are defined
+
+The monitor distinguishes three classes of issue, each with its own open and close criteria. The pattern across all three: **strict open thresholds** (only fire on genuinely bad signals) paired with **generous close thresholds** (clear once you're "out of the bad tail," not when you've fully returned to median). Industry guidance calls this "open quickly, close conservatively" — it matches user perception (notice problems immediately) while avoiding flapping when conditions partially recover.
+
+### Outage (red) — complete blackout
+
+| | Rule |
+|---|---|
+| **Open** | All 3 DNS-port probes (8.8.8.8, 1.1.1.1, 208.67.222.222) fail in a single 2-second probe cycle |
+| **Resolve** *(connectivity restored)* | Any single probe succeeds — marks `incident.end` |
+| **Recovered** *(true return-to-normal)* | Connectivity restored **and** speed back ≥ 7d-P10 (3 consecutive samples) **and** ping back ≤ 7d-P90 (30 consecutive probes) — marks `incident.recovery_end` |
+
+Because residential gateways often drop responses to monitor probes even when general traffic flows fine (uRPF, MTU/MSS issues, dual-stack churn), an "outage" here can be a monitoring artifact rather than an upstream ISP failure. The router-log scraper, when configured, surfaces this distinction directly.
+
+### Degradation (yellow stripes) — brownout, "responding but bad"
+
+Two independent signals can open a degraded period; each closes on its own streak rule.
+
+| Signal | Open | Close |
+|---|---|---|
+| **Slow speed** | Single speed sample with `download_mbps < 7d-P10` (the bottom 10% of last week's experience) | 3 consecutive non-Outage samples ≥ 7d-P10 (≈15 min @ 5 min cadence) |
+| **High ping** | Rolling p90 of last 30 connectivity probes ≥ `max(100ms, 3× 7d-median ping)`, sustained for 60 s | 30 consecutive non-None pings ≤ 7d-P90 (≈60 s @ 2 s); a failed probe breaks the streak |
+
+**Rationale:** P10 is the bottom-tail floor — any speed at or above it is, by definition, better than 90% of the last week. So opening below P10 means "this sample is genuinely tail-end," and closing once 3 consecutive samples reach P10 means "the bad spell is over, even if speeds aren't fully back to median." This replaces an earlier "below 50% × P50 → open / above 75% × P50 → close" rule that was both too trigger-happy on the open (any moderate speed dip) and too strict on the close (required full recovery).
+
+### Site loss (teal stripes) — a specific service flaky alone
+
+| | Rule |
+|---|---|
+| **Open** | A tracked site has 3 consecutive failed TCP:443 checks (≈30 s @ 10 s cadence) **and** there is no concurrent outage / slow / high-ping period |
+| **Close** | That site has 6 consecutive successful checks (≈60 s clean) |
+
+Site loss is a separate class because it represents a different kind of problem: not your connection, but a specific third-party service. When it co-occurs with broader degradation, the broader signal already covers it (no separate site-loss period is opened). When a site is flaky in isolation, the teal bar visually communicates "this isn't your internet."
+
+### What you'll see
+
+- **Solid red** — actual outage, all DNS-port targets unreachable
+- **Yellow stripes** — slow throughput or sustained high ping, but connectivity is up
+- **Teal stripes** — a specific site is flaky on its own; everything else looks fine
+- **Green** — normal
+- **Lighter shade of any category color** — that incident has been analyzed by AI; click to view
 
 ---
 

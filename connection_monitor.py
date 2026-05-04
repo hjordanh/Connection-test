@@ -79,13 +79,49 @@ ROUTER_SYSLOG_PATH     = os.environ.get("ROUTER_SYSLOG_PATH", "")
 ROUTER_POLL_INTERVAL   = int(os.environ.get("ROUTER_POLL_INTERVAL", "30"))
 
 # Degraded-period detection thresholds (tuning knobs, not deployment config).
-SLOW_OPEN_MULT   = 0.50   # download below 50% of 7d median → open "slow"
-SLOW_CLOSE_MULT  = 0.75   # download above 75% of 7d median → close "slow"
-SLOW_MIN_HISTORY = 5      # need at least N prior samples to use median
-HIGH_PING_OPEN_MULT  = 3.0   # p90 above 3× 7d median ping → candidate high_ping
-HIGH_PING_CLOSE_MULT = 1.5   # p90 back below 1.5× → candidate close
-HIGH_PING_FLOOR_MS   = 100.0 # never trigger if absolute p90 below this
-HIGH_PING_DURATION_S = 60    # must hold above/below threshold this long
+# ─────────────────────────────────────────────────────────────
+# Outage / degradation definitions (single source of truth)
+# ─────────────────────────────────────────────────────────────
+# An OUTAGE is a complete blackout: all 3 DNS-port probes (8.8.8.8, 1.1.1.1,
+# 208.67.222.222) fail in a single 2-second probe cycle. Resolves on the next
+# successful probe; "true return to normal" (recovery_end) additionally
+# requires speed and ping signals back to baseline (computed in ai_diagnosis).
+#
+# DEGRADATION is a brownout — service responds but quality is below baseline.
+# Three independent signals can open a degraded period; each closes on its own
+# streak rule. Open rules are strict (so we only flag genuine degradation);
+# close rules are generous (so periods clear once we're "out of the bad tail"
+# rather than requiring full restoration to the median).
+#
+# Slow:
+#   Open  — single speed sample with dl < 7d-P10 (true tail of recent
+#           experience: a sample worse than 90% of the last week).
+#   Close — SLOW_CLOSE_STREAK consecutive non-Outage samples ≥ 7d-P10.
+#
+# High ping:
+#   Open  — rolling p90 of last 30 connectivity probes (≈60s @ 2s) ≥
+#           max(HIGH_PING_FLOOR_MS, HIGH_PING_OPEN_MULT × 7d median ping),
+#           sustained for HIGH_PING_DURATION_S.
+#   Close — HIGH_PING_CLOSE_STREAK consecutive non-None pings ≤ 7d-P90. A
+#           None probe (failed connectivity) breaks the streak.
+#
+# SITE LOSS is a distinct class — a specific site is unreachable while
+# everything else looks fine. Surfaced in teal so it visually reads as
+# "this isn't your internet, it's that one service":
+#   Open  — a tracked site has SITE_LOSS_OPEN_STREAK consecutive failed
+#           TCP:443 checks (≈30s of loss at the 10s site-check cadence) AND
+#           there is no concurrent outage / slow / high_ping period (those
+#           subsume site flakiness already).
+#   Close — that site has SITE_LOSS_CLOSE_STREAK consecutive successful
+#           checks (≈60s clean).
+SLOW_MIN_HISTORY     = 5      # need at least N prior samples to use percentiles
+HIGH_PING_OPEN_MULT  = 3.0
+HIGH_PING_FLOOR_MS   = 100.0  # never trigger if absolute p90 below this
+HIGH_PING_DURATION_S = 60     # sustained-condition window for opening
+SLOW_CLOSE_STREAK         = 3   # samples (≈15min @ 5min cadence)
+HIGH_PING_CLOSE_STREAK    = 30  # probes (≈60s @ 2s)
+SITE_LOSS_OPEN_STREAK     = 3   # consecutive failed checks (≈30s @ 10s)
+SITE_LOSS_CLOSE_STREAK    = 6   # consecutive successful checks (≈60s @ 10s)
 
 _DEFAULT_PING_TARGETS = [
     "netflix.com",
@@ -258,10 +294,19 @@ class MonitorState:
         self.degraded_periods: deque = deque(maxlen=2000)
         self.current_slow: Optional[DegradedPeriod] = None
         self.current_high_ping: Optional[DegradedPeriod] = None
+        # Per-host site_loss DegradedPeriods — keyed by hostname so multiple
+        # sites can be in site_loss simultaneously without stomping each other.
+        self.current_site_loss: Dict[str, DegradedPeriod] = {}
         # Rolling latency window for high-ping detection (last 30 samples ≈ 60s @ 2s)
         self._recent_pings: deque = deque(maxlen=30)
         self._high_ping_started_above: Optional[datetime] = None
         self._high_ping_below_since: Optional[datetime] = None
+        # Streak counters for percentile-based close criteria.
+        self._slow_close_streak: int = 0
+        self._high_ping_close_streak: int = 0
+        # Per-host streaks for site_loss open/close.
+        self._site_fail_streaks: Dict[str, int] = {}
+        self._site_pass_streaks: Dict[str, int] = {}
 
         # Router log scraper — stores router_log.RouterEvent objects
         self.router_events: deque = deque(maxlen=5000)
@@ -931,39 +976,95 @@ def run_speed_test(state: MonitorState, label: str) -> None:
 # ─────────────────────────────────────────────────────────────
 # Degraded-period detectors (call with state.lock held)
 # ─────────────────────────────────────────────────────────────
-def _median_recent_downloads(state: "MonitorState", days: int = 7) -> Optional[float]:
+def _percentile(sorted_vals: List[float], q: float) -> float:
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    idx = q / 100 * (len(sorted_vals) - 1)
+    lo, hi = int(idx), min(int(idx) + 1, len(sorted_vals) - 1)
+    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (idx - lo)
+
+
+def _recent_download_pcts(state: "MonitorState", days: int = 7
+                          ) -> Optional[Tuple[float, float]]:
+    """Return (p10, p50) of download speeds over the last `days`. None if
+    insufficient history. Excludes zero-Mbps samples (Outage / failed tests).
+    """
     cutoff = datetime.now() - timedelta(days=days)
-    vals = [s.download_mbps for s in state.speed_history
-            if s.timestamp >= cutoff and s.download_mbps > 0]
+    vals = sorted(s.download_mbps for s in state.speed_history
+                  if s.timestamp >= cutoff and s.download_mbps > 0)
     if len(vals) < SLOW_MIN_HISTORY:
         return None
-    return statistics.median(vals)
+    return _percentile(vals, 10), _percentile(vals, 50)
+
+
+def _median_recent_downloads(state: "MonitorState", days: int = 7) -> Optional[float]:
+    pcts = _recent_download_pcts(state, days)
+    return pcts[1] if pcts else None
+
+
+def _p90_recent_pings(state: "MonitorState", days: int = 7) -> Optional[float]:
+    """Return P90 of recent ping latencies (from speed-test pings + connectivity
+    probe latencies in ping_history_ts). Excludes None/zero. Used to define
+    'normal range' for closing high-ping periods."""
+    cutoff = datetime.now() - timedelta(days=days)
+    cutoff_iso = cutoff.isoformat()
+    pings: List[float] = []
+    pings.extend(s.ping_ms for s in state.speed_history
+                 if s.timestamp >= cutoff and s.ping_ms and s.ping_ms > 0)
+    pings.extend(v for ts, v in state.ping_history_ts
+                 if v is not None and v > 0 and ts >= cutoff_iso)
+    if len(pings) < SLOW_MIN_HISTORY:
+        return None
+    pings.sort()
+    return _percentile(pings, 90)
 
 
 def _update_slow_degraded(state: "MonitorState", sample: SpeedSample,
                           now: datetime) -> Optional[Tuple[str, str]]:
     """Open or close a 'slow' DegradedPeriod based on this speed sample.
     Returns an optional (msg, level) for state.log() (called outside the lock).
+
+    Open: dl < 50% × 7d-P50 (single sample, strict — only flag real slowness).
+    Close: SLOW_CLOSE_STREAK consecutive non-Outage samples ≥ 7d-P10. P10 is
+    the bottom-tail floor — anything above it is "out of the bad zone," even
+    if not fully back to median. Outage-labeled samples reset the streak so a
+    transient drop during recovery doesn't falsely close.
     """
-    median = _median_recent_downloads(state)
-    if median is None:
+    pcts = _recent_download_pcts(state)
+    if pcts is None:
         return None
-    open_below  = SLOW_OPEN_MULT  * median
-    close_above = SLOW_CLOSE_MULT * median
+    p10, p50 = pcts
     dl = sample.download_mbps
-    if state.current_slow is None and dl < open_below:
+    is_outage_sample = (sample.label or "") == "Outage"
+
+    # Open: single sample below 7d-P10 (the bottom-tail of recent experience).
+    # Stricter than the old "50% of P50" trigger — only fires on samples worse
+    # than 90% of last week, dramatically reducing false positives.
+    if state.current_slow is None and not is_outage_sample and dl < p10:
         period = DegradedPeriod(
             start=now, kind="slow",
-            detail=f"download {dl:.1f} Mbps < {open_below:.1f} Mbps (50% of 7d median {median:.1f})",
+            detail=f"download {dl:.1f} Mbps < 7d-P10 ({p10:.1f} Mbps); 7d median {p50:.1f}",
         )
         state.current_slow = period
         state.degraded_periods.append(period)
-        return (f"Degraded: slow ({dl:.1f} Mbps, baseline {median:.1f})", "warning")
-    if state.current_slow is not None and dl >= close_above:
-        state.current_slow.end = now
-        msg = f"Degraded ended: speed recovered to {dl:.1f} Mbps"
-        state.current_slow = None
-        return (msg, "success")
+        state._slow_close_streak = 0
+        return (f"Degraded: slow ({dl:.1f} Mbps, P10 {p10:.1f}, P50 {p50:.1f})", "warning")
+
+    # Close path — streak of non-Outage samples ≥ 7d-P10.
+    if state.current_slow is not None:
+        if is_outage_sample:
+            state._slow_close_streak = 0
+        elif dl >= p10:
+            state._slow_close_streak += 1
+            if state._slow_close_streak >= SLOW_CLOSE_STREAK:
+                state.current_slow.end = now
+                msg = (f"Degraded ended: {SLOW_CLOSE_STREAK} consecutive samples "
+                       f"≥ 7d-P10 ({p10:.1f} Mbps); latest {dl:.1f} Mbps")
+                state.current_slow = None
+                state._slow_close_streak = 0
+                return (msg, "success")
+        else:
+            state._slow_close_streak = 0
     return None
 
 
@@ -971,53 +1072,67 @@ def _update_high_ping_degraded(state: "MonitorState", latency_ms: Optional[float
                                now: datetime) -> Optional[Tuple[str, str]]:
     """Track high-ping windows. Called from connectivity_thread under state.lock.
     Returns optional (msg, level) to log outside the lock.
+
+    Open: rolling p90 of last 30 connectivity probes ≥ max(100ms, 3× 7d-median),
+    sustained for HIGH_PING_DURATION_S (single condition, must hold).
+    Close: HIGH_PING_CLOSE_STREAK consecutive non-None pings ≤ 7d-P90 (the
+    "normal range" floor — anything inside the 90th percentile of typical
+    pings counts as recovered). A None ping (probe failure) breaks the
+    streak — we're not 'back to normal' if the connection is dropping probes.
     """
     if latency_ms is not None:
         state._recent_pings.append(latency_ms)
-    if len(state._recent_pings) < state._recent_pings.maxlen:
+
+    # ── CLOSE PATH ── runs every probe, including None, so the streak can
+    # both increment on each good ping and break on each missed one.
+    if state.current_high_ping is not None:
+        normal_p90 = _p90_recent_pings(state)
+        if latency_ms is None:
+            state._high_ping_close_streak = 0
+        elif normal_p90 is not None and latency_ms <= normal_p90:
+            state._high_ping_close_streak += 1
+            if state._high_ping_close_streak >= HIGH_PING_CLOSE_STREAK:
+                state.current_high_ping.end = now
+                state.current_high_ping = None
+                state._high_ping_close_streak = 0
+                return (f"Degraded ended: {HIGH_PING_CLOSE_STREAK} consecutive "
+                        f"pings ≤ 7d-P90 ({normal_p90:.0f}ms)", "success")
+        else:
+            state._high_ping_close_streak = 0
+        # While in a high-ping period, the open detector below is a no-op.
         return None
 
+    # ── OPEN PATH ── needs a full rolling window before evaluating.
+    if len(state._recent_pings) < state._recent_pings.maxlen:
+        return None
     pings = sorted(state._recent_pings)
     p90 = pings[int(0.9 * (len(pings) - 1))]
 
-    # Need a 7d median baseline to size the threshold; fall back to floor only.
+    # Open threshold sized off 7d median ping (fall back to floor only).
     baseline = None
     cutoff = now - timedelta(days=7)
     medians = [s.ping_ms for s in state.speed_history
                if s.timestamp >= cutoff and s.ping_ms > 0]
     if len(medians) >= SLOW_MIN_HISTORY:
         baseline = statistics.median(medians)
-    open_threshold  = max(HIGH_PING_FLOOR_MS,
-                          (HIGH_PING_OPEN_MULT  * baseline) if baseline else HIGH_PING_FLOOR_MS)
-    close_threshold = max(HIGH_PING_FLOOR_MS * 0.6,
-                          (HIGH_PING_CLOSE_MULT * baseline) if baseline else HIGH_PING_FLOOR_MS * 0.6)
+    open_threshold = max(HIGH_PING_FLOOR_MS,
+                         (HIGH_PING_OPEN_MULT * baseline) if baseline else HIGH_PING_FLOOR_MS)
 
-    if state.current_high_ping is None:
-        if p90 >= open_threshold:
-            if state._high_ping_started_above is None:
-                state._high_ping_started_above = now
-            elif (now - state._high_ping_started_above).total_seconds() >= HIGH_PING_DURATION_S:
-                period = DegradedPeriod(
-                    start=state._high_ping_started_above, kind="high_ping",
-                    detail=f"p90 {p90:.0f}ms ≥ {open_threshold:.0f}ms threshold",
-                )
-                state.current_high_ping = period
-                state.degraded_periods.append(period)
-                state._high_ping_started_above = None
-                return (f"Degraded: high ping (p90 {p90:.0f}ms)", "warning")
-        else:
+    if p90 >= open_threshold:
+        if state._high_ping_started_above is None:
+            state._high_ping_started_above = now
+        elif (now - state._high_ping_started_above).total_seconds() >= HIGH_PING_DURATION_S:
+            period = DegradedPeriod(
+                start=state._high_ping_started_above, kind="high_ping",
+                detail=f"p90 {p90:.0f}ms ≥ {open_threshold:.0f}ms threshold",
+            )
+            state.current_high_ping = period
+            state.degraded_periods.append(period)
             state._high_ping_started_above = None
+            state._high_ping_close_streak = 0
+            return (f"Degraded: high ping (p90 {p90:.0f}ms)", "warning")
     else:
-        if p90 <= close_threshold:
-            if state._high_ping_below_since is None:
-                state._high_ping_below_since = now
-            elif (now - state._high_ping_below_since).total_seconds() >= HIGH_PING_DURATION_S:
-                state.current_high_ping.end = now
-                state.current_high_ping = None
-                state._high_ping_below_since = None
-                return (f"Degraded ended: ping recovered (p90 {p90:.0f}ms)", "success")
-        else:
-            state._high_ping_below_since = None
+        state._high_ping_started_above = None
     return None
 
 
@@ -1184,7 +1299,19 @@ def load_state(state: MonitorState) -> None:
                 end = datetime.fromisoformat(o["end"]) if o.get("end") else None
                 outages.append(OutageRecord(start=start, end=end))
 
+        # Drop unreliable degraded period records on load:
+        #   1. end is missing → orphan from a restart that lost current_slow /
+        #      current_high_ping. We have no truthful end time.
+        #   2. end - start > MAX_DEGRADED_LOAD_DURATION → almost certainly a
+        #      previously force-closed orphan with a fake saved-at end time,
+        #      or a runaway period from before the streak-based close logic
+        #      landed. Real degraded periods clear within minutes once the
+        #      P10/P90 streak conditions are met.
+        # state.current_slow / state.current_high_ping start at None (existing
+        # behavior); detection runs fresh against the next live sample.
+        MAX_DEGRADED_LOAD_DURATION = timedelta(hours=4)
         degraded_loaded: List[DegradedPeriod] = []
+        dropped_orphan = dropped_long = 0
         for d in data.get("degraded_periods", []):
             try:
                 start = datetime.fromisoformat(d["start"])
@@ -1192,12 +1319,33 @@ def load_state(state: MonitorState) -> None:
                 continue
             if start < cutoff_30d:
                 continue
-            end = datetime.fromisoformat(d["end"]) if d.get("end") else None
+            end_raw = d.get("end")
+            if not end_raw:
+                dropped_orphan += 1
+                continue
+            try:
+                end = datetime.fromisoformat(end_raw)
+            except ValueError:
+                dropped_orphan += 1
+                continue
+            kind = d.get("kind", "slow")
+            # Slow / high_ping should clear within minutes once the new
+            # streak-based close criteria are met — anything > 4h is almost
+            # certainly a previously-orphaned record. site_loss is exempt:
+            # a real third-party service outage can legitimately last hours.
+            if kind in ("slow", "high_ping") and end - start > MAX_DEGRADED_LOAD_DURATION:
+                dropped_long += 1
+                continue
             degraded_loaded.append(DegradedPeriod(
                 start=start, end=end,
-                kind=d.get("kind", "slow"),
+                kind=kind,
                 detail=d.get("detail", ""),
             ))
+        if dropped_orphan or dropped_long:
+            logging.info("load_state: dropped %d orphan + %d unrealistically long "
+                         "degraded period(s) (> %s)",
+                         dropped_orphan, dropped_long,
+                         MAX_DEGRADED_LOAD_DURATION)
 
         ping_ts: List[Tuple[str, float]] = [
             (ts, v)
@@ -1335,6 +1483,39 @@ def site_check_thread(state: MonitorState) -> None:
                             out.end = now
                             state.site_outages.append((host, out))
                         events_to_log.append((f"Site restored: {host}", "success"))
+
+                    # Site-loss DegradedPeriod tracking (the teal-hashed class).
+                    # Only opened when the rest of the system looks fine —
+                    # otherwise site flakiness is already represented by an
+                    # ongoing outage / high_ping / slow period and adding a
+                    # site_loss layer would be redundant.
+                    if up:
+                        state._site_fail_streaks[host] = 0
+                        state._site_pass_streaks[host] = state._site_pass_streaks.get(host, 0) + 1
+                        if (host in state.current_site_loss
+                                and state._site_pass_streaks[host] >= SITE_LOSS_CLOSE_STREAK):
+                            period = state.current_site_loss.pop(host)
+                            period.end = now
+                            events_to_log.append(
+                                (f"Site loss ended: {host}", "success"))
+                    else:
+                        state._site_pass_streaks[host] = 0
+                        state._site_fail_streaks[host] = state._site_fail_streaks.get(host, 0) + 1
+                        if (host not in state.current_site_loss
+                                and state._site_fail_streaks[host] >= SITE_LOSS_OPEN_STREAK
+                                and state.current_outage is None
+                                and state.current_slow is None
+                                and state.current_high_ping is None):
+                            period = DegradedPeriod(
+                                start=now, kind="site_loss",
+                                detail=f"{host} unreachable for "
+                                       f"{state._site_fail_streaks[host]} consecutive checks",
+                            )
+                            state.current_site_loss[host] = period
+                            state.degraded_periods.append(period)
+                            events_to_log.append(
+                                (f"Site loss: {host} ({state._site_fail_streaks[host]} consecutive failures)",
+                                 "warning"))
 
             for msg, level in events_to_log:
                 state.log(msg, level)
@@ -1573,9 +1754,11 @@ window.UptimeTimeline = (function () {
     bar_ok:   'rgba(63,185,80,0.55)',   // muted green
     bar_no:   '#161b22',                 // future / no data
     outage:   '#f85149',
-    outage_seen: 'rgba(248,81,73,0.45)',   // lighter red = "analyzed" (matches legend)
+    outage_seen: 'rgba(248,81,73,0.45)',     // lighter red = analyzed outage
     degraded: '#d29922',
-    degraded_seen: 'rgba(248,81,73,0.45)',
+    degraded_seen: 'rgba(210,153,34,0.45)',  // lighter yellow = analyzed degraded
+    site_loss:      '#39c5cf',                  // teal = single site flaky alone
+    site_loss_seen: 'rgba(57,197,207,0.45)',    // lighter teal = analyzed site_loss
     today:    '#58a6ff',
     text:     '#e6edf3',
     dim:      '#8b949e',
@@ -1796,49 +1979,70 @@ window.UptimeTimeline = (function () {
       });
     }
 
-    // Helper: draw a cluster span (possibly crossing midnight) into bars.
-    // `cluster.category` is "outage" (red) or "degraded" (yellow with stripes).
+    // Render every cluster member individually in its own category color
+    // (outage red, degraded yellow stripes), instead of painting the entire
+    // cluster span in one color. Cross-kind clustering still groups members
+    // for click-to-diagnose, but visually a mostly-degraded cluster reads as
+    // mostly yellow — only the actual outage segments paint red.
     function drawSpan(cluster) {
-      const start = new Date(cluster.start);
-      const end = cluster.end ? new Date(cluster.end) : new Date();
       const isAnalyzed = analyzedIds.has(cluster.id);
-      const category = cluster.category || 'outage';
-      const baseColor =
-        category === 'outage' ? (isAnalyzed ? COLORS.outage_seen   : COLORS.outage)
-                              : (isAnalyzed ? COLORS.degraded_seen : COLORS.degraded);
-      const useStripes = (category !== 'outage');
-      const pattern = useStripes ? makeStripePattern(ctx, baseColor) : null;
+      const clusterCategory = cluster.category || 'outage';
+      // Backwards-compat: if `members` not present (older API response),
+      // synthesize a single member from the cluster span itself.
+      const members = (cluster.members && cluster.members.length)
+        ? cluster.members
+        : [{
+            kind: clusterCategory === 'outage' ? 'outage' : 'slow',
+            start: cluster.start,
+            end: cluster.end || new Date().toISOString(),
+            ongoing: !!cluster.ongoing,
+          }];
 
-      dayStarts.forEach((day, idx) => {
-        const dayEnd = new Date(day); dayEnd.setDate(day.getDate() + 1);
-        if (end <= day || start >= dayEnd) return;
-        const segStart = (start > day) ? start : day;
-        const segEnd   = (end   < dayEnd) ? end : dayEnd;
-        // Bottom-up Y axis: yOf(later) is higher (smaller pixel value) than
-        // yOf(earlier). yA is the top edge of the rect, yB the bottom.
-        const yA = yOf(minutesOfDay(segEnd >= dayEnd ? new Date(dayEnd.getTime() - 1) : segEnd));
-        const yB = yOf(minutesOfDay(segStart));
-        const x = dayX[idx] + (colW - barW) / 2;
-        // 30d view bumps bar height by 50% (and a slightly higher floor) so
-        // short incidents are easier to see and click. Bars stay centered on
-        // the actual time of the event.
-        const heightMult = days > 7 ? 1.5 : 1.0;
-        const minH = days > 7 ? 3 : 2;
-        const baseH = Math.max(minH, yB - yA);
-        const h = baseH * heightMult;
-        const yTop = yA - (h - (yB - yA)) / 2;
-        ctx.fillStyle = useStripes ? pattern : baseColor;
-        ctx.fillRect(x, yTop, barW, h);
-        // Hit region is padded a few pixels beyond the visual bar — short bars
-        // are otherwise hard to land the cursor on (felt ~3px off above).
-        const HIT_PAD_TOP = 4, HIT_PAD_BOT = 3, HIT_PAD_X = 1;
-        incidentRects.push({
-          x: x - HIT_PAD_X,
-          y: yTop - HIT_PAD_TOP,
-          w: barW + 2 * HIT_PAD_X,
-          h: h + HIT_PAD_TOP + HIT_PAD_BOT,
-          incident: { ...cluster, category, analyzed: isAnalyzed,
-                      title: titles[cluster.id] || null, dayIndex: idx },
+      members.forEach(m => {
+        const memStart = new Date(m.start);
+        const memEnd   = m.end ? new Date(m.end) : new Date();
+        // Per-member coloring: outage = solid red (or lighter when analyzed),
+        // slow / high_ping = yellow stripes, site_loss = teal stripes.
+        let memColor, useStripes;
+        if (m.kind === 'outage') {
+          memColor = isAnalyzed ? COLORS.outage_seen : COLORS.outage;
+          useStripes = false;
+        } else if (m.kind === 'site_loss') {
+          memColor = isAnalyzed ? COLORS.site_loss_seen : COLORS.site_loss;
+          useStripes = true;
+        } else { // 'slow' | 'high_ping'
+          memColor = isAnalyzed ? COLORS.degraded_seen : COLORS.degraded;
+          useStripes = true;
+        }
+        const pattern = useStripes ? makeStripePattern(ctx, memColor) : null;
+
+        dayStarts.forEach((day, idx) => {
+          const dayEnd = new Date(day); dayEnd.setDate(day.getDate() + 1);
+          if (memEnd <= day || memStart >= dayEnd) return;
+          const segStart = (memStart > day) ? memStart : day;
+          const segEnd   = (memEnd   < dayEnd) ? memEnd : dayEnd;
+          const yA = yOf(minutesOfDay(segEnd >= dayEnd ? new Date(dayEnd.getTime() - 1) : segEnd));
+          const yB = yOf(minutesOfDay(segStart));
+          const x = dayX[idx] + (colW - barW) / 2;
+          // 30d view bumps bar height by 50% so short incidents are visible.
+          const heightMult = days > 7 ? 1.5 : 1.0;
+          const minH = days > 7 ? 3 : 2;
+          const baseH = Math.max(minH, yB - yA);
+          const h = baseH * heightMult;
+          const yTop = yA - (h - (yB - yA)) / 2;
+          ctx.fillStyle = useStripes ? pattern : memColor;
+          ctx.fillRect(x, yTop, barW, h);
+          const HIT_PAD_TOP = 4, HIT_PAD_BOT = 3, HIT_PAD_X = 1;
+          incidentRects.push({
+            x: x - HIT_PAD_X,
+            y: yTop - HIT_PAD_TOP,
+            w: barW + 2 * HIT_PAD_X,
+            h: h + HIT_PAD_TOP + HIT_PAD_BOT,
+            // The hit-target carries the cluster (not the member) so clicks
+            // open the same diagnosis regardless of which member was hit.
+            incident: { ...cluster, category: clusterCategory, analyzed: isAnalyzed,
+                        title: titles[cluster.id] || null, dayIndex: idx },
+          });
         });
       });
     }
@@ -1909,9 +2113,10 @@ window.UptimeTimeline = (function () {
         const end   = inc.end ? new Date(inc.end) : new Date();
         const span  = (end - start) / 1000;
         const parts = [];
-        if (inc.outage_count)   parts.push(inc.outage_count + ' outage'    + (inc.outage_count > 1 ? 's' : ''));
+        if (inc.outage_count)    parts.push(inc.outage_count + ' outage' + (inc.outage_count > 1 ? 's' : ''));
         if (inc.high_ping_count) parts.push(inc.high_ping_count + ' high-ping');
-        if (inc.slow_count)     parts.push(inc.slow_count + ' slow');
+        if (inc.slow_count)      parts.push(inc.slow_count + ' slow');
+        if (inc.site_loss_count) parts.push(inc.site_loss_count + ' site-loss');
         const headline = parts.length ? parts.join(' · ')
           : (inc.category === 'outage' ? 'Outage' : 'Degraded');
         const lines = [];
@@ -3036,7 +3241,9 @@ function onTimelineClick(inc) {
   const start = new Date(inc.start);
   const end   = inc.end ? new Date(inc.end) : new Date();
   const sec   = (end - start) / 1000;
-  const kindLabel = inc.category === 'outage' ? 'outage' : 'degraded period';
+  const kindLabel = inc.category === 'outage' ? 'outage'
+                   : inc.category === 'site_loss' ? 'site-loss period'
+                   : 'degraded period';
   const ok = window.confirm(
     'Run AI diagnosis on this ' + fmtIncidentDuration(sec) +
     ' ' + kindLabel + ' at ' + start.toLocaleString() + '?\\n\\n' +
@@ -3701,8 +3908,9 @@ header {
   <div style="color:var(--dim);font-size:10px;margin-top:6px;display:flex;gap:14px;flex-wrap:wrap">
     <span><span style="color:var(--red)">█</span> outage</span>
     <span><span style="color:var(--yellow)">▨</span> degraded (slow / high ping)</span>
-    <span><span style="color:rgba(248,81,73,0.45)">█</span> already analyzed (click to view)</span>
-    <span><span style="color:var(--cyan)">─</span> now</span>
+    <span><span style="color:#39c5cf">▨</span> site loss (single site flaky)</span>
+    <span><span style="color:rgba(248,81,73,0.45)">█</span><span style="color:rgba(210,153,34,0.45)">▨</span> already analyzed (click to view)</span>
+    <span><span style="color:#39c5cf">─</span> now</span>
   </div>
 </div>
 
@@ -3737,6 +3945,7 @@ header {
         <div class="diag-chart-legend">
           <span><span class="lg-swatch" style="background:rgba(63,185,80,0.18)"></span>normal</span>
           <span><span class="lg-swatch" style="background:rgba(210,153,34,0.22)"></span>degraded</span>
+          <span><span class="lg-swatch" style="background:rgba(57,197,207,0.18)"></span>site loss</span>
           <span><span class="lg-swatch" style="background:rgba(248,81,73,0.28)"></span>outage</span>
           <span><span class="lg-band" style="background:rgba(57,197,207,0.18);border-top:1.5px solid var(--cyan);border-bottom:1.5px solid var(--cyan)"></span>ping p10–p90 / median (ms · left)</span>
           <span><span class="lg-dot" style="background:var(--magenta)"></span>speed test (Mbps · right)</span>
@@ -4004,9 +4213,10 @@ function paintDiagChart() {
     magenta:  _diagChartCss('--magenta'),
   };
   // Background tints (slightly stronger than chart-card so the bands read).
-  const BG_NORMAL   = 'rgba(63,185,80,0.10)';
-  const BG_DEGRADED = 'rgba(210,153,34,0.18)';
-  const BG_OUTAGE   = 'rgba(248,81,73,0.22)';
+  const BG_NORMAL    = 'rgba(63,185,80,0.10)';
+  const BG_DEGRADED  = 'rgba(210,153,34,0.18)';
+  const BG_OUTAGE    = 'rgba(248,81,73,0.22)';
+  const BG_SITE_LOSS = 'rgba(57,197,207,0.18)';   // teal for site_loss
 
   const ML = 40, MR = 44, MT = 10, MB = 22;
   const W = cssW - ML - MR;
@@ -4059,7 +4269,10 @@ function paintDiagChart() {
     ctx.fillStyle = color;
     ctx.fillRect(x0, MT, x1 - x0, H);
   }
-  (data.degraded || []).forEach(d => drawSpan(d.start, d.end, BG_DEGRADED));
+  (data.degraded || []).forEach(d => {
+    const bg = (d.kind === 'site_loss') ? BG_SITE_LOSS : BG_DEGRADED;
+    drawSpan(d.start, d.end, bg);
+  });
   (data.outages  || []).forEach(o => drawSpan(o.start, o.end, BG_OUTAGE));
 
   // ── 2. Y gridlines + left axis (ms) + right axis (Mbps) ─────────
@@ -4341,7 +4554,9 @@ function onTimelineClick(inc) {
   }
   const start = new Date(inc.start);
   const sec   = ((inc.end ? new Date(inc.end) : new Date()) - start) / 1000;
-  const kindLabel = inc.category === 'outage' ? 'outage' : 'degraded period';
+  const kindLabel = inc.category === 'outage' ? 'outage'
+                   : inc.category === 'site_loss' ? 'site-loss period'
+                   : 'degraded period';
   const ok = window.confirm(
     'Run AI diagnosis on this ' + fmtIncidentDuration(sec) +
     ' ' + kindLabel + ' at ' + start.toLocaleString() + '?\\n\\n' +
@@ -4640,9 +4855,9 @@ def _cluster_events(outages: List[OutageRecord],
                     degraded: List[DegradedPeriod],
                     now: datetime) -> List[Dict]:
     """Merge outages and degraded periods into unified clusters with a 30-min
-    gap. Each cluster's `category` is "outage" if any outage is inside (red);
-    otherwise "degraded" (yellow). Members preserve their original kind so the
-    tooltip can describe the mix."""
+    gap. Cluster category priority: outage (red) > degraded — slow/high_ping
+    (yellow) > site_loss (teal). Members preserve their original kind so each
+    bar renders in its own color."""
     events: List[Dict] = []
     for o in outages:
         events.append({
@@ -4654,7 +4869,7 @@ def _cluster_events(outages: List[OutageRecord],
         })
     for d in degraded:
         events.append({
-            "_kind": d.kind,     # "slow" | "high_ping"
+            "_kind": d.kind,     # "slow" | "high_ping" | "site_loss"
             "start": d.start,
             "end":   d.end or now,
             "ongoing": d.ongoing,
@@ -4678,26 +4893,46 @@ def _cluster_events(outages: List[OutageRecord],
     for members in clusters:
         first_start = min(m["start"] for m in members)
         # Counts and total downtime per kind
-        n_out = sum(1 for m in members if m["_kind"] == "outage")
+        n_out  = sum(1 for m in members if m["_kind"] == "outage")
         n_slow = sum(1 for m in members if m["_kind"] == "slow")
-        n_hp  = sum(1 for m in members if m["_kind"] == "high_ping")
+        n_hp   = sum(1 for m in members if m["_kind"] == "high_ping")
+        n_site = sum(1 for m in members if m["_kind"] == "site_loss")
         outage_secs = sum(int((m["end"] - m["start"]).total_seconds())
                           for m in members if m["_kind"] == "outage")
         degraded_secs = sum(int((m["end"] - m["start"]).total_seconds())
-                            for m in members if m["_kind"] != "outage")
-        category = "outage" if n_out > 0 else "degraded"
-        # Ongoing reflects only members of the cluster's category. An open
-        # degraded period inside an outage-categorized cluster shouldn't make
-        # the bar render as a current outage when connectivity is fine.
-        relevant = [m for m in members if m["_kind"] == "outage"] if category == "outage" else members
+                            for m in members
+                            if m["_kind"] in ("slow", "high_ping"))
+        site_loss_secs = sum(int((m["end"] - m["start"]).total_seconds())
+                             for m in members if m["_kind"] == "site_loss")
+        # Category priority: outage > degraded > site_loss. A cluster with an
+        # outage paints red; mixed slow/high_ping with no outage paints yellow;
+        # site_loss-only clusters paint teal as their own visual class.
+        if n_out > 0:
+            category = "outage"
+        elif (n_slow + n_hp) > 0:
+            category = "degraded"
+        else:
+            category = "site_loss"
+        # Ongoing reflects only members matching the cluster's category so an
+        # open lower-priority period (e.g. a still-open slow inside an outage
+        # cluster) doesn't make the bar render as a current outage when
+        # connectivity is fine.
+        if category == "outage":
+            relevant = [m for m in members if m["_kind"] == "outage"]
+        elif category == "degraded":
+            relevant = [m for m in members if m["_kind"] in ("slow", "high_ping")]
+        else:
+            relevant = [m for m in members if m["_kind"] == "site_loss"]
         ongoing  = any(m["ongoing"] for m in relevant)
         last_end = max(m["end"] for m in relevant)
         if n_out:
             dominant_kind = "outage"
-        elif n_hp >= n_slow:
+        elif n_hp >= n_slow and n_hp > 0:
             dominant_kind = "high_ping"
-        else:
+        elif n_slow > 0:
             dominant_kind = "slow"
+        else:
+            dominant_kind = "site_loss"
         out.append({
             "id": "cluster:" + first_start.isoformat(timespec="seconds"),
             "category": category,
@@ -4709,9 +4944,25 @@ def _cluster_events(outages: List[OutageRecord],
             "outage_count": n_out,
             "slow_count": n_slow,
             "high_ping_count": n_hp,
+            "site_loss_count": n_site,
             "total_outage_s": outage_secs,
             "total_degraded_s": degraded_secs,
+            "total_site_loss_s": site_loss_secs,
             "member_ids": [m["id"] for m in members],
+            # Members are emitted with kind/start/end so the timeline can render
+            # each in its own category color rather than painting the whole
+            # cluster span in the dominant category. This keeps cross-kind
+            # clustering useful for click-grouping without misrepresenting a
+            # mostly-degraded cluster as a giant red outage.
+            "members": [
+                {
+                    "kind": m["_kind"],   # "outage" | "slow" | "high_ping" | "site_loss"
+                    "start": m["start"].isoformat(timespec="seconds"),
+                    "end": m["end"].isoformat(timespec="seconds"),
+                    "ongoing": bool(m.get("ongoing")),
+                }
+                for m in members
+            ],
         })
     return out
 
