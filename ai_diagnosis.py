@@ -177,6 +177,19 @@ monitor: physical checks (cabling, modem reboot, line tester, ISP call), \
 environmental observations (peak hours, weather, household usage), or \
 configuration changes (router firmware update, swap DNS, contact ISP about \
 line stats they can pull from their side).
+7. **Do NOT describe `site_loss` periods as "internet outages" or "the \
+connection dropped."** A `site_loss` period (kind == "site_loss") means a \
+single specific service became briefly unreachable while the rest of the \
+connection kept working — by definition no real outage occurred. The \
+detail string identifies the affected service. The most common case is \
+"Primary speed test endpoint failed; HTTP fallback succeeded" — that is \
+Ookla's speedtest.net being temporarily unreachable, NOT the user's \
+internet going down. If the snapshot has `outages.count == 0` AND the \
+incident consists entirely of `site_loss` records, frame the description \
+as "[that specific service] was briefly unreachable" — never as "the \
+internet dropped" or any synonym. Do not infer a connectivity duration \
+from the time gap between two site_loss records — that gap is normal \
+operating time, not downtime.
 """
 
 
@@ -277,6 +290,37 @@ def build_chart_data(state, window: str,
 
     samples.sort(key=lambda x: x[0])
 
+    # ── Baselines (detector thresholds, expressed as their actual values) ──
+    # These are emitted into chart_data so the diagnose-page chart can draw
+    # the threshold line at the correct y-position whenever a slow / high
+    # ping degraded period is shown.
+    week_ago = now - timedelta(days=7)
+    pre_dls = sorted(
+        s.download_mbps for s in speed_history
+        if week_ago <= s.timestamp < cutoff
+        and (s.label or "") != "Outage" and s.download_mbps > 0
+    )
+    if len(pre_dls) >= 5:
+        idx = 0.10 * (len(pre_dls) - 1)
+        lo, hi = int(idx), min(int(idx) + 1, len(pre_dls) - 1)
+        slow_threshold_mbps = round(
+            pre_dls[lo] + (pre_dls[hi] - pre_dls[lo]) * (idx - lo), 1
+        )
+    else:
+        slow_threshold_mbps = None
+
+    pre_pings = sorted(
+        s.ping_ms for s in speed_history
+        if week_ago <= s.timestamp < cutoff
+        and s.ping_ms and s.ping_ms > 0
+    )
+    if len(pre_pings) >= 5:
+        ping_median = pre_pings[len(pre_pings) // 2]
+        # Detector formula at _update_high_ping_degraded: max(floor 100, 3× median).
+        high_ping_threshold_ms = round(max(100.0, 3.0 * ping_median), 1)
+    else:
+        high_ping_threshold_ms = None
+
     # Bin into time buckets and compute p10/p50/p90 per bin. Empty bins emit
     # nulls so outage gaps stay visible on the chart.
     window_secs = max(1.0, (end_at - cutoff).total_seconds())
@@ -315,18 +359,58 @@ def build_chart_data(state, window: str,
         else:
             ping_bands.append([ts_iso, None, None, None, 0])
 
-    # Speed samples in window.
-    speed_series = [
-        {
+    # Speed samples in window. Each carries rolling p10/p50/p90 over the
+    # previous SPEED_ROLLING_WINDOW samples (including itself), so the chart
+    # can render each as a vertical range bar with a median dot rather than
+    # a single point. Samples with fewer than 3 prior samples have null
+    # percentiles and the chart falls back to a plain dot.
+    SPEED_ROLLING_WINDOW = 5
+    in_window = [s for s in speed_history if cutoff <= s.timestamp <= end_at
+                 and (s.label or "") != "Outage" and s.download_mbps > 0]
+
+    def _pct_local(sorted_vals, q):
+        if len(sorted_vals) == 1:
+            return sorted_vals[0]
+        idx = q / 100 * (len(sorted_vals) - 1)
+        lo, hi = int(idx), min(int(idx) + 1, len(sorted_vals) - 1)
+        return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (idx - lo)
+
+    speed_series = []
+    for i, s in enumerate(in_window):
+        roll = in_window[max(0, i - SPEED_ROLLING_WINDOW + 1):i + 1]
+        dls = sorted(x.download_mbps for x in roll)
+        if len(dls) >= 3:
+            p10_r = round(_pct_local(dls, 10), 1)
+            p50_r = round(_pct_local(dls, 50), 1)
+            p90_r = round(_pct_local(dls, 90), 1)
+        else:
+            p10_r = p50_r = p90_r = None
+        speed_series.append({
             "ts": s.timestamp.isoformat(timespec="seconds"),
             "dl": round(s.download_mbps, 1),
             "ul": round(s.upload_mbps, 1),
             "ping": round(s.ping_ms, 1) if s.ping_ms else None,
             "label": s.label,
-        }
-        for s in speed_history
-        if cutoff <= s.timestamp <= end_at
-    ]
+            "p10_roll": p10_r,
+            "p50_roll": p50_r,
+            "p90_roll": p90_r,
+        })
+    # Also include the Outage-labeled / zero samples after the rolling pool
+    # so they still appear on the chart for context (just without rolling
+    # percentiles).
+    for s in speed_history:
+        if not (cutoff <= s.timestamp <= end_at):
+            continue
+        if (s.label or "") == "Outage" or s.download_mbps <= 0:
+            speed_series.append({
+                "ts": s.timestamp.isoformat(timespec="seconds"),
+                "dl": round(s.download_mbps, 1),
+                "ul": round(s.upload_mbps, 1),
+                "ping": round(s.ping_ms, 1) if s.ping_ms else None,
+                "label": s.label,
+                "p10_roll": None, "p50_roll": None, "p90_roll": None,
+            })
+    speed_series.sort(key=lambda x: x["ts"])
 
     # Outage spans clipped to window.
     all_outages = list(outages) + ([cur_outage] if cur_outage else [])
@@ -361,6 +445,90 @@ def build_chart_data(state, window: str,
                              if recovery_end else None),
         }
 
+    # ── Failed primary speedtest attempts (Ookla unreachable, fallback OK) ──
+    # Derived from the same site_loss records the timeline already shows;
+    # rendered as ✕ marks at the bottom of the chart so a glance distinguishes
+    # "speedtest API hiccup" from a real outage.
+    failed_primary_attempts = [
+        d.start.isoformat(timespec="seconds")
+        for d in degraded_periods
+        if d.kind == "site_loss"
+        and "Primary speed test" in (d.detail or "")
+        and cutoff <= d.start <= end_at
+    ]
+
+    # ── Per-site outage marks ──
+    # Each entry: {host, start, end} — only the ones that intersect the
+    # window. Drawn as small triangles on the chart so user sees which
+    # specific service was unreachable and when.
+    site_outage_marks = []
+    with state.lock:
+        site_outages_snap = list(state.site_outages)
+        cur_site_out_snap = dict(state.current_site_outages)
+        site_names_snap   = dict(state.site_names)
+    for host, rec in site_outages_snap:
+        eff_end = rec.end if rec.end else end_at
+        if eff_end < cutoff or rec.start > end_at:
+            continue
+        site_outage_marks.append({
+            "host": host,
+            "name": site_names_snap.get(host, host),
+            "start": rec.start.isoformat(timespec="seconds"),
+            "end":   rec.end.isoformat(timespec="seconds") if rec.end else None,
+        })
+    for host, rec in cur_site_out_snap.items():
+        if rec.start > end_at:
+            continue
+        site_outage_marks.append({
+            "host": host,
+            "name": site_names_snap.get(host, host),
+            "start": rec.start.isoformat(timespec="seconds"),
+            "end":   None,
+        })
+
+    # ── Ping spikes ──
+    # Outliers from the combined samples list (already collected for
+    # ping_bands above). Threshold scales with window length so a 24h
+    # diagnosis doesn't end up with hundreds of dots:
+    #   window ≤ 1h:  threshold = max(150ms, p99)        ← generous
+    #   window ≤ 6h:  threshold = max(200ms, p99)
+    #   window > 6h:  threshold = max(300ms, p99.5)      ← strict
+    # Cap at SPIKE_CAP, sampled to keep the worst spikes (sorted desc by
+    # value) — preserves the most diagnostically interesting samples.
+    SPIKE_CAP = 300
+    ping_spikes = []
+    if samples:
+        sorted_vals = sorted(v for _, v in samples if v is not None)
+        if len(sorted_vals) >= 20:
+            window_hours = (end_at - cutoff).total_seconds() / 3600
+            if window_hours <= 1:
+                pct_q = 99
+                floor_ms = 150.0
+            elif window_hours <= 6:
+                pct_q = 99
+                floor_ms = 200.0
+            else:
+                pct_q = 99.5
+                floor_ms = 300.0
+            idx = pct_q / 100 * (len(sorted_vals) - 1)
+            lo, hi = int(idx), min(int(idx) + 1, len(sorted_vals) - 1)
+            pct_v = sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (idx - lo)
+            spike_threshold = max(floor_ms, pct_v)
+            candidates = [
+                (t, v) for t, v in samples
+                if v is not None and v >= spike_threshold
+            ]
+            # Keep the worst SPIKE_CAP by value (the most informative ones)
+            # rather than uniformly across time. Re-sorted by ts at end so
+            # the chart still draws them in chronological order.
+            if len(candidates) > SPIKE_CAP:
+                candidates = sorted(candidates, key=lambda x: -x[1])[:SPIKE_CAP]
+                candidates.sort(key=lambda x: x[0])
+            ping_spikes = [
+                [t.isoformat(timespec="seconds"), round(v, 1)]
+                for t, v in candidates
+            ]
+
     return {
         "window_start": cutoff.isoformat(timespec="seconds"),
         "window_end":   end_at.isoformat(timespec="seconds"),
@@ -369,6 +537,14 @@ def build_chart_data(state, window: str,
         "speed_series": speed_series,
         "outages":      outage_spans,
         "degraded":     degraded_spans,
+        # Detector thresholds for the analyzed window — used to draw the
+        # dotted threshold line spanning each degraded period on the chart.
+        "slow_threshold_mbps":   slow_threshold_mbps,
+        "high_ping_threshold_ms": high_ping_threshold_ms,
+        # Visual aids that explain WHY events were flagged.
+        "failed_primary_attempts": failed_primary_attempts,  # [iso_ts, ...]
+        "site_outage_marks":       site_outage_marks,        # [{host,name,start,end}]
+        "ping_spikes":             ping_spikes,              # [[ts, ms], ...]
     }
 
 
@@ -596,10 +772,12 @@ def diagnose(snapshot: Dict[str, Any], api_key: Optional[str] = None) -> Dict[st
     import anthropic
 
     client = anthropic.Anthropic(api_key=api_key)
+    snapshot_json = json.dumps(snapshot, indent=2)
     user_msg = USER_TEMPLATE.format(
         window=snapshot.get("window"),
-        snapshot=json.dumps(snapshot, indent=2),
+        snapshot=snapshot_json,
     )
+    snapshot_bytes = len(snapshot_json.encode("utf-8"))
 
     try:
         msg = client.messages.create(
@@ -661,5 +839,8 @@ def diagnose(snapshot: Dict[str, Any], api_key: Optional[str] = None) -> Dict[st
             "router_poll_error": snapshot["router_events"].get("poll_error"),
             "router_events": snapshot["router_events"].get("total", 0),
             "dns_probe_drops": snapshot["router_events"].get("dns_probe_drop_count", 0),
+            "window_start": snapshot.get("window_start"),
+            "window_end": snapshot.get("window_end"),
+            "uploaded_bytes": snapshot_bytes,
         },
     }

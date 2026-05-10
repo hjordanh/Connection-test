@@ -170,6 +170,14 @@ Then edit `connection_monitor.env` and fill in the values you want. The monitor 
 | `ROUTER_SYSLOG_PATH` | optional | — *(blank skips)* | Path for the system event log. AT&T-style gateways use `/cgi-bin/syslog.ha`. |
 | `ROUTER_POLL_INTERVAL` | optional | `30` | Seconds between gateway polls. |
 | `PORT` | optional | `8765` | Port the dashboard listens on. |
+| `MONITOR_GAP_MIN_REPORT_MIN` | optional | `60` | Minimum gap (in minutes) before "monitor not running" downtime is rendered as a dim segment on the timeline. Default of 60 min skips macOS App Nap suspensions (which routinely fully-suspend background python processes for 15–30 min at a stretch) and only flags genuine crashes / long away-from-keyboard windows. Lower this on always-on machines (e.g. `5`) where any gap is news; set to `0` to render every detected gap. |
+| `HIGH_PING_FLOOR_MS` | optional | `75` | Absolute floor (in ms) for high-ping detection. Below this, latency is never considered "high" regardless of network baseline. Useful for very-fast networks where the percentile baseline could otherwise dip too low. |
+| `HIGH_PING_BASELINE_PCT` | optional | `99` | Percentile of your own connectivity-probe pings (over the last 7d, excluding samples inside prior high-ping windows) used as the high-ping trigger. P99 = "your normal worst." Lower this (e.g. `97`) to be more sensitive; raise it (`99.5`) to be stricter. |
+| `SITE_VERDICT_BASELINE_HOURS` | optional | `24` | Hours of recent traffic used to build the pool baseline that grades each site tile (GREAT / OK / SLOW / POOR). Smaller = more responsive to current network conditions; larger = more stable. |
+| `SITE_VERDICT_FALLBACK_HOURS` | optional | `168` | Fallback window (in hours) used when the primary baseline window has fewer than `SITE_VERDICT_MIN_SAMPLES` successful pings. |
+| `SITE_VERDICT_MIN_SAMPLES` | optional | `200` | Minimum number of pool pings required before the primary window is trusted; otherwise the fallback window is used. |
+| `SITE_VERDICT_GREAT_PCT` / `SITE_VERDICT_SLOW_PCT` / `SITE_VERDICT_POOR_PCT` | optional | `10` / `90` / `99` | Pool-percentile boundaries between the latency bands. A site's recent p50 ≤ GREAT% → GREAT, between GREAT% and SLOW% → OK, between SLOW% and POOR% → SLOW, above POOR% → POOR. |
+| `SITE_VERDICT_GREAT_REACH` / `SITE_VERDICT_OK_REACH` / `SITE_VERDICT_SLOW_REACH` | optional | `99` / `95` / `80` | Reachability thresholds (% of probes returning a value). Final verdict = worst of (latency band, reachability band). |
 
 > **Never commit `connection_monitor.env`.** It contains secrets. The repo's `.gitignore` already covers `*.env`.
 

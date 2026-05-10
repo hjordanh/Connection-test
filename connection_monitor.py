@@ -27,6 +27,63 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ─────────────────────────────────────────────────────────────
+# Timestamped logs
+#   Prefix every stdout/stderr line + every `logging` record with an
+#   ISO-ish local timestamp so monitor.out.log / monitor.err.log are
+#   readable after the fact. Done at import time so even early prints
+#   (e.g. the "Installing flask…" line) are stamped.
+# ─────────────────────────────────────────────────────────────
+class _TimestampedStream:
+    """File-like wrapper that prepends a timestamp to each output line."""
+    def __init__(self, stream):
+        self._stream = stream
+        self._at_line_start = True
+
+    def write(self, data):
+        if not data:
+            return 0
+        # Some libraries (click) write bytes; pass those through unchanged
+        # rather than try to timestamp them — iterating bytes yields ints
+        # which would crash this wrapper.
+        if not isinstance(data, str):
+            try:
+                return self._stream.write(data)
+            except TypeError:
+                # underlying stream is text-mode; decode best-effort
+                return self._stream.write(data.decode("utf-8", "replace"))
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        prefix = f"[{ts}] "
+        out_parts = []
+        for ch in data:
+            if self._at_line_start and ch != "\n":
+                out_parts.append(prefix)
+                self._at_line_start = False
+            out_parts.append(ch)
+            if ch == "\n":
+                self._at_line_start = True
+        self._stream.write("".join(out_parts))
+        return len(data)
+
+    def flush(self):
+        self._stream.flush()
+
+    def isatty(self):
+        return getattr(self._stream, "isatty", lambda: False)()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+sys.stdout = _TimestampedStream(sys.stdout)
+sys.stderr = _TimestampedStream(sys.stderr)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(message)s",
+)
+
+
+# ─────────────────────────────────────────────────────────────
 # Auto-install Flask
 # ─────────────────────────────────────────────────────────────
 def _pip_install(pkg: str) -> None:
@@ -115,13 +172,94 @@ ROUTER_POLL_INTERVAL   = int(os.environ.get("ROUTER_POLL_INTERVAL", "30"))
 #   Close — that site has SITE_LOSS_CLOSE_STREAK consecutive successful
 #           checks (≈60s clean).
 SLOW_MIN_HISTORY     = 5      # need at least N prior samples to use percentiles
-HIGH_PING_OPEN_MULT  = 3.0
-HIGH_PING_FLOOR_MS   = 100.0  # never trigger if absolute p90 below this
+# High-ping detection. The trigger compares the rolling p90 of the last 30
+# connectivity probes against max(HIGH_PING_FLOOR_MS, 7d-P{HIGH_PING_BASELINE_PCT}).
+# P99 (default) makes the threshold "your normal worst" — self-calibrating
+# across networks. The floor protects users with very fast baselines so a
+# trivial 50ms ping doesn't get flagged.
+# Both knobs are env-overridable so a user with a noisier baseline can dial
+# down (P95) or up (P99.5) without code edits.
+try:
+    HIGH_PING_FLOOR_MS = float(os.environ.get("HIGH_PING_FLOOR_MS", "75"))
+except ValueError:
+    HIGH_PING_FLOOR_MS = 75.0
+
+# Site-tile verdict thresholds. Each site is graded relative to the union of
+# all sites' successful pings over the baseline window (24h, falling back to
+# 7d when 24h has fewer than SITE_VERDICT_MIN_SAMPLES). The percentile knobs
+# define the band edges; the reachability knobs are independent floors.
+# Final verdict = worst of (latency_band, reachability_band).
+def _env_pct(key: str, default: float) -> float:
+    try:
+        return max(0.0, min(100.0, float(os.environ.get(key, str(default)))))
+    except ValueError:
+        return float(default)
+def _env_int(key: str, default: int) -> int:
+    try:
+        return max(1, int(float(os.environ.get(key, str(default)))))
+    except ValueError:
+        return int(default)
+
+SITE_VERDICT_BASELINE_HOURS = _env_int("SITE_VERDICT_BASELINE_HOURS", 24)
+SITE_VERDICT_FALLBACK_HOURS = _env_int("SITE_VERDICT_FALLBACK_HOURS", 24 * 7)
+SITE_VERDICT_MIN_SAMPLES    = _env_int("SITE_VERDICT_MIN_SAMPLES", 200)
+SITE_VERDICT_GREAT_PCT  = _env_pct("SITE_VERDICT_GREAT_PCT", 10)
+SITE_VERDICT_SLOW_PCT   = _env_pct("SITE_VERDICT_SLOW_PCT",  90)
+SITE_VERDICT_POOR_PCT   = _env_pct("SITE_VERDICT_POOR_PCT",  99)
+SITE_VERDICT_GREAT_REACH = _env_pct("SITE_VERDICT_GREAT_REACH", 99)
+SITE_VERDICT_OK_REACH    = _env_pct("SITE_VERDICT_OK_REACH",    95)
+SITE_VERDICT_SLOW_REACH  = _env_pct("SITE_VERDICT_SLOW_REACH",  80)
+try:
+    HIGH_PING_BASELINE_PCT = max(50.0, min(99.9, float(
+        os.environ.get("HIGH_PING_BASELINE_PCT", "99"))))
+except ValueError:
+    HIGH_PING_BASELINE_PCT = 99.0
+HIGH_PING_MIN_BASELINE_SAMPLES = 1000  # need this many probes before P99 is meaningful
+HIGH_PING_BASELINE_TTL_S       = 60    # cache P99 calc; recompute at most once/min
 HIGH_PING_DURATION_S = 60     # sustained-condition window for opening
+SLOW_OPEN_STREAK          = 2   # consecutive non-Outage samples below 7d-P10
+                                # required to OPEN slow (sustainment, ≈10min @
+                                # 5min cadence) — prevents single-sample blips
+                                # from tripping the detector
 SLOW_CLOSE_STREAK         = 3   # samples (≈15min @ 5min cadence)
 HIGH_PING_CLOSE_STREAK    = 30  # probes (≈60s @ 2s)
 SITE_LOSS_OPEN_STREAK     = 3   # consecutive failed checks (≈30s @ 10s)
 SITE_LOSS_CLOSE_STREAK    = 6   # consecutive successful checks (≈60s @ 10s)
+# Outage open requires sustained connectivity loss — single failed cycles
+# (Wi-Fi roam, brief gateway flap, laptop wake artifact) shouldn't show up
+# as outage records on the timeline. The OutageRecord's start is backdated
+# to the FIRST failure in the streak so timing stays honest.
+OUTAGE_OPEN_STREAK        = 4   # consecutive failed probe cycles (≈8s @ 2s)
+
+# Speed-test scheduling — fixed wall-clock slots, never drifting. The 10/25/40/55
+# pattern keeps tests every 15 minutes and intentionally avoids the xx:00–xx:05
+# window where Ookla's hourly cron-aligned load tends to fail. Exceptions:
+# (a) HTTP fallback always runs immediately when primary fails; (b) during an
+# active outage the speed-test thread records a 0-Mbps sample every 60s
+# instead of running a real test. The aligned cadence resumes after either.
+SPEED_TEST_SLOTS = (10, 25, 40, 55)
+
+# Monitor-downtime gap rendering. The detection floor is 120s (any
+# inter-heartbeat delta above that = "process not writing"); the report
+# floor below decides which detected gaps actually surface as dim segments
+# on the timeline.
+#
+# Default 60 min: macOS App Nap regularly fully-suspends background python
+# processes for 15–30 min at a stretch overnight; those windows are real
+# "process was suspended" but rarely interesting to a user reviewing their
+# uptime ("yes, my Mac was asleep, I knew that"). Raising the report floor
+# above the typical App Nap envelope keeps the feature focused on its
+# original purpose: flagging genuine script crashes / long away-from-keyboard
+# windows / laptop-fully-asleep stretches measured in hours.
+#
+# Override at launch with env var MONITOR_GAP_MIN_REPORT_MIN=<minutes>; set
+# to a low value (e.g. 5) on always-on machines where any gap is news.
+try:
+    MONITOR_GAP_MIN_REPORT_S = max(0, int(float(
+        os.environ.get("MONITOR_GAP_MIN_REPORT_MIN", "60")
+    ) * 60))
+except ValueError:
+    MONITOR_GAP_MIN_REPORT_S = 60 * 60   # fallback default: 60 minutes
 
 _DEFAULT_PING_TARGETS = [
     "netflix.com",
@@ -248,7 +386,9 @@ class MonitorState:
         self.connected: bool = True
         self.last_ping_ms: Optional[float] = None
         self.ping_history: deque = deque(maxlen=60)
-        self.ping_history_ts: deque = deque(maxlen=43200)  # (HH:MM:SS, float) — 24h @ 2s
+        # Connectivity probe latencies, retained 30 days at 2s cadence so AI
+        # diagnoses run on older incidents have full ping data. ~50 MB on disk.
+        self.ping_history_ts: deque = deque(maxlen=1_400_000)  # 30d @ 2s + headroom
 
         # Outages
         self.outages: List[OutageRecord] = []
@@ -260,7 +400,9 @@ class MonitorState:
         self.speed_status: str = ""
         self.last_speed_test: Optional[datetime] = None    # last attempt (success or fail)
         self.last_speed_success: Optional[datetime] = None # last successful result
-        self.speed_interval_secs: int = 300                # 5 minutes between successes
+        # Vestigial — kept for backwards-compat with any persisted snapshot
+        # that referenced it. Active scheduling now uses SPEED_TEST_SLOTS.
+        self.speed_interval_secs: int = 900                # 15 min nominal
         self.trigger_post_outage_test: bool = False
 
         # Events
@@ -271,10 +413,12 @@ class MonitorState:
         self.site_states: Dict[str, bool] = {}          # hostname -> currently up?
         self.current_site_outages: Dict[str, OutageRecord] = {}
         self.site_outages: List[Tuple[str, OutageRecord]] = []
-        # parallel history to ping_history_ts: (iso_ts, pct_accessible)
-        self.ping_accessibility_ts: deque = deque(maxlen=43200)
-        # per-site latency history: hostname -> deque of (iso_ts, ms_or_None)
-        # site check runs every 10s → 8640 entries/24h per site
+        # parallel history to ping_history_ts: (iso_ts, pct_accessible).
+        # 10s cadence × 30d = ~260k entries.
+        self.ping_accessibility_ts: deque = deque(maxlen=270_000)
+        # per-site latency history: hostname -> deque of (iso_ts, ms_or_None).
+        # 10s cadence × 30d = ~260k entries per host. With ~12 hosts that's
+        # ~75 MB on disk, the bulk of the long-term ping retention budget.
         self.site_ping_history: Dict[str, deque] = {}
 
         # Provider
@@ -301,15 +445,41 @@ class MonitorState:
         self._recent_pings: deque = deque(maxlen=30)
         self._high_ping_started_above: Optional[datetime] = None
         self._high_ping_below_since: Optional[datetime] = None
-        # Streak counters for percentile-based close criteria.
+        # Streak counters for percentile-based open / close criteria.
+        # Slow open is also streak-based now to filter single-sample blips.
+        self._slow_open_streak: int = 0
+        self._slow_open_first_at: Optional[datetime] = None
         self._slow_close_streak: int = 0
         self._high_ping_close_streak: int = 0
+        # Cached P99 of recent connectivity-probe pings (used by high-ping
+        # detector). Recomputed at most once every HIGH_PING_BASELINE_TTL_S
+        # because the calc walks ~190k samples on a 30d-retained network.
+        self._high_ping_baseline_ms: Optional[float] = None
+        self._high_ping_baseline_at: Optional[datetime] = None
         # Per-host streaks for site_loss open/close.
         self._site_fail_streaks: Dict[str, int] = {}
         self._site_pass_streaks: Dict[str, int] = {}
+        # Sustained-failure tracking for outage opens.
+        self._outage_fail_streak: int = 0
+        self._outage_first_failure_at: Optional[datetime] = None
+        # Speed-test attempt counters (primary = speedtest-cli; fallback =
+        # built-in HTTP). The chart shows the rolling primary success count.
+        self.speed_attempts: List[Dict] = []   # rolling list of attempt dicts
+        # Set by run_speed_test when primary fails; speed_test_thread uses
+        # this to back off retries past the top-of-hour failure window.
+        self._primary_failed_at: Optional[datetime] = None
+        # Rolling list of recent primary-speedtest failure dicts —
+        # {ts, type, code, phase, msg}. Surfaced via /api/state so the
+        # dashboard / API can show "last failure was a 429 at top of hour."
+        # Cap small; this is for spot-checking, not full history.
+        self.primary_fail_reasons: deque = deque(maxlen=50)
 
         # Router log scraper — stores router_log.RouterEvent objects
-        self.router_events: deque = deque(maxlen=5000)
+        # Sized for 30 days at ~500 events/hour observed peak rate. At ~176
+        # bytes/event JSON, the persisted router_events array is ~35–60 MB —
+        # well within "local-disk OK" territory. Time-based pruning (drop
+        # > 30d) runs each save tick, so the deque rarely approaches maxlen.
+        self.router_events: deque = deque(maxlen=400_000)
         self.last_router_poll: Optional[datetime] = None
         self.router_poll_error: Optional[str] = None
         self._router_warned_at: Optional[datetime] = None
@@ -319,6 +489,11 @@ class MonitorState:
         # added "id" field (millisecond timestamp string).
         self.diagnoses: deque = deque(maxlen=500)
         self.diagnosis_in_progress: bool = False
+        # Cluster IDs (e.g., "cluster:2026-05-04T19:00:55") the user has
+        # dismissed after reviewing the AI analysis. Hidden from the
+        # timeline + history by default; a "show dismissed" toggle reveals
+        # them again. Persisted across restarts.
+        self.dismissed_outage_ids: set = set()
 
         # Timing
         self.start_time: datetime = datetime.now()
@@ -392,7 +567,6 @@ class MonitorState:
             speed_status      = self.speed_status
             last_speed_test   = self.last_speed_test
             last_speed_success = self.last_speed_success
-            interval          = self.speed_interval_secs
             events           = list(self.events)
             start_time       = self.start_time
             current_provider = self.current_provider
@@ -409,6 +583,7 @@ class MonitorState:
             router_poll_error_snap = self.router_poll_error
             last_router_poll_snap = self.last_router_poll
             last_diagnosis_snap = self.diagnoses[0] if self.diagnoses else None
+            speed_attempts_snap = list(self.speed_attempts)
 
         now = datetime.now()
         runtime_secs = (now - start_time).total_seconds()
@@ -417,21 +592,17 @@ class MonitorState:
         total_out = self.total_outage_secs()
         all_outages = outages + ([cur_out] if cur_out else [])
 
+        # Aligned cadence: if we haven't yet completed the most recent
+        # scheduled slot, the next test is "now" (0); otherwise it's the
+        # countdown to the next slot.
         next_test_in = None
         if not in_progress:
-            if last_speed_success:
-                secs_since_success = (now - last_speed_success).total_seconds()
-                if secs_since_success >= interval:
-                    # Retry mode: next attempt in 60s from last attempt
-                    secs_since_attempt = (now - last_speed_test).total_seconds() if last_speed_test else interval
-                    next_test_in = max(0, 60 - secs_since_attempt)
-                else:
-                    # Normal: next test at 5-min mark from last success
-                    next_test_in = max(0, interval - secs_since_success)
-            elif last_speed_test:
-                # No success yet (baseline failed): retry every 60s
-                secs_since_attempt = (now - last_speed_test).total_seconds()
-                next_test_in = max(0, 60 - secs_since_attempt)
+            prev_slot = _previous_scheduled_slot(now)
+            next_slot = _next_scheduled_slot(now)
+            if last_speed_test is None or last_speed_test < prev_slot:
+                next_test_in = 0
+            else:
+                next_test_in = max(0, (next_slot - now).total_seconds())
 
         # Current uptime: time since last outage ended (or since start if none)
         if cur_out:
@@ -620,6 +791,40 @@ class MonitorState:
                 p10 = p50 = p90 = None
             return pct, p10, p50, p90
 
+
+        # Pool baseline for verdicts — shared with /api/site_history so the
+        # modal threshold band cannot drift from the tile colors.
+        _pool_thresh = _site_pool_thresholds(site_ping_hist_snap, now)
+        ovr_p_great = _pool_thresh["great_ms"]
+        ovr_p_slow  = _pool_thresh["slow_ms"]
+        ovr_p_poor  = _pool_thresh["poor_ms"]
+        pool_window_used = _pool_thresh["window_hours"]
+        pool_sample_count = _pool_thresh["samples"]
+
+        # Verdict ranking — used to take the worst of the two axes.
+        _ORDER = {"GREAT": 0, "OK": 1, "SLOW": 2, "POOR": 3}
+        _COLOR = {"GREAT": "s-green", "OK": "s-green",
+                  "SLOW":  "s-yellow", "POOR": "s-red"}
+
+        def _verdict_for(up: bool, pct: Optional[float], p50: Optional[float]
+                         ) -> Tuple[Optional[str], str]:
+            if not up:
+                return "DOWN", "s-red"
+            if pct is None or p50 is None or ovr_p_great is None:
+                return None, ""
+            # Latency band — pool-percentile based.
+            if   p50 <= ovr_p_great: lat = "GREAT"
+            elif p50 <= ovr_p_slow:  lat = "OK"
+            elif p50 <= ovr_p_poor:  lat = "SLOW"
+            else:                    lat = "POOR"
+            # Reachability band.
+            if   pct >= SITE_VERDICT_GREAT_REACH: reach = "GREAT"
+            elif pct >= SITE_VERDICT_OK_REACH:    reach = "OK"
+            elif pct >= SITE_VERDICT_SLOW_REACH:  reach = "SLOW"
+            else:                                 reach = "POOR"
+            worst = lat if _ORDER[lat] >= _ORDER[reach] else reach
+            return worst, _COLOR[worst]
+
         site_matrix = []
         cutoff_5m_site  = now - timedelta(minutes=5)
         cutoff_1h_site  = now - timedelta(hours=1)
@@ -632,14 +837,32 @@ class MonitorState:
             p5m,  p10_5m,  p50_5m,  p90_5m  = _site_stats(h5m)
             p1h,  p10_1h,  p50_1h,  p90_1h  = _site_stats(h1h)
             p24h, p10_24h, p50_24h, p90_24h = _site_stats(h24h)
+            up = site_states_snap.get(host, True)
+            # Pick the freshest available window for the verdict's inputs.
+            recent_pct = p5m if p5m is not None else p1h if p1h is not None else p24h
+            recent_p50 = p50_5m if p50_5m is not None else p50_1h if p50_1h is not None else p50_24h
+            verdict, verdict_class = _verdict_for(up, recent_pct, recent_p50)
             site_matrix.append({
                 "host":    host,
                 "name":    site_names_snap.get(host) or _friendly_name(host),
-                "up":      site_states_snap.get(host, True),
+                "up":      up,
                 "pct_5m":  p5m,  "p10_5m":  p10_5m,  "p50_5m":  p50_5m,  "p90_5m":  p90_5m,
                 "pct_1h":  p1h,  "p10_1h":  p10_1h,  "p50_1h":  p50_1h,  "p90_1h":  p90_1h,
                 "pct_24h": p24h, "p10_24h": p10_24h, "p50_24h": p50_24h, "p90_24h": p90_24h,
+                "verdict": verdict,
+                "verdict_class": verdict_class,
             })
+
+        site_pool_thresholds = {
+            "great_ms": ovr_p_great,
+            "slow_ms":  ovr_p_slow,
+            "poor_ms":  ovr_p_poor,
+            "great_reach_pct": SITE_VERDICT_GREAT_REACH,
+            "ok_reach_pct":    SITE_VERDICT_OK_REACH,
+            "slow_reach_pct":  SITE_VERDICT_SLOW_REACH,
+            "window_hours": pool_window_used,
+            "samples":      pool_sample_count,
+        }
 
         # Build 7-day calendar array for chart
         now_date = now.date()
@@ -755,8 +978,21 @@ class MonitorState:
             "provider_colors": provider_colors,
             "uptime_pct_24h": uptime_pct_24h,
             "site_matrix": site_matrix,
+            "site_pool_thresholds": site_pool_thresholds,
             "uptime_7d": uptime_7d,
             "router": _router_stats(router_events_snap, last_router_poll_snap, router_poll_error_snap, now),
+            # Primary speed-test success counts. Falls back to HTTP when the
+            # primary (speedtest-cli) endpoint is unreachable; fallback
+            # successes are NOT counted as primary OK.
+            "speed_attempts_24h": {
+                "primary_ok": sum(1 for a in speed_attempts_snap if a.get("primary_ok")),
+                "fallback_ok": sum(1 for a in speed_attempts_snap if not a.get("primary_ok") and a.get("fallback_ok")),
+                "total": len(speed_attempts_snap),
+            },
+            # Recent primary-speedtest failure details for inspection — the
+            # most recent N entries with HTTP code, exception type, and the
+            # phase (init / get_best_server / download / upload).
+            "primary_fail_reasons": list(self.primary_fail_reasons)[:25],
             "last_diagnosis_at": (last_diagnosis_snap.get("evaluated_at") if last_diagnosis_snap else None),
         }
 
@@ -882,16 +1118,45 @@ def _http_upload_mbps() -> Optional[float]:
     return None
 
 
-def _speedtest_lib() -> Tuple[Optional[float], Optional[float], Optional[float]]:
+def _speedtest_lib() -> Tuple[Optional[float], Optional[float], Optional[float], Optional[dict]]:
+    """Run a speedtest-cli measurement.
+    Returns (dl_mbps, ul_mbps, ping_ms, error_info).
+    On success, error_info is None. On failure, it's:
+      {type: <ExceptionClassName>, code: <HTTP status or None>,
+       phase: <which step failed>, msg: <stringified exception>}
+
+    HTTP status codes most commonly seen here:
+      429 — Too Many Requests (Ookla rate-limiting; cron-aligned bursts)
+      503 — Service Unavailable (no servers accepting)
+      529 — Site Is Overloaded (non-standard, used by some CDNs)
+    """
+    phase = "init"
     try:
         s = _st.Speedtest()
+        phase = "get_best_server"
         s.get_best_server()
+        phase = "download"
         dl = s.download() / 1_000_000
+        phase = "upload"
         ul = s.upload() / 1_000_000
-        return dl, ul, s.results.ping
+        return dl, ul, s.results.ping, None
     except Exception as exc:
-        logging.warning("speedtest-cli error: %s", exc)
-        return None, None, None
+        # Walk the exception chain looking for an underlying urllib HTTPError
+        # (speedtest-cli often wraps these as SpeedtestHTTPError).
+        code = None
+        cur = exc
+        while cur is not None:
+            if hasattr(cur, "code") and isinstance(getattr(cur, "code", None), int):
+                code = cur.code; break
+            cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+        info = {
+            "type": type(exc).__name__,
+            "code": code,
+            "phase": phase,
+            "msg": str(exc)[:200],
+        }
+        logging.warning("speedtest-cli error: %s", info)
+        return None, None, None, info
 
 
 def run_speed_test(state: MonitorState, label: str) -> None:
@@ -917,50 +1182,105 @@ def run_speed_test(state: MonitorState, label: str) -> None:
         state.assign_provider_color(provider)
         state.speed_status = "Initialising speed test…"
 
-    dl: Optional[float] = None
-    ul: Optional[float] = None
-    ping: Optional[float] = None
+    primary_dl: Optional[float] = None
+    primary_ul: Optional[float] = None
+    primary_ping: Optional[float] = None
+    fallback_dl: Optional[float] = None
+    fallback_ul: Optional[float] = None
+    fallback_ping: Optional[float] = None
+    primary_error: Optional[dict] = None
+    test_start = datetime.now()
 
     try:
+        # ── Primary: speedtest-cli (when available) ────────────────
         if SPEEDTEST_AVAILABLE:
             with state.lock:
                 state.speed_status = "Running speedtest-cli (≈30s)…"
-            dl, ul, ping = _speedtest_lib()
-            if dl is None and ul is None:
+            primary_dl, primary_ul, primary_ping, primary_error = _speedtest_lib()
+
+        primary_ok = (primary_dl is not None and primary_dl > 0) or \
+                     (primary_ul is not None and primary_ul > 0)
+
+        # ── Fallback: built-in HTTP — only when primary failed ─────
+        # Rate-limit codes (429 = Too Many Requests, 529 = Site Overloaded)
+        # are particularly common at top-of-hour because cron jobs across
+        # the world default to xx:00:00, all hitting Ookla simultaneously.
+        # Treat these as expected, jump straight to fallback without noise.
+        if not primary_ok:
+            is_rate_limited = (primary_error and primary_error.get("code") in (429, 529))
+            if SPEEDTEST_AVAILABLE and not is_rate_limited:
                 state.log("speedtest-cli failed — trying HTTP fallback…", "warning")
-
-        if dl is None and ul is None:
             with state.lock:
-                state.speed_status = "Measuring download speed…"
-            dl = _http_download_mbps()
+                state.speed_status = "Measuring fallback download…"
+            fallback_dl = _http_download_mbps()
             with state.lock:
-                state.speed_status = "Measuring upload speed…"
-            ul = _http_upload_mbps()
-            _, ping = check_connectivity()
+                state.speed_status = "Measuring fallback upload…"
+            fallback_ul = _http_upload_mbps()
+            _, fallback_ping = check_connectivity()
+        fallback_ok = (fallback_dl is not None and fallback_dl > 0) or \
+                      (fallback_ul is not None and fallback_ul > 0)
 
-        if dl is not None or ul is not None:
-            now = datetime.now()
+        test_end = datetime.now()
+
+        # ── Record the attempt ─────────────────────────────────────
+        cutoff_24h_iso = (datetime.now() - timedelta(hours=24)).isoformat()
+        with state.lock:
+            state.speed_attempts.append({
+                "ts": test_start.isoformat(timespec="seconds"),
+                "primary_ok": primary_ok,
+                "fallback_ok": fallback_ok,
+                "label": label,
+            })
+            state.speed_attempts = [a for a in state.speed_attempts
+                                    if a.get("ts", "") >= cutoff_24h_iso]
+
+        if primary_ok:
+            # ── Normal path: store as a SpeedSample (drives baselines) ──
             sample = SpeedSample(
-                timestamp=now,
-                download_mbps=dl or 0.0,
-                upload_mbps=ul or 0.0,
-                ping_ms=ping or 0.0,
+                timestamp=test_end,
+                download_mbps=primary_dl or 0.0,
+                upload_mbps=primary_ul or 0.0,
+                ping_ms=primary_ping or 0.0,
                 label=label,
                 provider=provider,
             )
             slow_event: Optional[Tuple[str, str]] = None
             with state.lock:
                 state.speed_history.append(sample)
-                state.last_speed_success = now
-                slow_event = _update_slow_degraded(state, sample, now)
-
-            dl_str = f"↓{dl:.1f}" if dl else "↓?"
-            ul_str = f"↑{ul:.1f}" if ul else "↑?"
+                state.last_speed_success = test_end
+                slow_event = _update_slow_degraded(state, sample, test_end)
+            dl_str = f"↓{primary_dl:.1f}" if primary_dl else "↓?"
+            ul_str = f"↑{primary_ul:.1f}" if primary_ul else "↑?"
             state.log(f"Speed [{label}] via {provider}: {dl_str} {ul_str} Mbps")
             if slow_event:
                 state.log(*slow_event)
+        elif fallback_ok:
+            # ── Primary failed but fallback worked. Don't record this as
+            # a site_loss — we proved the connection was up (HTTP fallback
+            # succeeded), so it's purely a third-party speedtest endpoint
+            # hiccup. Surface the captured exception type / HTTP status
+            # so we can investigate the pattern (429 rate-limit at xx:00,
+            # 503 no-servers, etc.).
+            with state.lock:
+                state._primary_failed_at = datetime.now()
+                if primary_error:
+                    state.primary_fail_reasons.appendleft({
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        **primary_error,
+                    })
+            err_tag = ""
+            if primary_error:
+                code = primary_error.get("code")
+                err_tag = f" [{primary_error.get('type')}"
+                if code is not None: err_tag += f" {code}"
+                err_tag += f" @ {primary_error.get('phase')}]"
+            state.log(
+                f"Speed [{label}]: primary endpoint failed{err_tag}; "
+                f"HTTP fallback succeeded (connection verified up)", "info",
+            )
         else:
-            state.log("Speed test: no results (network error?)", "warning")
+            # Both failed — likely concurrent with an outage; just log it.
+            state.log(f"Speed [{label}]: both primary and fallback failed", "warning")
 
     except Exception as exc:
         state.log(f"Speed test error: {exc}", "error")
@@ -1037,18 +1357,36 @@ def _update_slow_degraded(state: "MonitorState", sample: SpeedSample,
     dl = sample.download_mbps
     is_outage_sample = (sample.label or "") == "Outage"
 
-    # Open: single sample below 7d-P10 (the bottom-tail of recent experience).
-    # Stricter than the old "50% of P50" trigger — only fires on samples worse
-    # than 90% of last week, dramatically reducing false positives.
-    if state.current_slow is None and not is_outage_sample and dl < p10:
-        period = DegradedPeriod(
-            start=now, kind="slow",
-            detail=f"download {dl:.1f} Mbps < 7d-P10 ({p10:.1f} Mbps); 7d median {p50:.1f}",
-        )
-        state.current_slow = period
-        state.degraded_periods.append(period)
-        state._slow_close_streak = 0
-        return (f"Degraded: slow ({dl:.1f} Mbps, P10 {p10:.1f}, P50 {p50:.1f})", "warning")
+    # Open: SLOW_OPEN_STREAK consecutive non-Outage samples below 7d-P10
+    # (sustainment — single-sample blips don't trigger). Period start is
+    # backdated to the FIRST sub-P10 sample so the recorded duration is
+    # honest. Outage-labeled samples reset the open streak.
+    if state.current_slow is None:
+        if is_outage_sample:
+            state._slow_open_streak = 0
+            state._slow_open_first_at = None
+        elif dl < p10:
+            state._slow_open_streak += 1
+            if state._slow_open_first_at is None:
+                state._slow_open_first_at = now
+            if state._slow_open_streak >= SLOW_OPEN_STREAK:
+                period = DegradedPeriod(
+                    start=state._slow_open_first_at, kind="slow",
+                    detail=f"download {dl:.1f} Mbps < 7d-P10 ({p10:.1f} Mbps) "
+                           f"for {SLOW_OPEN_STREAK} consecutive tests; 7d median {p50:.1f}",
+                )
+                state.current_slow = period
+                state.degraded_periods.append(period)
+                state._slow_open_streak = 0
+                state._slow_open_first_at = None
+                state._slow_close_streak = 0
+                return (f"Degraded: slow ({dl:.1f} Mbps, P10 {p10:.1f}, P50 {p50:.1f})", "warning")
+        else:
+            state._slow_open_streak = 0
+            state._slow_open_first_at = None
+        # While the open streak is being built, don't fall through to the
+        # close path (state.current_slow is still None).
+        return None
 
     # Close path — streak of non-Outage samples ≥ 7d-P10.
     if state.current_slow is not None:
@@ -1068,13 +1406,79 @@ def _update_slow_degraded(state: "MonitorState", sample: SpeedSample,
     return None
 
 
+def _high_ping_baseline(state: "MonitorState", now: datetime) -> Optional[float]:
+    """Return the P{HIGH_PING_BASELINE_PCT} of the user's connectivity-probe
+    pings over the last 7 days, EXCLUDING samples that fell within an already-
+    recorded high_ping degraded period (so a long bad event doesn't pollute
+    the baseline that would catch the next bad event).
+
+    Returns None if we don't yet have HIGH_PING_MIN_BASELINE_SAMPLES probes
+    in the eligible window — caller falls back to the floor.
+
+    Cached for HIGH_PING_BASELINE_TTL_S because the calc walks ~190k samples.
+    """
+    if (state._high_ping_baseline_at is not None
+        and (now - state._high_ping_baseline_at).total_seconds()
+            < HIGH_PING_BASELINE_TTL_S):
+        return state._high_ping_baseline_ms
+
+    cutoff = now - timedelta(days=7)
+    # Build exclusion windows from any recorded high_ping degraded periods
+    # within the last 7 days (closed or ongoing).
+    excl: List[Tuple[datetime, datetime]] = []
+    for p in state.degraded_periods:
+        if p.kind != "high_ping":
+            continue
+        if p.start >= cutoff:
+            excl.append((p.start, p.end or now))
+    if state.current_high_ping is not None and state.current_high_ping not in (None,):
+        # current_high_ping is also in degraded_periods, already added above
+        pass
+    excl.sort()
+
+    def in_excl(ts: datetime) -> bool:
+        # Linear scan is fine — there are typically < 30 high_ping windows in 7d.
+        for s, e in excl:
+            if s <= ts <= e:
+                return True
+        return False
+
+    eligible: List[float] = []
+    for ts_iso, v in state.ping_history_ts:
+        if v is None:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_iso)
+        except (TypeError, ValueError):
+            continue
+        if ts < cutoff:
+            continue
+        if excl and in_excl(ts):
+            continue
+        eligible.append(float(v))
+
+    if len(eligible) < HIGH_PING_MIN_BASELINE_SAMPLES:
+        state._high_ping_baseline_ms = None
+        state._high_ping_baseline_at = now
+        return None
+
+    eligible.sort()
+    idx = min(len(eligible) - 1,
+              int(HIGH_PING_BASELINE_PCT / 100.0 * (len(eligible) - 1)))
+    p = eligible[idx]
+    state._high_ping_baseline_ms = p
+    state._high_ping_baseline_at = now
+    return p
+
+
 def _update_high_ping_degraded(state: "MonitorState", latency_ms: Optional[float],
                                now: datetime) -> Optional[Tuple[str, str]]:
     """Track high-ping windows. Called from connectivity_thread under state.lock.
     Returns optional (msg, level) to log outside the lock.
 
-    Open: rolling p90 of last 30 connectivity probes ≥ max(100ms, 3× 7d-median),
-    sustained for HIGH_PING_DURATION_S (single condition, must hold).
+    Open: rolling p90 of last 30 connectivity probes ≥ max(HIGH_PING_FLOOR_MS,
+    7d-P{HIGH_PING_BASELINE_PCT} of own pings excluding prior high_ping
+    periods), sustained for HIGH_PING_DURATION_S.
     Close: HIGH_PING_CLOSE_STREAK consecutive non-None pings ≤ 7d-P90 (the
     "normal range" floor — anything inside the 90th percentile of typical
     pings counts as recovered). A None ping (probe failure) breaks the
@@ -1108,15 +1512,16 @@ def _update_high_ping_degraded(state: "MonitorState", latency_ms: Optional[float
     pings = sorted(state._recent_pings)
     p90 = pings[int(0.9 * (len(pings) - 1))]
 
-    # Open threshold sized off 7d median ping (fall back to floor only).
-    baseline = None
-    cutoff = now - timedelta(days=7)
-    medians = [s.ping_ms for s in state.speed_history
-               if s.timestamp >= cutoff and s.ping_ms > 0]
-    if len(medians) >= SLOW_MIN_HISTORY:
-        baseline = statistics.median(medians)
-    open_threshold = max(HIGH_PING_FLOOR_MS,
-                         (HIGH_PING_OPEN_MULT * baseline) if baseline else HIGH_PING_FLOOR_MS)
+    # Open threshold = max(floor, 7d-P{pct} of own connectivity-probe pings,
+    # excluding samples inside prior high_ping windows). If we don't yet have
+    # enough history, the floor stands alone.
+    baseline = _high_ping_baseline(state, now)
+    if baseline is not None:
+        open_threshold = max(HIGH_PING_FLOOR_MS, baseline)
+        baseline_label = f"P{HIGH_PING_BASELINE_PCT:g} {baseline:.0f}ms"
+    else:
+        open_threshold = HIGH_PING_FLOOR_MS
+        baseline_label = "floor"
 
     if p90 >= open_threshold:
         if state._high_ping_started_above is None:
@@ -1124,7 +1529,7 @@ def _update_high_ping_degraded(state: "MonitorState", latency_ms: Optional[float
         elif (now - state._high_ping_started_above).total_seconds() >= HIGH_PING_DURATION_S:
             period = DegradedPeriod(
                 start=state._high_ping_started_above, kind="high_ping",
-                detail=f"p90 {p90:.0f}ms ≥ {open_threshold:.0f}ms threshold",
+                detail=f"p90 {p90:.0f}ms ≥ {open_threshold:.0f}ms threshold ({baseline_label})",
             )
             state.current_high_ping = period
             state.degraded_periods.append(period)
@@ -1175,25 +1580,53 @@ def save_state(state: MonitorState) -> None:
                 for d in state.degraded_periods
                 if d.start >= cutoff_30d
             ]
+            # Ping series retained 30 days so AI diagnoses on older
+            # incidents have full ping context, not just whatever's in the
+            # rolling 24h buffer.
+            # Ping series retained 30 days so AI diagnoses on older
+            # incidents have full ping context, not just whatever's in the
+            # rolling 24h buffer.
+            cutoff_30d_iso = cutoff_30d.isoformat()
             ping_ts = [
                 [ts, v]
                 for ts, v in state.ping_history_ts
-                if datetime.fromisoformat(ts) >= cutoff
+                if ts >= cutoff_30d_iso
             ]
             access_ts = [
                 [ts, v]
                 for ts, v in state.ping_accessibility_ts
-                if datetime.fromisoformat(ts) >= cutoff
+                if ts >= cutoff_30d_iso
             ]
+            # Per-site ping history (10s cadence × 30d × N hosts). The bulk
+            # of the long-term ping payload — usually the largest section
+            # of the data file. Filter each host's deque inline.
+            site_ping_save = {
+                host: [
+                    [ts, v] for ts, v in hist
+                    if ts >= cutoff_30d_iso
+                ]
+                for host, hist in state.site_ping_history.items()
+            }
             provider_uptime = dict(state.provider_uptime_secs)
             provider_colors = dict(state.provider_colors)
             current_outage = state.current_outage
             daily_history_snap = list(state.daily_history)
+            # Router events are retained for 30 days (extended from 24h) so
+            # the AI diagnosis can pull a full month of context for any
+            # incident the user clicks on. ~36 MB at current rate.
+            router_cutoff_iso = (datetime.now() - _30D).isoformat()
             router_events_to_save = [
                 ev.to_dict()
                 for ev in state.router_events
-                if ev.timestamp >= cutoff.isoformat()
+                if ev.timestamp >= router_cutoff_iso
             ]
+            # Prune in-memory deque to the same 30d window so live memory
+            # tracks what's on disk (and stays bounded by time, not count).
+            if len(state.router_events) != len(router_events_to_save):
+                state.router_events = deque(
+                    (ev for ev in state.router_events if ev.timestamp >= router_cutoff_iso),
+                    maxlen=state.router_events.maxlen,
+                )
             cutoff_30d_iso = (datetime.now() - _30D).isoformat()
             diagnoses_to_save = [
                 d for d in state.diagnoses
@@ -1252,12 +1685,14 @@ def save_state(state: MonitorState) -> None:
             "outages": outages,
             "ping_history_ts": ping_ts,
             "ping_accessibility_ts": access_ts,
+            "site_ping_history": site_ping_save,
             "provider_uptime_secs": provider_uptime,
             "provider_colors": provider_colors,
             "daily_history": new_daily_history,
             "router_events": router_events_to_save,
             "degraded_periods": degraded,
             "diagnoses": diagnoses_to_save,
+            "dismissed_outage_ids": sorted(state.dismissed_outage_ids),
             "first_seen": state.first_seen.isoformat(),
             "saved_at": datetime.now().isoformat(),
         }
@@ -1267,6 +1702,94 @@ def save_state(state: MonitorState) -> None:
         os.replace(tmp, DATA_FILE)
     except Exception as exc:
         logging.warning("Failed to save state: %s", exc)
+
+
+def _reconstruct_slow_periods_from_speed(
+    speed: List["SpeedSample"],
+    existing: List["DegradedPeriod"],
+) -> List["DegradedPeriod"]:
+    """Recover slow degraded periods that aren't in the persisted record but
+    are clearly visible in speed_history.
+
+    A "run" is consecutive non-Outage successful samples whose download is
+    below 50% × median(successful loaded samples). Open at SLOW_OPEN_STREAK
+    consecutive sub-threshold samples; close when ANY sample ≥ threshold or
+    on a >2h gap. Skip the run if any existing degraded period overlaps.
+    Returns possibly-empty list of new DegradedPeriod records.
+    """
+    if not speed:
+        return []
+    successes = [s for s in speed if (s.label or "") != "Outage"
+                 and s.download_mbps is not None]
+    if len(successes) < SLOW_MIN_HISTORY:
+        return []
+    dls = sorted(s.download_mbps for s in successes)
+    median = dls[len(dls) // 2]
+    threshold = median * 0.5
+
+    existing_slow = [(d.start, d.end) for d in existing
+                     if d.kind == "slow" and d.end is not None]
+
+    def overlaps_existing(a: datetime, b: datetime) -> bool:
+        for s, e in existing_slow:
+            if a <= e and s <= b:
+                return True
+        return False
+
+    out: List["DegradedPeriod"] = []
+    GAP_LIMIT = timedelta(hours=2)
+    run_start: Optional[datetime] = None
+    run_first_sample: Optional[datetime] = None
+    run_count = 0
+    last_ts: Optional[datetime] = None
+
+    successes_sorted = sorted(successes, key=lambda s: s.timestamp)
+    for s in successes_sorted:
+        ts = s.timestamp
+        if last_ts is not None and (ts - last_ts) > GAP_LIMIT:
+            # Force-close any open run at the previous sample.
+            if run_count >= SLOW_OPEN_STREAK and run_first_sample is not None:
+                start_t, end_t = run_first_sample, last_ts
+                if not overlaps_existing(start_t, end_t):
+                    out.append(DegradedPeriod(
+                        start=start_t, end=end_t, kind="slow",
+                        detail=f"reconstructed from speed_history "
+                               f"(median {median:.0f} Mbps, threshold "
+                               f"{threshold:.0f} Mbps, {run_count} samples)",
+                    ))
+            run_first_sample = None
+            run_count = 0
+
+        if s.download_mbps < threshold:
+            if run_first_sample is None:
+                run_first_sample = ts
+            run_count += 1
+        else:
+            if run_count >= SLOW_OPEN_STREAK and run_first_sample is not None and last_ts is not None:
+                start_t, end_t = run_first_sample, last_ts
+                if not overlaps_existing(start_t, end_t):
+                    out.append(DegradedPeriod(
+                        start=start_t, end=end_t, kind="slow",
+                        detail=f"reconstructed from speed_history "
+                               f"(median {median:.0f} Mbps, threshold "
+                               f"{threshold:.0f} Mbps, {run_count} samples)",
+                    ))
+            run_first_sample = None
+            run_count = 0
+
+        last_ts = ts
+
+    # Tail-end run that never closed.
+    if run_count >= SLOW_OPEN_STREAK and run_first_sample is not None and last_ts is not None:
+        start_t, end_t = run_first_sample, last_ts
+        if not overlaps_existing(start_t, end_t):
+            out.append(DegradedPeriod(
+                start=start_t, end=end_t, kind="slow",
+                detail=f"reconstructed from speed_history "
+                       f"(median {median:.0f} Mbps, threshold "
+                       f"{threshold:.0f} Mbps, {run_count} samples)",
+            ))
+    return out
 
 
 def load_state(state: MonitorState) -> None:
@@ -1292,26 +1815,47 @@ def load_state(state: MonitorState) -> None:
                     provider=s.get("provider", ""),
                 ))
 
+        # Drop "flap" outages on load — anything shorter than the new
+        # OUTAGE_OPEN_STREAK gate (4 consecutive failed probes × 2s = 8s).
+        # These are records from before the sustained-failure rule landed
+        # (Wi-Fi roams, brief gateway flaps, laptop wake artifacts) that
+        # would not be recorded today. Persist will rewrite the file
+        # without them on the next save.
+        FLAP_THRESHOLD = timedelta(seconds=OUTAGE_OPEN_STREAK * 2)
         outages: List[OutageRecord] = []
+        flap_dropped = 0
         for o in data.get("outages", []):
             start = datetime.fromisoformat(o["start"])
-            if start >= cutoff_30d:
-                end = datetime.fromisoformat(o["end"]) if o.get("end") else None
-                outages.append(OutageRecord(start=start, end=end))
+            if start < cutoff_30d:
+                continue
+            end = datetime.fromisoformat(o["end"]) if o.get("end") else None
+            if end is not None and (end - start) < FLAP_THRESHOLD:
+                flap_dropped += 1
+                continue
+            outages.append(OutageRecord(start=start, end=end))
+        if flap_dropped:
+            logging.info("load_state: dropped %d flap outage(s) shorter than %s",
+                         flap_dropped, FLAP_THRESHOLD)
 
-        # Drop unreliable degraded period records on load:
-        #   1. end is missing → orphan from a restart that lost current_slow /
-        #      current_high_ping. We have no truthful end time.
-        #   2. end - start > MAX_DEGRADED_LOAD_DURATION → almost certainly a
-        #      previously force-closed orphan with a fake saved-at end time,
-        #      or a runaway period from before the streak-based close logic
-        #      landed. Real degraded periods clear within minutes once the
-        #      P10/P90 streak conditions are met.
-        # state.current_slow / state.current_high_ping start at None (existing
-        # behavior); detection runs fresh against the next live sample.
-        MAX_DEGRADED_LOAD_DURATION = timedelta(hours=4)
+        # Load all persisted degraded periods. Previously this path silently
+        # dropped (a) orphans with no end and (b) anything kind=slow/high_ping
+        # longer than 4h, on the theory that they were stuck-state artifacts.
+        # That filter destroyed real long-running events (e.g. a 4-hour
+        # sustained-slow incident) and made the timeline disagree with the AI
+        # diagnoses, which retain their own copies of the event IDs.
+        #
+        # New policy: keep everything inside the 30d window. For orphans
+        # (missing end), close them at the file's saved_at timestamp so they
+        # render with a real bar instead of being dropped. The live close
+        # path will re-open or extend if the condition is still active.
+        saved_at_str = data.get("saved_at") or ""
+        try:
+            saved_at_dt = datetime.fromisoformat(saved_at_str) if saved_at_str else datetime.now()
+        except ValueError:
+            saved_at_dt = datetime.now()
+
         degraded_loaded: List[DegradedPeriod] = []
-        dropped_orphan = dropped_long = 0
+        closed_orphans = 0
         for d in data.get("degraded_periods", []):
             try:
                 start = datetime.fromisoformat(d["start"])
@@ -1320,50 +1864,56 @@ def load_state(state: MonitorState) -> None:
             if start < cutoff_30d:
                 continue
             end_raw = d.get("end")
-            if not end_raw:
-                dropped_orphan += 1
-                continue
-            try:
-                end = datetime.fromisoformat(end_raw)
-            except ValueError:
-                dropped_orphan += 1
-                continue
-            kind = d.get("kind", "slow")
-            # Slow / high_ping should clear within minutes once the new
-            # streak-based close criteria are met — anything > 4h is almost
-            # certainly a previously-orphaned record. site_loss is exempt:
-            # a real third-party service outage can legitimately last hours.
-            if kind in ("slow", "high_ping") and end - start > MAX_DEGRADED_LOAD_DURATION:
-                dropped_long += 1
-                continue
+            if end_raw:
+                try:
+                    end = datetime.fromisoformat(end_raw)
+                except ValueError:
+                    end = saved_at_dt
+                    closed_orphans += 1
+            else:
+                end = saved_at_dt if saved_at_dt > start else start + timedelta(seconds=1)
+                closed_orphans += 1
             degraded_loaded.append(DegradedPeriod(
                 start=start, end=end,
-                kind=kind,
+                kind=d.get("kind", "slow"),
                 detail=d.get("detail", ""),
             ))
-        if dropped_orphan or dropped_long:
-            logging.info("load_state: dropped %d orphan + %d unrealistically long "
-                         "degraded period(s) (> %s)",
-                         dropped_orphan, dropped_long,
-                         MAX_DEGRADED_LOAD_DURATION)
+        if closed_orphans:
+            logging.info("load_state: closed %d orphan degraded period(s) at saved_at",
+                         closed_orphans)
 
+        # All ping series are retained 30d on disk now — load with the 30d
+        # cutoff so AI diagnoses can analyze historical incidents.
         ping_ts: List[Tuple[str, float]] = [
             (ts, v)
             for ts, v in data.get("ping_history_ts", [])
-            if datetime.fromisoformat(ts) >= cutoff
+            if datetime.fromisoformat(ts) >= cutoff_30d
         ]
 
         access_ts: List[Tuple[str, float]] = [
             (ts, v)
             for ts, v in data.get("ping_accessibility_ts", [])
-            if datetime.fromisoformat(ts) >= cutoff
+            if datetime.fromisoformat(ts) >= cutoff_30d
         ]
 
+        # Per-site ping history loaded into the same per-host deque structure
+        # the live site_check_thread maintains.
+        site_ping_loaded: Dict[str, deque] = {}
+        site_ping_raw = data.get("site_ping_history", {}) or {}
+        cutoff_30d_iso = cutoff_30d.isoformat()
+        for host, samples in site_ping_raw.items():
+            kept = [(ts, v) for ts, v in samples if ts >= cutoff_30d_iso]
+            if kept:
+                site_ping_loaded[host] = deque(kept, maxlen=270_000)
+
+        # Router events are retained 30 days on disk so historical
+        # diagnoses have context — load with the 30d cutoff, not the
+        # general 24h cutoff used for higher-volume series like ping_ts.
         router_events_loaded: List = []
         for r in data.get("router_events", []):
             ts = r.get("ts", "")
             try:
-                if ts and datetime.fromisoformat(ts) < cutoff:
+                if ts and datetime.fromisoformat(ts) < cutoff_30d:
                     continue
             except ValueError:
                 continue
@@ -1379,12 +1929,13 @@ def load_state(state: MonitorState) -> None:
         with state.lock:
             state.speed_history = speed
             state.outages = outages
-            state.ping_history_ts = deque(ping_ts, maxlen=43200)
-            state.ping_accessibility_ts = deque(access_ts, maxlen=43200)
+            state.ping_history_ts = deque(ping_ts, maxlen=1_400_000)
+            state.ping_accessibility_ts = deque(access_ts, maxlen=270_000)
+            state.site_ping_history = site_ping_loaded
             state.provider_uptime_secs = data.get("provider_uptime_secs", {})
             state.provider_colors = data.get("provider_colors", {})
             state.daily_history = data.get("daily_history", [])
-            state.router_events = deque(router_events_loaded, maxlen=5000)
+            state.router_events = deque(router_events_loaded, maxlen=400_000)
             state.degraded_periods = deque(degraded_loaded, maxlen=2000)
 
             # Restore first_seen — always take the min of (persisted value if
@@ -1432,11 +1983,30 @@ def load_state(state: MonitorState) -> None:
                     d["id"] = "legacy-" + str(abs(hash(base)) % 10_000_000)
                 kept.append(d)
             state.diagnoses = deque(kept, maxlen=500)
+            state.dismissed_outage_ids = set(data.get("dismissed_outage_ids", []) or [])
             if speed:
                 state.last_speed_test = max(s.timestamp for s in speed)
                 successes = [s for s in speed if s.label != "Outage"]
                 if successes:
                     state.last_speed_success = max(s.timestamp for s in successes)
+
+            # Reconstruct missing slow degraded periods from speed_history.
+            # If a previous build silently dropped a degraded record on load
+            # (or one was never persisted before a crash), the timeline ends
+            # up with no bar even though speed_history clearly shows a
+            # sustained slow run. Walk speed_history once; whenever we see
+            # ≥ SLOW_OPEN_STREAK consecutive non-Outage samples below the
+            # threshold (50% × median of loaded successful samples), and no
+            # existing degraded period overlaps that window, synthesize one.
+            reconstructed = _reconstruct_slow_periods_from_speed(
+                speed, list(state.degraded_periods))
+            if reconstructed:
+                state.degraded_periods.extend(reconstructed)
+                # Keep the deque sorted by start so cluster logic is happy.
+                ordered = sorted(state.degraded_periods, key=lambda d: d.start)
+                state.degraded_periods = deque(ordered, maxlen=2000)
+                logging.info("load_state: reconstructed %d slow degraded period(s) "
+                             "from speed_history", len(reconstructed))
 
         print(f"  Loaded {len(speed)} speed samples, {len(outages)} outages, "
               f"{len(ping_ts)} ping points from disk.", flush=True)
@@ -1469,7 +2039,7 @@ def site_check_thread(state: MonitorState) -> None:
 
                     # Record per-site latency (None = unreachable)
                     if host not in state.site_ping_history:
-                        state.site_ping_history[host] = deque(maxlen=8640)
+                        state.site_ping_history[host] = deque(maxlen=270_000)  # 30d @ 10s
                     state.site_ping_history[host].append((iso_now, ms))
 
                     if was_up and not up:
@@ -1635,8 +2205,7 @@ def connectivity_thread(state: MonitorState) -> None:
         ping_event: Optional[Tuple[str, str]] = None
 
         with state.lock:
-            was_connected = state.connected
-            state.connected = online
+            state.connected = online   # always reflect the latest probe
             now = datetime.now()
 
             if latency is not None:
@@ -1648,16 +2217,34 @@ def connectivity_thread(state: MonitorState) -> None:
             elif not online:
                 state.last_ping_ms = None
 
-            if online and not was_connected:
-                if state.current_outage:
+            # ── Sustained-failure outage gating ───────────────────────
+            # A single failed probe (Wi-Fi roam, brief gateway flap, laptop
+            # wake artifact) shouldn't open an outage. Require
+            # OUTAGE_OPEN_STREAK consecutive failures (≈8s @ 2s) before
+            # creating the OutageRecord, and backdate its start to the FIRST
+            # failure so timing stays honest.
+            if online:
+                # Recovery: only fire "restored" if a sustained outage was
+                # actually open. Brief blips (streak < threshold) recover
+                # silently — no record, no log.
+                if state.current_outage is not None:
                     state.current_outage.end = now
                     state.outages.append(state.current_outage)
                     state.current_outage = None
                     state.trigger_post_outage_test = True
-                event = ("Connection restored!", "success")
-            elif not online and was_connected:
-                state.current_outage = OutageRecord(start=now)
-                event = ("Connection LOST!", "error")
+                    event = ("Connection restored!", "success")
+                state._outage_fail_streak = 0
+                state._outage_first_failure_at = None
+            else:
+                state._outage_fail_streak += 1
+                if state._outage_first_failure_at is None:
+                    state._outage_first_failure_at = now
+                if (state._outage_fail_streak == OUTAGE_OPEN_STREAK
+                        and state.current_outage is None):
+                    state.current_outage = OutageRecord(
+                        start=state._outage_first_failure_at
+                    )
+                    event = ("Connection LOST!", "error")
 
             ping_event = _update_high_ping_degraded(state, latency, now)
 
@@ -1667,6 +2254,28 @@ def connectivity_thread(state: MonitorState) -> None:
             state.log(*ping_event)
 
         time.sleep(2)
+
+
+def _previous_scheduled_slot(now: datetime) -> datetime:
+    """Return the most recent SPEED_TEST_SLOTS minute mark at or before `now`.
+    If we're earlier than every slot in this hour, falls back to the prior
+    hour's last slot (xx:55)."""
+    for m in reversed(SPEED_TEST_SLOTS):
+        slot = now.replace(minute=m, second=0, microsecond=0)
+        if slot <= now:
+            return slot
+    last_m = SPEED_TEST_SLOTS[-1]
+    return (now - timedelta(hours=1)).replace(minute=last_m, second=0, microsecond=0)
+
+
+def _next_scheduled_slot(now: datetime) -> datetime:
+    """Return the next SPEED_TEST_SLOTS minute mark strictly after `now`."""
+    for m in SPEED_TEST_SLOTS:
+        slot = now.replace(minute=m, second=0, microsecond=0)
+        if slot > now:
+            return slot
+    first_m = SPEED_TEST_SLOTS[0]
+    return (now + timedelta(hours=1)).replace(minute=first_m, second=0, microsecond=0)
 
 
 def speed_test_thread(state: MonitorState) -> None:
@@ -1682,8 +2291,6 @@ def speed_test_thread(state: MonitorState) -> None:
             in_progress   = state.speed_in_progress
             trigger_post  = state.trigger_post_outage_test
             last_attempt  = state.last_speed_test
-            last_success  = state.last_speed_success
-            interval      = state.speed_interval_secs
             outage_active = state.current_outage is not None
             cur_provider  = state.current_provider
 
@@ -1691,7 +2298,8 @@ def speed_test_thread(state: MonitorState) -> None:
             continue
 
         # Active outage (no connectivity): record 0-bandwidth sample every 60s
-        # instead of attempting a live test.
+        # instead of attempting a live test. This is one of the documented
+        # exceptions to the fixed xx:10/25/40/55 cadence.
         if not online and outage_active:
             secs_since_attempt = (
                 (datetime.now() - last_attempt).total_seconds() if last_attempt else 9999
@@ -1715,7 +2323,10 @@ def speed_test_thread(state: MonitorState) -> None:
         if not online:
             continue
 
-        # Post-outage: run a test shortly after connectivity is restored.
+        # Post-outage: immediate test after connectivity is restored.
+        # Documented exception to the fixed cadence — we want to know how
+        # quickly speeds returned to baseline. The aligned schedule resumes
+        # naturally on the next loop iteration after this fires.
         if trigger_post:
             with state.lock:
                 state.trigger_post_outage_test = False
@@ -1726,18 +2337,15 @@ def speed_test_thread(state: MonitorState) -> None:
             run_speed_test(state, "Post-outage")
             continue
 
-        # Normal scheduling:
-        # - If last success was < 5 min ago: wait for the 5-min mark.
-        # - If last success was >= 5 min ago (or never): retry every 60s.
+        # ── Aligned-cadence scheduling ─────────────────────────────
+        # Tests run at the wall-clock minute marks in SPEED_TEST_SLOTS
+        # (10, 25, 40, 55). If we haven't already attempted a test at or
+        # after the most recent slot, fire one. The 5-second tick means
+        # tests land within 5 seconds of each scheduled mark.
         now = datetime.now()
-        secs_since_success = (now - last_success).total_seconds() if last_success else float("inf")
-        secs_since_attempt = (now - last_attempt).total_seconds() if last_attempt else float("inf")
-
-        if secs_since_success >= interval:
-            # Past the 5-min success window — retry every 60 seconds
-            if secs_since_attempt >= 60:
-                run_speed_test(state, "Periodic")
-        # else: still within 5-min window; wait for the loop to tick past it
+        prev_slot = _previous_scheduled_slot(now)
+        if last_attempt is None or last_attempt < prev_slot:
+            run_speed_test(state, "Periodic")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1752,7 +2360,7 @@ window.UptimeTimeline = (function () {
   const COLORS = {
     bg:       '#0d1117',
     bar_ok:   'rgba(63,185,80,0.55)',   // muted green
-    bar_no:   '#161b22',                 // future / no data
+    bar_no:   '#161b22',                 // future / no data / monitor down
     outage:   '#f85149',
     outage_seen: 'rgba(248,81,73,0.45)',     // lighter red = analyzed outage
     degraded: '#d29922',
@@ -1844,7 +2452,35 @@ window.UptimeTimeline = (function () {
     const titles      = opts.titles || {};
     const monitorStartedAt = opts.monitorStartedAt
       ? new Date(opts.monitorStartedAt) : null;
+    // Periods when the monitor process itself wasn't running. Rendered as
+    // dim "no data" overlay on the green covered band, with hover tooltip.
+    const monitorGaps = (opts.monitorGaps || []).map(g => ({
+      start: new Date(g.start),
+      end:   new Date(g.end),
+      duration_s: g.duration_s,
+    }));
+    const gapRects = [];
     const onClick = opts.onIncidentClick || null;
+    // ID of the cluster currently being viewed in the diagnosis panel —
+    // when set, we draw a bright-yellow outline around its members and
+    // pipe the bounding box back via onSelectedBounds so a popover can be
+    // positioned to point at it.
+    const selectedClusterId = opts.selectedClusterId || null;
+    const onSelectedBounds  = opts.onSelectedBounds || null;
+    const selectedBoundsAcc = { x: Infinity, y: Infinity, x2: -Infinity, y2: -Infinity, found: false };
+    // Highlight an arbitrary time slice on the timeline (used when the
+    // selected diagnosis is window-based — 1h / 24h — and isn't tied to
+    // a single cluster). { start, end } as ISO strings.
+    const selectedWindow = opts.selectedWindow || null;
+    // Per-kind member filter. `kindFilter` is a Set of kinds to HIDE
+    // (e.g., new Set(['slow', 'site_loss'])). Outage members are never
+    // hidden — those are always relevant.
+    const kindFilter = opts.kindFilter instanceof Set ? opts.kindFilter : new Set();
+    // Cluster IDs the user has dismissed. Hidden by default; shown when
+    // showDismissed is true (the user toggled "show dismissed").
+    const dismissedIds = opts.dismissedClusterIds instanceof Set
+      ? opts.dismissedClusterIds : new Set();
+    const showDismissed = !!opts.showDismissed;
     const showHourLabels = days <= 7;
 
     const dpr = window.devicePixelRatio || 1;
@@ -1934,6 +2570,26 @@ window.UptimeTimeline = (function () {
         ctx.fillRect(x, yA, barW, yB - yA);
       }
 
+      // Monitor downtime: overlay each gap that intersects this day with
+      // the dim "no data" color so the user can see when the monitor wasn't
+      // running. Each rect is also recorded for tooltip hit-testing.
+      monitorGaps.forEach(g => {
+        if (g.end <= day || g.start >= dayEnd) return;
+        const segStart = g.start < day    ? day    : g.start;
+        const segEnd   = g.end   > dayEnd ? dayEnd : g.end;
+        const fm = (segStart <= day)    ? 0    : minutesOfDay(segStart);
+        const tm = (segEnd   >= dayEnd) ? 1440 : minutesOfDay(segEnd);
+        if (tm <= fm) return;
+        const yA = yOf(tm);
+        const yB = yOf(fm);
+        ctx.fillStyle = COLORS.bar_no;
+        ctx.fillRect(x, yA, barW, yB - yA);
+        gapRects.push({
+          x: x, y: yA, w: barW, h: yB - yA,
+          start: g.start, end: g.end, duration_s: g.duration_s,
+        });
+      });
+
       // Day label(s)
       ctx.fillStyle = COLORS.dim;
       ctx.textAlign = 'center';
@@ -1999,6 +2655,8 @@ window.UptimeTimeline = (function () {
           }];
 
       members.forEach(m => {
+        // Per-kind filter — outage members are never hidden.
+        if (m.kind !== 'outage' && kindFilter.has(m.kind)) return;
         const memStart = new Date(m.start);
         const memEnd   = m.end ? new Date(m.end) : new Date();
         // Per-member coloring: outage = solid red (or lighter when analyzed),
@@ -2032,6 +2690,27 @@ window.UptimeTimeline = (function () {
           const yTop = yA - (h - (yB - yA)) / 2;
           ctx.fillStyle = useStripes ? pattern : memColor;
           ctx.fillRect(x, yTop, barW, h);
+          // Yellow outline + bounding-box accumulation for the selected
+          // cluster (the one the user is currently viewing in the
+          // diagnosis panel).
+          if (cluster.id === selectedClusterId) {
+            const outlinePad = 2;
+            ctx.save();
+            ctx.strokeStyle = '#f1e05a';   // bright yellow, no glow
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(
+              x - outlinePad,
+              yTop - outlinePad,
+              barW + outlinePad * 2,
+              h + outlinePad * 2,
+            );
+            ctx.restore();
+            selectedBoundsAcc.found = true;
+            selectedBoundsAcc.x  = Math.min(selectedBoundsAcc.x,  x - outlinePad);
+            selectedBoundsAcc.y  = Math.min(selectedBoundsAcc.y,  yTop - outlinePad);
+            selectedBoundsAcc.x2 = Math.max(selectedBoundsAcc.x2, x + barW + outlinePad);
+            selectedBoundsAcc.y2 = Math.max(selectedBoundsAcc.y2, yTop + h + outlinePad);
+          }
           const HIT_PAD_TOP = 4, HIT_PAD_BOT = 3, HIT_PAD_X = 1;
           incidentRects.push({
             x: x - HIT_PAD_X,
@@ -2047,10 +2726,71 @@ window.UptimeTimeline = (function () {
       });
     }
 
+    // Apply dismissed-cluster filter unless the user has toggled "show
+    // dismissed" on. Dismissed clusters render with a translucent dim
+    // overlay when shown, so they're visible-but-distinguishable.
+    const visibleClusters = clusters.filter(c =>
+      showDismissed || !dismissedIds.has(c.id)
+    );
     // Draw degraded clusters first (so outage clusters render on top, just in
     // case any future data shape allows overlap — server-side they're merged).
-    clusters.filter(c => c.category !== 'outage').forEach(drawSpan);
-    clusters.filter(c => c.category === 'outage').forEach(drawSpan);
+    visibleClusters.filter(c => c.category !== 'outage').forEach(drawSpan);
+    visibleClusters.filter(c => c.category === 'outage').forEach(drawSpan);
+    // Visually mark dismissed clusters with a thin gray overlay so they
+    // read as "acknowledged, kept around for history."
+    if (showDismissed) {
+      ctx.save();
+      ctx.fillStyle = 'rgba(139,148,158,0.45)';
+      visibleClusters.forEach(c => {
+        if (!dismissedIds.has(c.id)) return;
+        const sMs = new Date(c.start).getTime();
+        const eMs = c.end ? new Date(c.end).getTime() : new Date().getTime();
+        dayStarts.forEach((day, idx) => {
+          const dayEnd = new Date(day); dayEnd.setDate(day.getDate() + 1);
+          if (eMs <= day.getTime() || sMs >= dayEnd.getTime()) return;
+          const segStart = new Date(Math.max(sMs, day.getTime()));
+          const segEnd   = new Date(Math.min(eMs, dayEnd.getTime() - 1));
+          const yA = yOf(minutesOfDay(segEnd));
+          const yB = yOf(minutesOfDay(segStart));
+          const x = dayX[idx] + (colW - barW) / 2;
+          ctx.fillRect(x, yA, barW, yB - yA);
+        });
+      });
+      ctx.restore();
+    }
+
+    // Highlight an arbitrary time slice (used when the selected diagnosis is
+    // window-based — 1h/24h — and isn't tied to a specific cluster). Drawn
+    // as a yellow outline that may span multiple day columns since a 24h
+    // window can cross midnight.
+    if (selectedWindow && selectedWindow.start && selectedWindow.end) {
+      const winStart = new Date(selectedWindow.start);
+      const winEnd   = new Date(selectedWindow.end);
+      ctx.save();
+      ctx.strokeStyle = '#f1e05a';
+      ctx.lineWidth = 1.5;
+      dayStarts.forEach((day, idx) => {
+        const dayEnd = new Date(day); dayEnd.setDate(day.getDate() + 1);
+        if (winEnd <= day || winStart >= dayEnd) return;
+        const segStart = (winStart > day) ? winStart : day;
+        const segEnd   = (winEnd   < dayEnd) ? winEnd : dayEnd;
+        const yA = yOf(minutesOfDay(segEnd >= dayEnd ? new Date(dayEnd.getTime() - 1) : segEnd));
+        const yB = yOf(minutesOfDay(segStart));
+        const x = dayX[idx] + (colW - barW) / 2 - 2;
+        const w = barW + 4;
+        const yTop = yA - 2;
+        const h = (yB - yA) + 4;
+        ctx.strokeRect(x, yTop, w, h);
+        // Report bounding box so caller can react if it wants (mirrors the
+        // selectedClusterId path).
+        selectedBoundsAcc.found = true;
+        selectedBoundsAcc.x  = Math.min(selectedBoundsAcc.x,  x);
+        selectedBoundsAcc.y  = Math.min(selectedBoundsAcc.y,  yTop);
+        selectedBoundsAcc.x2 = Math.max(selectedBoundsAcc.x2, x + w);
+        selectedBoundsAcc.y2 = Math.max(selectedBoundsAcc.y2, yTop + h);
+      });
+      ctx.restore();
+    }
 
     // "Now" tick on today's column
     const now = new Date();
@@ -2087,14 +2827,41 @@ window.UptimeTimeline = (function () {
       });
     }
 
+    // Notify caller of the bounding box of the selected cluster's bars (in
+    // CSS pixels relative to the canvas) so it can position a popover that
+    // points at the highlighted incident. null when nothing is selected or
+    // the selected id wasn't found in the rendered clusters.
+    if (onSelectedBounds) {
+      if (selectedBoundsAcc.found) {
+        onSelectedBounds({
+          x: selectedBoundsAcc.x,
+          y: selectedBoundsAcc.y,
+          w: selectedBoundsAcc.x2 - selectedBoundsAcc.x,
+          h: selectedBoundsAcc.y2 - selectedBoundsAcc.y,
+        });
+      } else {
+        onSelectedBounds(null);
+      }
+    }
+
     // Hover/click handlers
     let activeIncident = null;
     function hitTest(evt) {
       const rect = canvas.getBoundingClientRect();
       const px = evt.clientX - rect.left;
       const py = evt.clientY - rect.top;
+      // Incident rects are checked first — they're drawn on top of gaps.
       for (const r of incidentRects) {
         if (px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h) return r.incident;
+      }
+      return null;
+    }
+    function hitTestGap(evt) {
+      const rect = canvas.getBoundingClientRect();
+      const px = evt.clientX - rect.left;
+      const py = evt.clientY - rect.top;
+      for (const r of gapRects) {
+        if (px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h) return r;
       }
       return null;
     }
@@ -2140,8 +2907,22 @@ window.UptimeTimeline = (function () {
         tt.innerHTML = lines.join('<br>');
         placeTooltip(e.clientX, e.clientY);
       } else {
-        canvas.style.cursor = 'default';
-        hideTooltip();
+        // No incident under cursor — check for monitor-down gaps.
+        const g = hitTestGap(e);
+        if (g) {
+          canvas.style.cursor = 'default';
+          const lines = [
+            '<strong style="color:var(--dim)">Monitor not running</strong>',
+            new Date(g.start).toLocaleString() + ' → ' +
+              new Date(g.end).toLocaleString(),
+            'Duration: ' + fmtDuration(g.duration_s),
+          ];
+          tt.innerHTML = lines.join('<br>');
+          placeTooltip(e.clientX, e.clientY);
+        } else {
+          canvas.style.cursor = 'default';
+          hideTooltip();
+        }
       }
     };
     canvas.onmouseleave = hideTooltip;
@@ -2427,6 +3208,15 @@ tr:last-child td { border-bottom: none; }
   display: flex;
   gap: 10px;
 }
+.speed-attempts-line {
+  font-size: 10px;
+  color: var(--dim);
+  margin-top: 6px;
+  letter-spacing: 0.02em;
+}
+.speed-attempts-line strong { color: var(--text); font-weight: 600; }
+.speed-attempts-line .sa-warn { color: var(--yellow); }
+
 .speed-row .card {
   flex: 1;
   min-width: 0;
@@ -2545,6 +3335,86 @@ tr:last-child td { border-bottom: none; }
   box-shadow: 0 4px 18px rgba(0,0,0,0.5);
 }
 .site-tile:hover .site-tile-tooltip { display: block; }
+.site-tile { cursor: pointer; }
+.site-tile:hover { transform: translateY(-1px); transition: transform 0.1s ease; }
+
+/* Per-site ping history modal */
+.site-modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.6);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 100;
+}
+.site-modal {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  width: min(900px, 92vw);
+  max-height: 90vh;
+  display: flex; flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+}
+.site-modal-head {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.site-modal-title {
+  font-size: 15px; font-weight: 600; color: var(--text);
+}
+.site-modal-sub {
+  font-size: 11px; color: var(--dim); margin-top: 4px;
+}
+.site-modal-sub strong { color: var(--text); font-weight: 600; }
+.site-modal-close {
+  background: transparent; border: none; color: var(--dim);
+  font-size: 22px; cursor: pointer; line-height: 1;
+  padding: 0 4px;
+}
+.site-modal-close:hover { color: var(--text); }
+.site-modal-canvas-wrap {
+  width: 100%; height: 280px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+#site-modal-canvas { width: 100%; height: 100%; display: block; }
+.site-modal-legend {
+  display: flex; gap: 14px; flex-wrap: wrap;
+  font-size: 10px; color: var(--dim);
+  margin-top: 8px;
+}
+.site-modal-legend > span { display: inline-flex; align-items: center; gap: 4px; }
+.site-modal-legend > span[data-layer] { cursor: pointer; user-select: none; }
+.site-modal-legend > span[data-layer]:hover { color: var(--text); }
+.site-modal-legend > span[data-layer].layer-off {
+  opacity: 0.35;
+  text-decoration: line-through;
+}
+.site-modal-legend .lg-cross {
+  display: inline-block;
+  width: 10px; height: 10px;
+  position: relative;
+}
+.site-modal-legend .lg-cross::before,
+.site-modal-legend .lg-cross::after {
+  content: ''; position: absolute;
+  left: 50%; top: 0;
+  width: 1.4px; height: 100%;
+  background: var(--red);
+  transform-origin: center;
+}
+.site-modal-legend .lg-cross::before { transform: translateX(-50%) rotate(45deg); }
+.site-modal-legend .lg-cross::after  { transform: translateX(-50%) rotate(-45deg); }
+.site-modal-legend .lg-spike {
+  display: inline-block;
+  width: 6px; height: 6px;
+  background: var(--red);
+  border: 1px solid var(--text);
+  border-radius: 50%;
+}
 .tt-head { font-weight: 700; color: var(--dim); text-transform: uppercase;
            letter-spacing: 0.06em; font-size: 9px; margin-bottom: 5px; }
 .tt-row {
@@ -2559,6 +3429,41 @@ tr:last-child td { border-bottom: none; }
 .tt-pct.warn { color: #d29922; }
 .tt-pct.bad  { color: #f85149; }
 .tt-lat { color: var(--dim); padding-left: 4px; }
+.tt-pool {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text);
+}
+.tt-pool-lbl { color: var(--dim); margin-right: 4px; }
+.tt-pool .s-green  { color: #3fb950; }
+.tt-pool .s-yellow { color: #d29922; }
+.tt-pool .s-red    { color: #f85149; }
+.tt-pool-sub { color: var(--dim); font-size: 9px; }
+
+/* Kind-filter toggles next to the timeline title (mirrors /diagnose) */
+.kind-filter {
+  display: inline-flex;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--dim);
+  font-weight: normal;
+  letter-spacing: 0.02em;
+}
+.kind-filter label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.kind-filter input[type="checkbox"] {
+  accent-color: var(--blue);
+  margin: 0;
+  cursor: pointer;
+}
 </style>
 </head>
 <body>
@@ -2634,7 +3539,14 @@ tr:last-child td { border-bottom: none; }
 
   <!-- ── 7-Day Uptime Timeline ──────────────────────────────── -->
   <div class="card col-3" id="uptime-card" style="display:flex;flex-direction:column">
-    <div class="card-title">7-Day Uptime</div>
+    <div class="card-title" style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap">
+      <span>7-Day Uptime</span>
+      <span class="kind-filter">
+        <label><input type="checkbox" data-kind="slow" checked> slow</label>
+        <label><input type="checkbox" data-kind="site_loss" checked> site loss</label>
+        <label><input type="checkbox" data-show-dismissed> dismissed</label>
+      </span>
+    </div>
     <div class="chart-wrap" style="height:280px;flex:1;position:relative">
       <canvas id="uptimeTimeline" style="width:100%;height:100%"></canvas>
     </div>
@@ -2685,6 +3597,7 @@ tr:last-child td { border-bottom: none; }
       <div class="card">
         <div class="card-title" id="upload-chart-title">Upload — 24h hourly avg + latest (Mbps)</div>
         <div class="chart-wrap"><canvas id="uploadChartCombined"></canvas></div>
+        <div id="speed-attempts-line" class="speed-attempts-line" title="Primary speed test = speedtest-cli; fallback = built-in HTTP. Fallback successes do not count as primary OK."></div>
       </div>
       <div class="card">
         <div class="card-title" id="download-chart-title">Download — 24h hourly avg + latest (Mbps)</div>
@@ -2732,10 +3645,16 @@ function makePingConfig24h() {
           yAxisID: 'yMs',
           order: 3,
         },
+        // p50 (median) line — drawn slightly heavier than the p10/p90
+        // edges so the median reads as the headline stat. Toggleable via
+        // the legend; the dataset stays in slot 1 either way so the
+        // p10/p90 fill anchor (`fill: '-2'` two slots back) keeps working.
+        // Color matches the teal family used by p10/p90 for visual
+        // consistency, just at higher opacity.
         {
           label: 'p50 (ms)',
           data: [],
-          borderColor: 'rgba(57,197,207,1)',
+          borderColor: 'rgba(57,197,207,0.95)',
           backgroundColor: 'transparent',
           borderWidth: 2,
           pointRadius: 2,
@@ -2854,6 +3773,46 @@ function makePingConfig5m() {
   };
 }
 
+// ── Latest-bar value label plugin ─────────────────────────────
+// Draws the most-recent test's actual value above the rightmost bar.
+// Chart.js plugins receive the chart instance; we read the raw slots that
+// updateSpeedBar() stashes on the chart (chart._speedRaw + chart._isUl).
+const latestValuePlugin = {
+  id: 'latestValueLabel',
+  afterDatasetsDraw(chart) {
+    const slots = chart._speedRaw;
+    if (!slots || !slots.length) return;
+    const last = slots.length - 1;
+    const pt = slots[last];
+    if (!pt) return;
+    const isUl = chart._isUl;
+    // For the most-recent bar (single sample), p10 == p50 == p90 == the
+    // actual measured value. Pick whichever stack is non-zero.
+    const v = (isUl ? pt.ul_p10 : pt.dl_p10);
+    const top = (isUl ? pt.ul_p90 : pt.dl_p90) ?? v;
+    if (v == null) return;
+
+    const meta = chart.getDatasetMeta(2);   // top stack segment
+    const bar  = meta && meta.data && meta.data[last];
+    if (!bar) return;
+
+    // Format: 1 decimal under 100, whole number above (consistent with
+    // dashboard's other speed readouts).
+    const text = (top != null && top >= 100) ? `${Math.round(top)}` : `${(top ?? v).toFixed(1)}`;
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.font = 'bold 11px ui-monospace, monospace';
+    ctx.fillStyle = '#e6edf3';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    // Position 4px above the top of the bar.
+    const x = bar.x;
+    const y = Math.min(bar.y, bar.base) - 4;
+    ctx.fillText(text, x, y);
+    ctx.restore();
+  },
+};
+
 // ── Speed bar chart: stacked p10 / p10→p50 / p50→p90 per hour + latest bar ──
 function makeSpeedBarConfig(label, defaultColor) {
   return {
@@ -2866,9 +3825,13 @@ function makeSpeedBarConfig(label, defaultColor) {
         { label: 'Top 10%',   data: [], backgroundColor: [], borderColor: [], borderWidth: 1, stack: 's', borderRadius: 3 },
       ],
     },
+    plugins: [latestValuePlugin],
     options: {
       responsive: true, maintainAspectRatio: false, animation: false,
       interaction: { mode: 'index', intersect: false },
+      // Reserve a few pixels at the top so the latest-value label drawn by
+      // latestValuePlugin isn't clipped against the chart's top edge.
+      layout: { padding: { top: 14 } },
       plugins: {
         legend: { display: false },
         tooltip: {
@@ -3045,6 +4008,23 @@ function update(d) {
   document.getElementById('last-updated').textContent =
     'Updated ' + new Date().toLocaleTimeString();
 
+  // Speed attempts strip (under the upload chart) — primary vs fallback.
+  const sa = d.speed_attempts_24h;
+  const saEl = document.getElementById('speed-attempts-line');
+  if (saEl) {
+    if (!sa || !sa.total) {
+      saEl.innerHTML = '<span style="color:var(--dim)">No speed tests in last 24h yet</span>';
+    } else {
+      const parts = [
+        'Primary speed tests: <strong>' + sa.primary_ok + ' / ' + sa.total + '</strong> ok in last 24h',
+      ];
+      if (sa.fallback_ok > 0) {
+        parts.push('<span class="sa-warn">' + sa.fallback_ok + ' fell back to HTTP (recorded as site-loss; not graphed)</span>');
+      }
+      saEl.innerHTML = parts.join(' &nbsp;·&nbsp; ');
+    }
+  }
+
   // Status card
   setEl('stat-runtime',  d.runtime_str || '—');
   const statProvEl = document.getElementById('stat-provider');
@@ -3157,25 +4137,34 @@ function update(d) {
       return [p10, p50, p90].map(v => v != null ? Math.round(v) : '—').join('/') + 'ms';
     };
 
+    // Pool thresholds footer — helps the user see what GREAT/OK/SLOW/POOR
+    // mean tonight. Same string appears on every tile so we build it once.
+    const pt = d.site_pool_thresholds || {};
+    const ptFooter = (pt.great_ms != null) ? `
+      <div class="tt-pool">
+        <span class="tt-pool-lbl">band:</span>
+        <span class="s-green">≤${pt.great_ms}ms</span>
+        ·
+        <span>${pt.great_ms}–${pt.slow_ms}ms</span>
+        ·
+        <span class="s-yellow">${pt.slow_ms}–${pt.poor_ms}ms</span>
+        ·
+        <span class="s-red">>${pt.poor_ms}ms</span>
+        <div class="tt-pool-sub">from ${pt.samples} pings · ${pt.window_hours}h pool</div>
+      </div>` : '';
+
     const tiles = d.site_matrix.map(s => {
-      // Best available window for current verdict (prefer fresh data)
+      // Best available window for the displayed sub-line (prefer fresh).
       const pct = s.pct_5m ?? s.pct_1h ?? s.pct_24h;
       const p50 = s.p50_5m ?? s.p50_1h ?? s.p50_24h;
 
-      // Verdict + color
-      let verdict, colorCls;
-      if (!s.up) {
-        verdict = 'DOWN'; colorCls = 's-red';
-      } else if (pct == null) {
-        verdict = '…';    colorCls = '';
-      } else if (pct >= 95 && (p50 == null || p50 < 80)) {
-        verdict = 'GREAT'; colorCls = 's-green';
-      } else if (pct >= 80 && (p50 == null || p50 < 250)) {
-        verdict = 'OK';    colorCls = 's-green';
-      } else if (pct >= 60 || (p50 != null && p50 < 500)) {
-        verdict = 'SLOW';  colorCls = 's-yellow';
-      } else {
-        verdict = 'POOR';  colorCls = 's-red';
+      // Verdict comes from the server now — pool-percentile based, see
+      // SITE_VERDICT_* constants in connection_monitor.py.
+      let verdict = s.verdict;
+      let colorCls = s.verdict_class || '';
+      if (verdict == null) {
+        // Server returned no verdict (cold start before pool exists).
+        verdict = (pct == null) ? '…' : '…';
       }
 
       // Trend: compare 5m median to 1h median (need both to show arrow)
@@ -3205,7 +4194,7 @@ function update(d) {
         </div>`;
 
       const displayName = s.name || s.host.replace(/^www\./, '');
-      return `<div class="site-tile ${colorCls}">
+      return `<div class="site-tile ${colorCls}" data-host="${s.host}" title="Click for ping history">
         <div class="site-tile-host">${displayName}</div>
         <div class="site-tile-verdict">
           <span class="site-tile-dot"></span>${verdict}${trendHtml}
@@ -3216,6 +4205,7 @@ function update(d) {
           ${mkTtRow('5m',  s.pct_5m,  s.p10_5m,  s.p50_5m,  s.p90_5m)}
           ${mkTtRow('1h',  s.pct_1h,  s.p10_1h,  s.p50_1h,  s.p90_1h)}
           ${mkTtRow('24h', s.pct_24h, s.p10_24h, s.p50_24h, s.p90_24h)}
+          ${ptFooter}
         </div>
       </div>`;
     }).join('');
@@ -3254,15 +4244,59 @@ function onTimelineClick(inc) {
 }
 
 let _timelineCache = null;
+
+// Per-page kind filter, persisted (shared key with /diagnose so the
+// preference flows across pages).
+function loadKindFilter() {
+  const set = new Set();
+  try {
+    const raw = localStorage.getItem('diagKindFilter');
+    if (raw) JSON.parse(raw).forEach(k => set.add(k));
+  } catch (e) {}
+  return set;
+}
+function saveKindFilter(set) {
+  try { localStorage.setItem('diagKindFilter', JSON.stringify([...set])); } catch (e) {}
+}
+let _kindFilter = loadKindFilter();
+let _showDismissed = (function() {
+  try { return localStorage.getItem('diagShowDismissed') === '1'; }
+  catch (e) { return false; }
+})();
+document.querySelectorAll('.kind-filter input[type="checkbox"]').forEach(cb => {
+  if (cb.dataset.kind) {
+    cb.checked = !_kindFilter.has(cb.dataset.kind);
+    cb.addEventListener('change', () => {
+      if (cb.checked) _kindFilter.delete(cb.dataset.kind);
+      else            _kindFilter.add(cb.dataset.kind);
+      saveKindFilter(_kindFilter);
+      paintTimeline();
+    });
+  } else if (cb.hasAttribute('data-show-dismissed')) {
+    cb.checked = _showDismissed;
+    cb.addEventListener('change', () => {
+      _showDismissed = cb.checked;
+      try { localStorage.setItem('diagShowDismissed', _showDismissed ? '1' : '0'); }
+      catch (e) {}
+      paintTimeline();
+    });
+  }
+});
+
 function paintTimeline() {
   if (!_timelineCache) return;
+  const dismissedSet = new Set(_timelineCache.dismissed_ids || []);
   UptimeTimeline.render(uptimeTimelineCanvas, {
     days: 7,
     clusters: _timelineCache.clusters,
     analyzedIds: _timelineCache.analyzed_ids,
     titles: _timelineCache.titles || {},
     monitorStartedAt: _timelineCache.monitor_started_at,
+    monitorGaps: _timelineCache.monitor_gaps || [],
     onIncidentClick: onTimelineClick,
+    kindFilter: _kindFilter,
+    dismissedClusterIds: dismissedSet,
+    showDismissed: _showDismissed,
   });
 }
 async function refreshTimeline() {
@@ -3317,7 +4351,480 @@ setInterval(poll, 2000);
 // Timeline refreshes less often; outages don't change every 2 seconds.
 refreshTimeline();
 setInterval(refreshTimeline, 30000);
+
+// ── Per-site ping history modal ───────────────────────────────
+function _siteCss(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+// ── Site-modal layer toggles (persistent across all sites) ────
+// Layer keys:
+//   band        — per-bin p10–p90 fill (off by default; was previously the
+//                 default but noisy at short bin widths)
+//   mean        — per-bin mean (white line)
+//   threshold   — pool P10–P90 horizontal band (the "OK zone" tonight)
+//   threshold_p99 — pool P99 horizontal line (the POOR threshold)
+//   slow_zone   — yellow shading where bin-mean > pool P90 (SLOW)
+//   poor_zone   — orange shading where bin-mean > pool P99 (POOR)
+//   outliers    — red dots for raw spikes above the in-window p99/2×p90
+//   noresp      — red ✕ marks for null samples (no response)
+//   outage      — red bands for sustained unreachable runs
+const SITE_LAYER_KEYS = ['band', 'mean', 'threshold', 'threshold_p99',
+                         'slow_zone', 'poor_zone',
+                         'outliers', 'noresp', 'outage'];
+const SITE_LAYER_DEFAULT_OFF = ['band'];
+const SITE_LAYER_STORAGE_KEY = 'siteModalLayersOff_v2';
+function _loadSiteLayersOff() {
+  const off = new Set();
+  try {
+    const raw = localStorage.getItem(SITE_LAYER_STORAGE_KEY);
+    if (raw !== null) {
+      JSON.parse(raw).forEach(k => off.add(k));
+    } else {
+      // First-time defaults reflect the new layer set: hide the per-bin
+      // band in favor of the pool-threshold reference.
+      SITE_LAYER_DEFAULT_OFF.forEach(k => off.add(k));
+    }
+  } catch (e) {}
+  return off;
+}
+function _saveSiteLayersOff(off) {
+  try { localStorage.setItem(SITE_LAYER_STORAGE_KEY, JSON.stringify([...off])); }
+  catch (e) {}
+}
+let _siteLayersOff = _loadSiteLayersOff();
+let _siteModalData = null;
+function isSiteLayerOn(key) { return !_siteLayersOff.has(key); }
+function refreshSiteLegendStrikes() {
+  document.querySelectorAll('.site-modal-legend > span[data-layer]').forEach(el => {
+    const k = el.dataset.layer;
+    el.classList.toggle('layer-off', !isSiteLayerOn(k));
+  });
+}
+// Document-level delegation so the listener works even though the modal
+// is hidden until first opened.
+document.addEventListener('click', (evt) => {
+  const lg = evt.target.closest('.site-modal-legend > span[data-layer]');
+  if (!lg) return;
+  evt.stopPropagation();   // don't bubble into the tile/overlay handlers
+  const k = lg.dataset.layer;
+  if (_siteLayersOff.has(k)) _siteLayersOff.delete(k);
+  else                        _siteLayersOff.add(k);
+  _saveSiteLayersOff(_siteLayersOff);
+  refreshSiteLegendStrikes();
+  if (_siteModalData) paintSiteHistory(_siteModalData);
+});
+
+async function openSiteModal(host) {
+  const overlay = document.getElementById('site-modal-overlay');
+  const titleEl = document.getElementById('site-modal-title');
+  const subEl = document.getElementById('site-modal-sub');
+  const statsEl = document.getElementById('site-modal-stats');
+  titleEl.textContent = host;
+  subEl.textContent = 'Loading…';
+  statsEl.innerHTML = '';
+  overlay.style.display = 'flex';
+  // Clear any prior canvas paint to avoid flashes of stale data.
+  const canvas = document.getElementById('site-modal-canvas');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  try {
+    // hours intentionally omitted → server auto-selects: 24h primary,
+    // falls back to 7d when 24h has too few samples (matches the site-tile
+    // verdict baseline). This stabilizes the p10–p90 band on quiet sites.
+    const resp = await fetch('/api/site_history?host=' + encodeURIComponent(host));
+    if (!resp.ok) throw new Error('http ' + resp.status);
+    const data = await resp.json();
+    titleEl.textContent = data.name + (data.name !== data.host ? '  (' + data.host + ')' : '');
+    const ps = data.ping_stats || {};
+    const parts = [];
+    parts.push('reachable <strong>' + (data.reachable_pct != null ? data.reachable_pct + '%' : '—') + '</strong>');
+    if (ps.p50 != null) parts.push('median <strong>' + ps.p50 + ' ms</strong>');
+    if (ps.p10 != null && ps.p90 != null) parts.push('p10–p90 <strong>' + ps.p10 + '–' + ps.p90 + ' ms</strong>');
+    const winLabel = data.hours >= 48 ? Math.round(data.hours / 24) + 'd' : data.hours + 'h';
+    const winNote = data.auto_window && data.hours !== data.primary_hours
+      ? ' <span style="color:var(--dim)">(extended from ' + data.primary_hours + 'h)</span>' : '';
+    parts.push('<strong>' + (data.samples ? data.samples.length : 0) + '</strong> samples · last ' + winLabel + winNote);
+    const ptd = data.pool_thresholds || {};
+    if (ptd.great_ms != null) {
+      parts.push('pool <strong>P10 ' + ptd.great_ms + ' / P90 ' + ptd.slow_ms + ' / P99 ' + ptd.poor_ms + '</strong> ms');
+    }
+    subEl.innerHTML = parts.join(' &nbsp;·&nbsp; ');
+    _siteModalData = data;
+    refreshSiteLegendStrikes();
+    paintSiteHistory(data);
+  } catch (e) {
+    subEl.textContent = 'Failed to load: ' + e.message;
+  }
+}
+
+function closeSiteModal() {
+  const overlay = document.getElementById('site-modal-overlay');
+  overlay.style.display = 'none';
+}
+
+function paintSiteHistory(data) {
+  const canvas = document.getElementById('site-modal-canvas');
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth;
+  const cssH = canvas.clientHeight;
+  if (cssW <= 0 || cssH <= 0) return;
+  canvas.width = Math.floor(cssW * dpr);
+  canvas.height = Math.floor(cssH * dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const C = {
+    text: _siteCss('--text'),  dim: _siteCss('--dim'),
+    border: _siteCss('--border'), green: _siteCss('--green'),
+    red: _siteCss('--red'), cyan: _siteCss('--cyan'),
+  };
+
+  const ML = 42, MR = 12, MT = 10, MB = 22;
+  const W = cssW - ML - MR;
+  const H = cssH - MT - MB;
+  if (W <= 10 || H <= 20) return;
+
+  const samples = data.samples || [];
+  if (!samples.length) {
+    ctx.fillStyle = C.dim;
+    ctx.font = '12px ui-monospace, monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('No samples in window', cssW / 2, cssH / 2);
+    return;
+  }
+
+  const t0 = new Date(samples[0][0]).getTime();
+  const t1 = new Date(samples[samples.length - 1][0]).getTime();
+  const span = Math.max(1, t1 - t0);
+  const xOf = (ms) => ML + ((ms - t0) / span) * W;
+
+  // Pool thresholds — drawn as horizontal reference lines + drive the
+  // SLOW/POOR shading. Same data that powers the GREAT/OK/SLOW/POOR tile.
+  const pool = data.pool_thresholds || {};
+  const poolP10 = pool.great_ms;   // edge of GREAT
+  const poolP90 = pool.slow_ms;    // edge of SLOW
+  const poolP99 = pool.poor_ms;    // edge of POOR
+
+  // Y scale: include the pool thresholds so they're never clipped, plus
+  // the in-window p99 (or p90 if outliers hidden) so the chart fits the
+  // visible data without leaving wasted headroom.
+  const pings = samples.map(s => s[1]).filter(v => v != null && isFinite(v));
+  let yMax = 100;
+  const yMaxCandidates = [];
+  if (pings.length) {
+    const sorted = [...pings].sort((a, b) => a - b);
+    const useTop = isSiteLayerOn('outliers') ? 0.99 : 0.90;
+    yMaxCandidates.push(sorted[Math.floor(useTop * (sorted.length - 1))]);
+  }
+  if (isSiteLayerOn('threshold_p99') && poolP99 != null) yMaxCandidates.push(poolP99);
+  if (isSiteLayerOn('threshold')     && poolP90 != null) yMaxCandidates.push(poolP90);
+  if (yMaxCandidates.length) {
+    yMax = Math.max(100, Math.ceil(Math.max(...yMaxCandidates) * 1.15 / 50) * 50);
+  }
+  const yOf = (ms) => MT + H - (Math.min(Math.max(0, ms), yMax) / yMax) * H;
+
+  // ── Bin samples first so we can shade SLOW/POOR zones alongside the
+  // outage tints. Aim for ~80 bins across the chart width.
+  const N_BINS = Math.min(120, Math.max(20, Math.floor(W / 6)));
+  const binSpan = span / N_BINS;
+  const bins = [];   // each: { t, vals: [..], p10, p50, p90, mean }
+  for (let i = 0; i < N_BINS; i++) bins.push({ t: t0 + (i + 0.5) * binSpan, vals: [] });
+  samples.forEach(([ts, v]) => {
+    if (v == null) return;
+    const idx = Math.min(N_BINS - 1, Math.floor((new Date(ts).getTime() - t0) / binSpan));
+    if (idx >= 0) bins[idx].vals.push(v);
+  });
+  function _pctOf(sorted, q) {
+    if (!sorted.length) return null;
+    if (sorted.length === 1) return sorted[0];
+    const idx = q / 100 * (sorted.length - 1);
+    const lo = Math.floor(idx), hi = Math.min(lo + 1, sorted.length - 1);
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+  }
+  bins.forEach(b => {
+    if (!b.vals.length) { b.p10 = b.p50 = b.p90 = b.mean = null; return; }
+    const s = [...b.vals].sort((a, b) => a - b);
+    b.p10  = _pctOf(s, 10);
+    b.p50  = _pctOf(s, 50);
+    b.p90  = _pctOf(s, 90);
+    b.mean = b.vals.reduce((a, c) => a + c, 0) / b.vals.length;
+  });
+
+  // ── SLOW / POOR zone shading: contiguous runs of >=2 bins where the
+  // bin-mean is above the corresponding pool threshold. Yellow = SLOW
+  // (above pool P90), orange = POOR (above pool P99). Distinct from the
+  // red "unreachable" outage bands (those are reachability events). When
+  // POOR overlaps SLOW, POOR wins (drawn second).
+  function shadeRuns(threshold, color, minRunBins, layerKey) {
+    if (!isSiteLayerOn(layerKey) || threshold == null) return;
+    let runStart = -1;
+    const closeRun = (endIdx) => {
+      if (runStart < 0) return;
+      const runLen = endIdx - runStart;
+      if (runLen >= minRunBins) {
+        const tStart = bins[runStart].t - binSpan / 2;
+        const tEnd   = bins[endIdx - 1].t + binSpan / 2;
+        const x0 = Math.max(ML, xOf(tStart));
+        const x1 = Math.min(ML + W, xOf(tEnd));
+        if (x1 > x0) {
+          ctx.fillStyle = color;
+          ctx.fillRect(x0, MT, x1 - x0, H);
+        }
+      }
+      runStart = -1;
+    };
+    bins.forEach((b, i) => {
+      const above = b.mean != null && b.mean > threshold;
+      if (above) { if (runStart < 0) runStart = i; }
+      else       { closeRun(i); }
+    });
+    closeRun(bins.length);
+  }
+  shadeRuns(poolP90, 'rgba(210,153,34,0.16)', 2, 'slow_zone');  // SLOW
+  shadeRuns(poolP99, 'rgba(247,140,55,0.22)', 2, 'poor_zone');  // POOR
+
+  // Outage tints (red bands for periods when site was unreachable).
+  if (isSiteLayerOn('outage')) {
+    (data.outages || []).forEach(o => {
+      const sMs = new Date(o.start).getTime();
+      const eMs = o.end ? new Date(o.end).getTime() : t1;
+      const x0 = Math.max(ML, xOf(Math.max(t0, sMs)));
+      const x1 = Math.min(ML + W, xOf(Math.min(t1, eMs)));
+      if (x1 <= x0) return;
+      ctx.fillStyle = 'rgba(248,81,73,0.18)';
+      ctx.fillRect(x0, MT, x1 - x0, H);
+    });
+  }
+
+  // Y gridlines + labels.
+  ctx.strokeStyle = C.border;
+  ctx.font = '9px ui-monospace, monospace';
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  for (let i = 0; i <= 4; i++) {
+    const v = (yMax / 4) * i;
+    const y = yOf(v);
+    ctx.beginPath();
+    ctx.moveTo(ML, y); ctx.lineTo(ML + W, y);
+    ctx.globalAlpha = i === 0 ? 0.6 : 0.2;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = C.dim;
+    ctx.fillText(Math.round(v) + 'ms', ML - 4, y);
+  }
+
+  // X tick labels.
+  const spanMin = span / 60000;
+  const stepMin = spanMin <= 60 ? 10 : spanMin <= 360 ? 60 : spanMin <= 720 ? 120 : 180;
+  const stepMs = stepMin * 60000;
+  let firstTick = Math.ceil(t0 / stepMs) * stepMs;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillStyle = C.dim;
+  for (let tx = firstTick; tx <= t1; tx += stepMs) {
+    const x = xOf(tx);
+    if (x < ML || x > ML + W) continue;
+    const d = new Date(tx);
+    ctx.fillText(String(d.getHours()).padStart(2, '0') + ':' +
+                 String(d.getMinutes()).padStart(2, '0'),
+                 x, MT + H + 4);
+  }
+
+  // ── Pool threshold reference lines — horizontal lines at pool P10,
+  // P90, P99. These are the verdict thresholds: a site whose recent p50
+  // sits in the band [P10, P90] is OK; above P90 it's SLOW; above P99 it's
+  // POOR. Drawn in the same teal family as the per-bin band so the user
+  // can see at a glance "where do I sit relative to the rest?"
+  if (isSiteLayerOn('threshold') && poolP10 != null && poolP90 != null) {
+    ctx.save();
+    // Light cyan filled band between P10 and P90.
+    const yTop = yOf(poolP90), yBot = yOf(poolP10);
+    if (yBot > yTop) {
+      ctx.fillStyle = 'rgba(57,197,207,0.10)';
+      ctx.fillRect(ML, yTop, W, yBot - yTop);
+    }
+    // Dashed P10 + P90 lines.
+    ctx.strokeStyle = 'rgba(57,197,207,0.55)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    [poolP10, poolP90].forEach(v => {
+      const y = yOf(v);
+      ctx.beginPath();
+      ctx.moveTo(ML, y); ctx.lineTo(ML + W, y);
+      ctx.stroke();
+    });
+    ctx.setLineDash([]);
+    // Right-edge labels.
+    ctx.fillStyle = 'rgba(57,197,207,0.85)';
+    ctx.font = '9px ui-monospace, monospace';
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    ctx.fillText('pool P90 ' + Math.round(poolP90) + 'ms', ML + W - 2, yOf(poolP90) - 1);
+    ctx.textBaseline = 'top';
+    ctx.fillText('pool P10 ' + Math.round(poolP10) + 'ms', ML + W - 2, yOf(poolP10) + 1);
+    ctx.restore();
+  }
+  if (isSiteLayerOn('threshold_p99') && poolP99 != null) {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(248,81,73,0.65)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 4]);
+    const y = yOf(poolP99);
+    ctx.beginPath();
+    ctx.moveTo(ML, y); ctx.lineTo(ML + W, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(248,81,73,0.85)';
+    ctx.font = '9px ui-monospace, monospace';
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    ctx.fillText('pool P99 ' + Math.round(poolP99) + 'ms', ML + W - 2, y - 1);
+    ctx.restore();
+  }
+
+  // ── Per-bin p10–p90 band (off by default; opt-in via legend). ──
+  if (isSiteLayerOn('band')) {
+    const BAND_FILL = 'rgba(57,197,207,0.28)';
+    let seg = [];
+    function flushBand(seg) {
+      if (seg.length < 2) return;
+      ctx.beginPath();
+      ctx.moveTo(xOf(seg[0].t), yOf(seg[0].p90));
+      for (let i = 1; i < seg.length; i++) ctx.lineTo(xOf(seg[i].t), yOf(seg[i].p90));
+      for (let i = seg.length - 1; i >= 0; i--) ctx.lineTo(xOf(seg[i].t), yOf(seg[i].p10));
+      ctx.closePath();
+      ctx.fillStyle = BAND_FILL;
+      ctx.fill();
+    }
+    bins.forEach(b => {
+      if (b.p50 == null) { flushBand(seg); seg = []; return; }
+      seg.push(b);
+    });
+    flushBand(seg);
+  }
+
+  // ── Mean line on top of the band.
+  if (isSiteLayerOn('mean')) {
+    ctx.strokeStyle = C.text;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    let drawing = false;
+    bins.forEach(b => {
+      if (b.mean == null) { drawing = false; return; }
+      const x = xOf(b.t), y = yOf(b.mean);
+      if (!drawing) { ctx.moveTo(x, y); drawing = true; }
+      else          { ctx.lineTo(x, y); }
+    });
+    ctx.stroke();
+  }
+
+  // ── Outlier dots (raw samples above the in-window p99 / 2× p90). ──
+  // Drawn at the sample's actual y position so they sit above the band,
+  // matching the diagnose-page ping-spike style.
+  let outlierThreshold = null;
+  if (pings.length >= 20) {
+    const sorted = [...pings].sort((a, b) => a - b);
+    const p99 = sorted[Math.floor(0.99 * (sorted.length - 1))];
+    const p90 = sorted[Math.floor(0.90 * (sorted.length - 1))];
+    outlierThreshold = Math.max(p99, p90 * 2);
+  }
+  if (outlierThreshold != null && isSiteLayerOn('outliers')) {
+    ctx.save();
+    ctx.fillStyle = C.red;
+    ctx.strokeStyle = C.text;
+    ctx.lineWidth = 0.75;
+    samples.forEach(([ts, v]) => {
+      if (v == null || v < outlierThreshold) return;
+      const x = xOf(new Date(ts).getTime()), y = yOf(v);
+      ctx.beginPath();
+      ctx.arc(x, y, 2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
+
+  // ── No-response ✕ marks at the bottom of the chart. ──
+  // One ✕ per contiguous run of null samples, positioned at the run's
+  // start. Avoids cluttering long unreachable stretches with hundreds of
+  // overlapping marks while still flagging every transition into "no
+  // response" state.
+  if (isSiteLayerOn('noresp')) {
+    ctx.save();
+    ctx.strokeStyle = C.red;
+    ctx.lineWidth = 1.4;
+    const noRespY = MT + H - 4;
+    let inRun = false;
+    samples.forEach(([ts, v]) => {
+      if (v == null) {
+        if (!inRun) {
+          const x = xOf(new Date(ts).getTime());
+          if (x >= ML && x <= ML + W) {
+            ctx.beginPath();
+            ctx.moveTo(x - 3, noRespY - 3); ctx.lineTo(x + 3, noRespY + 3);
+            ctx.moveTo(x + 3, noRespY - 3); ctx.lineTo(x - 3, noRespY + 3);
+            ctx.stroke();
+          }
+          inRun = true;
+        }
+      } else {
+        inRun = false;
+      }
+    });
+    ctx.restore();
+  }
+}
+
+// All handlers below use delegation on document so they don't depend on the
+// referenced elements existing at script-evaluation time. (The site-matrix
+// is rendered async after the first /api/state poll, and the modal overlay
+// HTML lives outside this script block — both can be missing when this
+// code first runs.)
+// (NB: do not put a literal closing-script tag in a comment here — the HTML
+// parser will end the script element early, silently breaking everything.)
+document.addEventListener('click', (evt) => {
+  // Site tile click → open per-site ping history modal.
+  const tile = evt.target.closest('.site-tile');
+  if (tile) {
+    const host = tile.dataset.host;
+    if (host) openSiteModal(host);
+    return;
+  }
+  // Click on the dim modal background → close.
+  if (evt.target.id === 'site-modal-overlay') closeSiteModal();
+});
+document.addEventListener('keydown', (evt) => {
+  if (evt.key === 'Escape') closeSiteModal();
+});
 </script>
+
+<!-- Per-site ping-history modal (hidden by default) -->
+<div id="site-modal-overlay" class="site-modal-overlay" style="display:none">
+  <div class="site-modal">
+    <div class="site-modal-head">
+      <div>
+        <div class="site-modal-title" id="site-modal-title">—</div>
+        <div class="site-modal-sub" id="site-modal-sub"></div>
+      </div>
+      <button class="site-modal-close" onclick="closeSiteModal()" aria-label="Close">×</button>
+    </div>
+    <div class="site-modal-canvas-wrap">
+      <canvas id="site-modal-canvas"></canvas>
+    </div>
+    <div class="site-modal-stats" id="site-modal-stats"></div>
+    <div class="site-modal-legend" title="Click a legend entry to toggle that layer (saved across sites)">
+      <span data-layer="threshold"><span style="background:rgba(57,197,207,0.10);border:1px dashed rgba(57,197,207,0.55);display:inline-block;width:14px;height:8px;border-radius:1px"></span> pool P10–P90</span>
+      <span data-layer="threshold_p99"><span style="border-top:1px dashed rgba(248,81,73,0.85);display:inline-block;width:14px;height:0"></span> pool P99</span>
+      <span data-layer="mean"><span style="color:var(--text)">─</span> mean</span>
+      <span data-layer="slow_zone"><span style="background:rgba(210,153,34,0.16);display:inline-block;width:14px;height:8px;border-radius:1px"></span> SLOW (mean &gt; P90)</span>
+      <span data-layer="poor_zone"><span style="background:rgba(247,140,55,0.22);display:inline-block;width:14px;height:8px;border-radius:1px"></span> POOR (mean &gt; P99)</span>
+      <span data-layer="band"><span style="background:rgba(57,197,207,0.28);display:inline-block;width:14px;height:8px;border-radius:1px"></span> per-bin p10–p90</span>
+      <span data-layer="outliers"><span class="lg-spike"></span> high-ping outlier</span>
+      <span data-layer="noresp"><span class="lg-cross"></span> no response</span>
+      <span data-layer="outage"><span style="background:rgba(248,81,73,0.4);display:inline-block;width:14px;height:8px;border-radius:1px"></span> sustained unreachable</span>
+    </div>
+  </div>
+</div>
 </body>
 </html>
 """
@@ -3697,6 +5204,20 @@ header {
 .sev-SEVERE   { color: var(--red); }
 .sev-ERROR    { color: var(--red); }
 .sev-UNKNOWN  { color: var(--dim); }
+.history-item.dismissed { opacity: 0.55; }
+.history-item.dismissed .title { text-decoration: line-through; }
+.dismissed-tag {
+  margin-left: 6px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--dim);
+  background: rgba(139,148,158,0.18);
+  border: 1px solid rgba(139,148,158,0.35);
+  padding: 1px 4px;
+  border-radius: 3px;
+  text-transform: uppercase;
+}
 
 #detail-empty { color: var(--dim); font-size: 12px; padding: 16px; text-align: center; }
 #detail-meta { color: var(--dim); font-size: 11px; margin-bottom: 16px; }
@@ -3787,6 +5308,21 @@ header {
   font-size: 10px;
   color: var(--dim);
 }
+.diag-chart-legend > span[data-layer] {
+  cursor: pointer;
+  user-select: none;
+  border-radius: 3px;
+  padding: 1px 3px;
+  margin: -1px -3px;
+  transition: opacity 0.15s, background 0.15s;
+}
+.diag-chart-legend > span[data-layer]:hover {
+  background: rgba(255,255,255,0.04);
+}
+.diag-chart-legend > span[data-layer].layer-off {
+  opacity: 0.35;
+  text-decoration: line-through;
+}
 .diag-chart-legend > span {
   display: inline-flex;
   align-items: center;
@@ -3805,6 +5341,41 @@ header {
   display: inline-block;
   width: 16px; height: 8px;
   border-radius: 1px;
+}
+.lg-dotted {
+  display: inline-block;
+  width: 18px; height: 0;
+  border-top: 1.5px dashed var(--text);
+  vertical-align: middle;
+  opacity: 0.7;
+}
+.lg-cross {
+  display: inline-block;
+  width: 10px; height: 10px;
+  position: relative;
+}
+.lg-cross::before, .lg-cross::after {
+  content: ''; position: absolute;
+  left: 50%; top: 0;
+  width: 1.4px; height: 100%;
+  background: var(--red);
+  transform-origin: center;
+}
+.lg-cross::before { transform: translateX(-50%) rotate(45deg); }
+.lg-cross::after  { transform: translateX(-50%) rotate(-45deg); }
+.lg-tri {
+  display: inline-block;
+  width: 0; height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 7px solid #39c5cf;
+}
+.lg-spike {
+  display: inline-block;
+  width: 6px; height: 6px;
+  background: var(--red);
+  border: 1px solid var(--text);
+  border-radius: 50%;
 }
 .diag-delete-btn {
   background: var(--bg);
@@ -3826,6 +5397,75 @@ header {
   background: rgba(248,81,73,0.08);
 }
 .diag-delete-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Kind-filter toggles next to the timeline title */
+.kind-filter {
+  display: inline-flex;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--dim);
+  font-weight: normal;
+  letter-spacing: 0.02em;
+}
+.kind-filter label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.kind-filter input[type="checkbox"] {
+  accent-color: var(--blue);
+  margin: 0;
+  cursor: pointer;
+}
+
+/* Analysis-in-progress modal — front and center while a new diagnosis is
+   running. Auto-closes on completion. */
+.diag-run-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.65);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 200;
+  backdrop-filter: blur(2px);
+}
+.diag-run-modal {
+  background: var(--card);
+  border: 1px solid var(--magenta);
+  border-radius: 8px;
+  padding: 24px 28px;
+  width: min(440px, 90vw);
+  text-align: center;
+  box-shadow: 0 8px 32px rgba(188,140,255,0.25);
+}
+.diag-run-spinner {
+  display: inline-block;
+  width: 36px; height: 36px;
+  border: 3px solid rgba(188,140,255,0.18);
+  border-top-color: var(--magenta);
+  border-radius: 50%;
+  animation: diag-spin 0.9s linear infinite;
+  margin-bottom: 14px;
+}
+@keyframes diag-spin { to { transform: rotate(360deg); } }
+.diag-run-title {
+  font-size: 14px; font-weight: 600; color: var(--text);
+  margin-bottom: 6px;
+}
+.diag-run-target {
+  font-size: 12px; color: var(--magenta);
+  margin-bottom: 4px; word-break: break-word;
+}
+.diag-run-status {
+  font-size: 11px; color: var(--dim);
+  letter-spacing: 0.02em;
+  font-family: ui-monospace, 'SF Mono', monospace;
+}
+.diag-run-elapsed {
+  font-size: 10px; color: var(--dim);
+  margin-top: 8px;
+  font-variant-numeric: tabular-nums;
+}
 
 .analyzed-strip {
   margin-top: 6px;
@@ -3898,11 +5538,16 @@ header {
 </header>
 
 <div class="card" id="timeline-card" style="margin-bottom:12px">
-  <div class="card-title" style="display:flex;justify-content:space-between;align-items:baseline">
+  <div class="card-title" style="display:flex;justify-content:space-between;align-items:baseline;gap:14px;flex-wrap:wrap">
     <span>30-day Uptime Timeline</span>
-    <span id="timeline-stats" style="color:var(--dim);font-size:11px;font-weight:normal"></span>
+    <span class="kind-filter">
+      <label><input type="checkbox" data-kind="slow" checked> slow</label>
+      <label><input type="checkbox" data-kind="site_loss" checked> site loss</label>
+      <label><input type="checkbox" data-show-dismissed> show dismissed</label>
+    </span>
+    <span id="timeline-stats" style="color:var(--dim);font-size:11px;font-weight:normal;margin-left:auto"></span>
   </div>
-  <div style="height:160px;position:relative">
+  <div style="height:240px;position:relative">
     <canvas id="timelineCanvas" style="width:100%;height:100%"></canvas>
   </div>
   <div style="color:var(--dim);font-size:10px;margin-top:6px;display:flex;gap:14px;flex-wrap:wrap">
@@ -3926,9 +5571,12 @@ header {
 
   <!-- Right: Detail -->
   <div class="card" id="detail-card">
-    <div class="card-title" id="detail-title-bar" style="display:flex;justify-content:space-between;align-items:center">
+    <div class="card-title" id="detail-title-bar" style="display:flex;justify-content:space-between;align-items:center;gap:6px">
       <span>Diagnosis</span>
-      <button id="diag-delete-btn" class="diag-delete-btn" style="display:none" title="Delete this diagnosis (cluster becomes re-runnable)">Delete</button>
+      <span style="display:flex;gap:6px">
+        <button id="diag-dismiss-btn" class="diag-delete-btn" style="display:none" title="Hide this incident from the timeline + history (toggle on the 'show dismissed' filter to see it again)">Dismiss</button>
+        <button id="diag-delete-btn" class="diag-delete-btn" style="display:none" title="Delete this diagnosis (cluster becomes re-runnable)">Delete</button>
+      </span>
     </div>
     <div id="detail-empty">No diagnosis selected. Run a new one or pick from history.</div>
     <div id="detail-body" style="display:none">
@@ -3942,14 +5590,19 @@ header {
           <canvas id="diag-chart"></canvas>
           <div id="diag-chart-tooltip" class="diag-chart-tooltip"></div>
         </div>
-        <div class="diag-chart-legend">
-          <span><span class="lg-swatch" style="background:rgba(63,185,80,0.18)"></span>normal</span>
-          <span><span class="lg-swatch" style="background:rgba(210,153,34,0.22)"></span>degraded</span>
-          <span><span class="lg-swatch" style="background:rgba(57,197,207,0.18)"></span>site loss</span>
-          <span><span class="lg-swatch" style="background:rgba(248,81,73,0.28)"></span>outage</span>
-          <span><span class="lg-band" style="background:rgba(57,197,207,0.18);border-top:1.5px solid var(--cyan);border-bottom:1.5px solid var(--cyan)"></span>ping p10–p90 / median (ms · left)</span>
-          <span><span class="lg-dot" style="background:var(--magenta)"></span>speed test (Mbps · right)</span>
-          <span><span class="lg-vline"></span>event marker</span>
+        <div class="diag-chart-legend" id="diag-chart-legend">
+          <span data-layer="bg_normal" title="Click to toggle — green normal-period background"><span class="lg-swatch" style="background:rgba(63,185,80,0.18)"></span>normal</span>
+          <span data-layer="bg_degraded" title="Click to toggle"><span class="lg-swatch" style="background:rgba(210,153,34,0.22)"></span>degraded</span>
+          <span data-layer="bg_site_loss" title="Click to toggle"><span class="lg-swatch" style="background:rgba(57,197,207,0.18)"></span>site loss</span>
+          <span data-layer="bg_outage" title="Click to toggle"><span class="lg-swatch" style="background:rgba(248,81,73,0.28)"></span>outage</span>
+          <span data-layer="ping_band" title="Click to toggle"><span class="lg-band" style="background:rgba(57,197,207,0.28)"></span>ping p10–p90 (ms · left)</span>
+          <span data-layer="dl_dots" title="Click to toggle"><span class="lg-dot" style="background:#58a6ff"></span>↓ download (Mbps · right)</span>
+          <span data-layer="ul_dots" title="Click to toggle"><span class="lg-dot" style="background:#3fb950"></span>↑ upload (Mbps · right)</span>
+          <span data-layer="threshold_line" title="Click to toggle"><span class="lg-dotted"></span>7d-P10 / high-ping threshold (event boundary)</span>
+          <span data-layer="failed_speedtest" title="Click to toggle"><span class="lg-cross"></span>primary speedtest failed (Ookla unreachable)</span>
+          <span data-layer="site_outage_marks" title="Click to toggle"><span class="lg-tri"></span>per-site outage</span>
+          <span data-layer="ping_spikes" title="Click to toggle"><span class="lg-spike"></span>ping spike (outlier)</span>
+          <span data-layer="event_markers" title="Click to toggle"><span class="lg-vline"></span>event marker</span>
         </div>
       </div>
       <div id="detail-error"></div>
@@ -4018,6 +5671,22 @@ function renderAnalyzedStrip(s) {
     routerPart = dim('router events', s.router_events) +
                  ' &nbsp;·&nbsp; ' + dim('DNS-probe drops', s.dns_probe_drops);
   }
+  // Window + upload size — proves what was actually sent to the model.
+  // Window is the analyzed slice; uploaded_bytes is the JSON payload after
+  // summarization (router events are histogrammed; only top 30 DNS-probe
+  // drop samples are sent verbatim — never the raw event list).
+  let windowPart = '';
+  if (s.window_start && s.window_end) {
+    const ws = String(s.window_start).slice(0, 16).replace('T', ' ');
+    const we = String(s.window_end).slice(0, 16).replace('T', ' ');
+    windowPart = '<div style="margin-top:2px;color:var(--dim)"><span class="analyzed-label">Uploaded:</span> '
+      + 'window <strong>' + ws + ' → ' + we + '</strong>';
+    if (s.uploaded_bytes != null) {
+      const kb = (s.uploaded_bytes / 1024).toFixed(1);
+      windowPart += ' &nbsp;·&nbsp; payload <strong>' + kb + ' KB</strong>';
+    }
+    windowPart += '</div>';
+  }
   return '<div class="analyzed-strip">'
     + '<span class="analyzed-label">Analyzed:</span> '
     + dim('outages', s.outages)
@@ -4025,6 +5694,7 @@ function renderAnalyzedStrip(s) {
     + ' &nbsp;·&nbsp; ' + dim('speed tests', s.speed_tests)
     + ' &nbsp;·&nbsp; ' + dim('sites', s.sites_checked)
     + ' &nbsp;·&nbsp; ' + routerPart
+    + windowPart
     + '</div>';
 }
 
@@ -4047,12 +5717,19 @@ function eventIsoOf(d) {
 function renderHistory() {
   const container = document.getElementById('history');
   container.innerHTML = '';
-  if (history.length === 0) {
-    container.innerHTML = '<div style="color:var(--dim);font-size:12px">No diagnoses yet. Run one to start.</div>';
+  // Hide dismissed diagnoses unless the "show dismissed" toggle is on.
+  const visible = (typeof _showDismissed !== 'undefined' && _showDismissed)
+    ? history
+    : history.filter(d => !d.dismissed);
+  if (visible.length === 0) {
+    const msg = history.length === 0
+      ? 'No diagnoses yet. Run one to start.'
+      : 'All diagnoses are dismissed. Toggle "show dismissed" above to view.';
+    container.innerHTML = '<div style="color:var(--dim);font-size:12px">' + msg + '</div>';
     return;
   }
   let lastDay = null;
-  history.forEach(d => {
+  visible.forEach(d => {
     const eventIso = eventIsoOf(d);
     const day = fmtDay(eventIso);
     if (day !== lastDay) {
@@ -4063,18 +5740,22 @@ function renderHistory() {
       lastDay = day;
     }
     const item = document.createElement('div');
-    item.className = 'history-item' + (d.id === selectedId ? ' selected' : '');
+    item.className = 'history-item'
+      + (d.id === selectedId ? ' selected' : '')
+      + (d.dismissed ? ' dismissed' : '');
     const sev = severityOf(d);
     const t = (eventIso || '').slice(11, 16) || '—';
     const title = (d.result && d.result.title) ? d.result.title : null;
     const titleRow = title
       ? '<div class="title">' + escapeHtml(title) + '</div>'
       : '';
+    const dismissedTag = d.dismissed
+      ? '<span class="dismissed-tag" title="dismissed">dismissed</span>' : '';
     item.innerHTML =
       titleRow +
       '<div class="row1"><span class="time">' + t + '</span>' +
       '<span class="window">' + (d.window || '?') + '</span></div>' +
-      '<div class="severity sev-' + sev + '">' + sev + '</div>';
+      '<div class="severity sev-' + sev + '">' + sev + dismissedTag + '</div>';
     item.addEventListener('click', () => selectDiagnosis(d.id));
     container.appendChild(item);
   });
@@ -4085,6 +5766,9 @@ function selectDiagnosis(id) {
   const d = history.find(x => x.id === id);
   renderHistory();
   renderDetail(d);
+  // Refresh the timeline highlight so the yellow outline + popover move
+  // to whichever cluster matches this diagnosis.
+  if (typeof paintTimeline === 'function') paintTimeline();
 }
 
 function renderDetail(diag) {
@@ -4096,6 +5780,8 @@ function renderDetail(diag) {
     empty.style.display = 'block';
     body.style.display = 'none';
     if (delBtn) delBtn.style.display = 'none';
+    const dismissBtn0 = document.getElementById('diag-dismiss-btn');
+    if (dismissBtn0) dismissBtn0.style.display = 'none';
     renderDiagChart(null);
     return;
   }
@@ -4105,6 +5791,20 @@ function renderDetail(diag) {
   if (delBtn) {
     delBtn.style.display = 'inline-block';
     delBtn.dataset.id = diag.id || '';
+  }
+  // Dismiss button — only meaningful when the diagnosis is tied to a
+  // specific cluster (outage_id). Window-based diagnoses (1h/24h) don't
+  // have a cluster to hide.
+  const dismissBtn = document.getElementById('diag-dismiss-btn');
+  if (dismissBtn) {
+    if (diag.outage_id) {
+      dismissBtn.style.display = 'inline-block';
+      dismissBtn.dataset.outageId = diag.outage_id;
+      dismissBtn.dataset.dismissed = diag.dismissed ? '1' : '0';
+      dismissBtn.textContent = diag.dismissed ? 'Restore' : 'Dismiss';
+    } else {
+      dismissBtn.style.display = 'none';
+    }
   }
   renderDiagChart(diag.chart_data || null);
 
@@ -4171,6 +5871,45 @@ function renderDetail(diag) {
 // ── Diagnosis chart ─────────────────────────────────────────────
 let _diagChartState = null;
 
+// Per-layer visibility — clicking a legend entry toggles the layer.
+// State persists in localStorage and is shared across reports + sessions.
+const DIAG_LAYER_KEYS = [
+  'bg_normal', 'bg_degraded', 'bg_site_loss', 'bg_outage',
+  'ping_band', 'dl_dots', 'ul_dots', 'threshold_line',
+  'failed_speedtest', 'site_outage_marks', 'ping_spikes', 'event_markers',
+];
+function loadDiagLayers() {
+  const off = new Set();
+  try {
+    const raw = localStorage.getItem('diagChartLayersOff');
+    if (raw) JSON.parse(raw).forEach(k => off.add(k));
+  } catch (e) {}
+  return off;
+}
+let _diagLayersOff = loadDiagLayers();
+function isLayerOn(key) { return !_diagLayersOff.has(key); }
+function saveDiagLayers() {
+  try { localStorage.setItem('diagChartLayersOff', JSON.stringify([..._diagLayersOff])); }
+  catch (e) {}
+}
+function refreshLegendStrikes() {
+  document.querySelectorAll('#diag-chart-legend > span[data-layer]').forEach(el => {
+    el.classList.toggle('layer-off', _diagLayersOff.has(el.dataset.layer));
+  });
+}
+// Wire legend clicks once at script load. paintDiagChart re-reads
+// _diagLayersOff at every paint, so toggles take effect immediately.
+document.addEventListener('click', (evt) => {
+  const span = evt.target.closest('#diag-chart-legend > span[data-layer]');
+  if (!span) return;
+  const key = span.dataset.layer;
+  if (_diagLayersOff.has(key)) _diagLayersOff.delete(key);
+  else                          _diagLayersOff.add(key);
+  saveDiagLayers();
+  refreshLegendStrikes();
+  if (_diagChartState) paintDiagChart();
+});
+
 function renderDiagChart(data) {
   const wrap = document.getElementById('diag-chart-wrap');
   if (!data || !data.window_start || !data.window_end) {
@@ -4228,13 +5967,23 @@ function paintDiagChart() {
   const span = Math.max(1, t1 - t0);
   const xOf = (ms) => ML + ((ms - t0) / span) * W;
 
-  // ── Y-scale (left): ping ms — derived from band p90 + speed pings ──
+  // ── Y-scale (left): ping ms — derived from band p90, speed pings, AND
+  // spike values. Without spike values, every spike clamps to the top
+  // edge ("solid red line" look on long windows).
   const bands = data.ping_bands || [];
+  // Y-scale pools — only include sources for layers that are currently
+  // visible, so toggling a layer off rescales the chart accordingly.
   const p50s = bands.map(b => b[2]).filter(v => v != null && isFinite(v));
-  const p90s = bands.map(b => b[3]).filter(v => v != null && isFinite(v));
-  const speedPings = (data.speed_series || [])
-    .map(s => s.ping).filter(v => v != null && isFinite(v));
-  const pingPool = p90s.concat(speedPings);
+  const p90s = isLayerOn('ping_band')
+    ? bands.map(b => b[3]).filter(v => v != null && isFinite(v))
+    : [];
+  const speedPings = (isLayerOn('dl_dots') || isLayerOn('ul_dots'))
+    ? (data.speed_series || []).map(s => s.ping).filter(v => v != null && isFinite(v))
+    : [];
+  const spikePings = isLayerOn('ping_spikes')
+    ? (data.ping_spikes || []).map(p => p[1]).filter(v => v != null && isFinite(v))
+    : [];
+  const pingPool = p90s.concat(speedPings, spikePings);
   let yMaxMs = 100;
   if (pingPool.length) {
     const sorted = [...pingPool].sort((a, b) => a - b);
@@ -4243,21 +5992,34 @@ function paintDiagChart() {
   }
   const yOfMs = (ms) => MT + H - (Math.min(Math.max(0, ms), yMaxMs) / yMaxMs) * H;
 
-  // ── Y-scale (right): speed Mbps — from speed_series dl values ──
+  // ── Y-scale (right): speed Mbps — from whichever of dl/ul is visible.
+  const speedPool = [];
+  if (isLayerOn('dl_dots')) {
+    (data.speed_series || []).forEach(s => {
+      if (s.dl != null && isFinite(s.dl)) speedPool.push(s.dl);
+    });
+  }
+  if (isLayerOn('ul_dots')) {
+    (data.speed_series || []).forEach(s => {
+      if (s.ul != null && isFinite(s.ul)) speedPool.push(s.ul);
+    });
+  }
+  // Keep dlVals around for the stats strip below.
   const dlVals = (data.speed_series || [])
     .map(s => s.dl).filter(v => v != null && isFinite(v));
   let yMaxMbps = 100;
-  if (dlVals.length) {
-    const m = Math.max(...dlVals);
-    // Round up to a nice scale.
+  if (speedPool.length) {
+    const m = Math.max(...speedPool);
     const step = m <= 50 ? 10 : m <= 200 ? 50 : m <= 500 ? 100 : 200;
     yMaxMbps = Math.max(step, Math.ceil(m * 1.1 / step) * step);
   }
   const yOfMbps = (mbps) => MT + H - (Math.min(Math.max(0, mbps), yMaxMbps) / yMaxMbps) * H;
 
-  // ── 1. Background bands ────────────────────────────────────────
-  ctx.fillStyle = BG_NORMAL;
-  ctx.fillRect(ML, MT, W, H);
+  // ── 1. Background bands (each layer-toggleable) ───────────────
+  if (isLayerOn('bg_normal')) {
+    ctx.fillStyle = BG_NORMAL;
+    ctx.fillRect(ML, MT, W, H);
+  }
 
   function drawSpan(start, end, color) {
     if (!start) return;
@@ -4270,10 +6032,14 @@ function paintDiagChart() {
     ctx.fillRect(x0, MT, x1 - x0, H);
   }
   (data.degraded || []).forEach(d => {
-    const bg = (d.kind === 'site_loss') ? BG_SITE_LOSS : BG_DEGRADED;
-    drawSpan(d.start, d.end, bg);
+    const isSite = (d.kind === 'site_loss');
+    if (isSite && !isLayerOn('bg_site_loss')) return;
+    if (!isSite && !isLayerOn('bg_degraded')) return;
+    drawSpan(d.start, d.end, isSite ? BG_SITE_LOSS : BG_DEGRADED);
   });
-  (data.outages  || []).forEach(o => drawSpan(o.start, o.end, BG_OUTAGE));
+  if (isLayerOn('bg_outage')) {
+    (data.outages || []).forEach(o => drawSpan(o.start, o.end, BG_OUTAGE));
+  }
 
   // ── 2. Y gridlines + left axis (ms) + right axis (Mbps) ─────────
   ctx.strokeStyle = COLORS.border;
@@ -4300,15 +6066,28 @@ function paintDiagChart() {
   }
 
   // ── 3. X tick labels (HH:MM) ────────────────────────────────────
+  // Adaptive: target ~8 labels across the chart, snapped to a "nice"
+  // 1/2/5/10/15/30/60/120/180/360-minute interval. Never pick a step so
+  // small that labels overlap (≤ ~30px each), and never so large that the
+  // window has < 4 ticks.
   ctx.textAlign = 'center';
   ctx.textBaseline = 'top';
   const spanMin = span / 60000;
-  let stepMin;
-  if (spanMin <= 15)       stepMin = 2;
-  else if (spanMin <= 60)  stepMin = 10;
-  else if (spanMin <= 180) stepMin = 30;
-  else if (spanMin <= 720) stepMin = 60;
-  else                     stepMin = 120;
+  const NICE_STEPS = [1, 2, 5, 10, 15, 20, 30, 60, 120, 180, 360, 720];
+  const targetTicks = 8;
+  const minLabelPx = 32;
+  const maxTicksByWidth = Math.max(2, Math.floor(W / minLabelPx));
+  const targetMin = spanMin / Math.min(targetTicks, maxTicksByWidth);
+  let stepMin = NICE_STEPS[NICE_STEPS.length - 1];
+  for (const cand of NICE_STEPS) {
+    if (cand >= targetMin) { stepMin = cand; break; }
+  }
+  // Cap: never let the window show fewer than 4 ticks, even if span is short.
+  while (stepMin > 1 && spanMin / stepMin < 4) {
+    const idx = NICE_STEPS.indexOf(stepMin);
+    if (idx <= 0) break;
+    stepMin = NICE_STEPS[idx - 1];
+  }
   const stepMs = stepMin * 60000;
   let firstTick = Math.ceil(t0 / stepMs) * stepMs;
   for (let tx = firstTick; tx <= t1; tx += stepMs) {
@@ -4321,14 +6100,15 @@ function paintDiagChart() {
     ctx.fillText(hh + ':' + mm, x, MT + H + 4);
   }
 
-  // ── 4. Ping bands: filled p10–p90 area + p50 line ───────────────
+  // ── 4. Ping band: filled p10–p90 area only (no median line) ─────
   // Walk bands; break the path into segments wherever a band is null
   // (so outage gaps stay visible). Each contiguous run becomes one fill
-  // (forward through p90, back through p10) and one p50 stroke.
-  const bandFill = 'rgba(57,197,207,0.18)';   // cyan-ish translucent
+  // (forward through p90, back through p10).
+  const bandFill = 'rgba(57,197,207,0.28)';   // cyan-ish translucent (a bit
+                                              // stronger now that there's no
+                                              // p50 line drawing on top)
   function flushSegment(seg) {
     if (seg.length < 2) return;
-    // Filled band p10 → p90.
     ctx.beginPath();
     ctx.moveTo(seg[0].x, yOfMs(seg[0].p90));
     for (let i = 1; i < seg.length; i++) ctx.lineTo(seg[i].x, yOfMs(seg[i].p90));
@@ -4336,37 +6116,156 @@ function paintDiagChart() {
     ctx.closePath();
     ctx.fillStyle = bandFill;
     ctx.fill();
-    // p50 line.
-    ctx.beginPath();
-    ctx.moveTo(seg[0].x, yOfMs(seg[0].p50));
-    for (let i = 1; i < seg.length; i++) ctx.lineTo(seg[i].x, yOfMs(seg[i].p50));
-    ctx.strokeStyle = COLORS.cyan;
-    ctx.lineWidth = 1.4;
-    ctx.stroke();
   }
   let seg = [];
-  bands.forEach(([ts, p10, p50, p90, n]) => {
-    if (p50 == null) { flushSegment(seg); seg = []; return; }
-    seg.push({ x: xOf(new Date(ts).getTime()), p10, p50, p90, n, ts });
-  });
-  flushSegment(seg);
+  if (isLayerOn('ping_band')) {
+    bands.forEach(([ts, p10, p50, p90, n]) => {
+      if (p50 == null) { flushSegment(seg); seg = []; return; }
+      seg.push({ x: xOf(new Date(ts).getTime()), p10, p50, p90, n, ts });
+    });
+    flushSegment(seg);
+  }
 
-  // ── 5. Speed test markers (positioned on right Mbps axis) ──────
+  // ── 5. Speed: separate ↓ and ↑ dots on the right Mbps axis. Colors
+  //     match the dashboard's combined speed cards (blue download,
+  //     green upload). Each speed test contributes two dots stacked at
+  //     the same x.
+  const DL_COLOR = '#58a6ff';   // matches dashboard download chart
+  const UL_COLOR = '#3fb950';   // matches dashboard upload chart
   const speedMarks = [];
   (data.speed_series || []).forEach(s => {
     const x = xOf(new Date(s.ts).getTime());
     if (x < ML || x > ML + W) return;
-    if (s.dl == null) return;
-    const y = yOfMbps(s.dl);
-    ctx.fillStyle = COLORS.magenta;
     ctx.strokeStyle = COLORS.text;
     ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.arc(x, y, 3.5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-    speedMarks.push({ x, y, sample: s });
+    let dlY = null, ulY = null;
+    if (s.dl != null && isLayerOn('dl_dots')) {
+      dlY = yOfMbps(s.dl);
+      ctx.fillStyle = DL_COLOR;
+      ctx.beginPath();
+      ctx.arc(x, dlY, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+    if (s.ul != null && isLayerOn('ul_dots')) {
+      ulY = yOfMbps(s.ul);
+      ctx.fillStyle = UL_COLOR;
+      ctx.beginPath();
+      ctx.arc(x, ulY, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+    speedMarks.push({ x, dlY, ulY, sample: s });
   });
+
+  // ── 5b. Threshold lines spanning each degraded period in the window.
+  //   For a `slow` period: dotted horizontal line at the 7d-P10 download
+  //   speed (right Mbps axis) — visualizes "this sample fell below P10
+  //   here, and recovered after 3 consecutive samples ≥ P10 here."
+  //   For a `high_ping` period: same shape, anchored at the high-ping
+  //   threshold (max(100ms, 3× 7d-median ping)) on the left ms axis.
+  const slowThr = data.slow_threshold_mbps;
+  const pingThr = data.high_ping_threshold_ms;
+  if (isLayerOn('threshold_line')) {
+    (data.degraded || []).forEach(d => {
+      const sMs = new Date(d.start).getTime();
+      const eMs = d.end ? new Date(d.end).getTime() : t1;
+      const x0 = Math.max(ML, xOf(Math.max(t0, sMs)));
+      const x1 = Math.min(ML + W, xOf(Math.min(t1, eMs)));
+      if (x1 <= x0) return;
+      let y, color;
+      if (d.kind === 'slow' && slowThr != null && isFinite(slowThr)) {
+        y = yOfMbps(slowThr); color = DL_COLOR;
+      } else if (d.kind === 'high_ping' && pingThr != null && isFinite(pingThr)) {
+        y = yOfMs(pingThr); color = COLORS.cyan;
+      } else {
+        return;  // site_loss has no clean numeric threshold to anchor at
+      }
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([4, 3]);
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.moveTo(x0, y); ctx.lineTo(x1, y);
+      ctx.stroke();
+      ctx.restore();
+    });
+  }
+
+  // ── 5c. Failed primary speedtest markers (Ookla unreachable). Tiny
+  //     red ✕ at the bottom of the chart so a glance distinguishes
+  //     "speedtest API hiccup" from a real outage.
+  const failedMarks = [];
+  if (isLayerOn('failed_speedtest')) {
+    (data.failed_primary_attempts || []).forEach(ts => {
+      const x = xOf(new Date(ts).getTime());
+      if (x < ML || x > ML + W) return;
+      const y = MT + H - 4;
+      ctx.save();
+      ctx.strokeStyle = COLORS.red;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.moveTo(x - 3, y - 3); ctx.lineTo(x + 3, y + 3);
+      ctx.moveTo(x + 3, y - 3); ctx.lineTo(x - 3, y + 3);
+      ctx.stroke();
+      ctx.restore();
+      failedMarks.push({ x, y, ts });
+    });
+  }
+
+  // ── 5d. Per-site outage marks. Small downward-pointing triangles in
+  //     teal at the top of the plot at each per-site outage start, with
+  //     a thin teal underline spanning the outage duration if known.
+  const siteMarks = [];
+  if (isLayerOn('site_outage_marks')) {
+    (data.site_outage_marks || []).forEach(m => {
+      const sMs = new Date(m.start).getTime();
+      const eMs = m.end ? new Date(m.end).getTime() : t1;
+      const x = xOf(Math.max(t0, sMs));
+      if (x < ML || x > ML + W) return;
+      const y = MT + 4;
+      ctx.save();
+      ctx.fillStyle = '#39c5cf';   // teal (matches site_loss color)
+      ctx.beginPath();
+      ctx.moveTo(x, y + 5);
+      ctx.lineTo(x - 4, y);
+      ctx.lineTo(x + 4, y);
+      ctx.closePath();
+      ctx.fill();
+      const x1 = Math.min(ML + W, xOf(Math.min(t1, eMs)));
+      if (x1 > x + 1) {
+        ctx.strokeStyle = '#39c5cf';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(x, y + 6); ctx.lineTo(x1, y + 6);
+        ctx.stroke();
+      }
+      ctx.restore();
+      siteMarks.push({ x, y, info: m });
+    });
+  }
+
+  // ── 5e. Ping spike dots (outliers above the band, so they don't get
+  //     averaged away by binning).
+  const spikeMarks = [];
+  if (isLayerOn('ping_spikes')) {
+    (data.ping_spikes || []).forEach(([ts, v]) => {
+      const x = xOf(new Date(ts).getTime());
+      if (x < ML || x > ML + W) return;
+      const y = yOfMs(v);
+      ctx.save();
+      ctx.fillStyle = COLORS.red;
+      ctx.strokeStyle = COLORS.text;
+      ctx.lineWidth = 0.75;
+      ctx.beginPath();
+      ctx.arc(x, y, 2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+      spikeMarks.push({ x, y, ts, ms: v });
+    });
+  }
 
   // ── 6. Vertical reference lines ────────────────────────────────
   function earliestStart(items) {
@@ -4411,23 +6310,25 @@ function paintDiagChart() {
   refs.push({ ms: t1, color: COLORS.dim, label: 'window end', dashed: true });
 
   ctx.font = '9px ui-monospace, monospace';
-  refs.forEach(r => {
-    const x = xOf(r.ms);
-    if (x < ML || x > ML + W) return;
-    ctx.strokeStyle = r.color;
-    ctx.globalAlpha = r.dashed ? 0.5 : 0.85;
-    ctx.lineWidth = 1;
-    if (r.dashed) ctx.setLineDash([3, 3]);
-    ctx.beginPath();
-    ctx.moveTo(x, MT); ctx.lineTo(x, MT + H);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = r.color;
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'top';
-    ctx.fillText(r.label, x + 3, MT + 1);
-  });
+  if (isLayerOn('event_markers')) {
+    refs.forEach(r => {
+      const x = xOf(r.ms);
+      if (x < ML || x > ML + W) return;
+      ctx.strokeStyle = r.color;
+      ctx.globalAlpha = r.dashed ? 0.5 : 0.85;
+      ctx.lineWidth = 1;
+      if (r.dashed) ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(x, MT); ctx.lineTo(x, MT + H);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = r.color;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillText(r.label, x + 3, MT + 1);
+    });
+  }
 
   // ── 7. Stats strip above chart ─────────────────────────────────
   const statsEl = document.getElementById('diag-chart-stats');
@@ -4464,18 +6365,52 @@ function paintDiagChart() {
     const rect = canvas.getBoundingClientRect();
     const px = evt.clientX - rect.left;
     const py = evt.clientY - rect.top;
-    // Speed marker hit first.
+    // Hit-test order: site-outage triangle / failed-speedtest ✕ / spike dot
+    // / speed marker. Whichever is within range of the cursor wins; the
+    // tooltip then renders the matching content.
     let hit = null;
-    for (const m of speedMarks) {
-      const dx = px - m.x, dy = py - m.y;
-      if (dx*dx + dy*dy <= 36) { hit = m; break; }
+    for (const m of siteMarks) {
+      if (Math.hypot(px - m.x, py - m.y) <= 7) { hit = { kind: 'site', m }; break; }
     }
-    if (hit) {
+    if (!hit) for (const m of failedMarks) {
+      if (Math.hypot(px - m.x, py - m.y) <= 6) { hit = { kind: 'failed', m }; break; }
+    }
+    if (!hit) for (const m of spikeMarks) {
+      if (Math.hypot(px - m.x, py - m.y) <= 5) { hit = { kind: 'spike', m }; break; }
+    }
+    if (!hit) for (const m of speedMarks) {
+      const dx = px - m.x;
+      const dDl = (m.dlY != null) ? Math.hypot(dx, py - m.dlY) : Infinity;
+      const dUl = (m.ulY != null) ? Math.hypot(dx, py - m.ulY) : Infinity;
+      const closest = Math.min(dDl, dUl);
+      if (closest <= 6) { hit = { kind: 'speed', m }; break; }
+    }
+    if (hit && hit.kind === 'site') {
+      const i = hit.m.info;
+      const sStr = i.start.replace('T', ' ').slice(11, 19);
+      const eStr = i.end ? i.end.replace('T', ' ').slice(11, 19) : 'ongoing';
+      tt.innerHTML = '<strong style="color:#39c5cf">Site outage</strong>'
+        + '<br>' + (i.name || i.host)
+        + '<br>' + sStr + ' → ' + eStr;
+    } else if (hit && hit.kind === 'failed') {
+      const tStr = hit.m.ts.replace('T', ' ').slice(11, 19);
+      tt.innerHTML = '<strong style="color:' + COLORS.red + '">Primary speed test failed</strong>'
+        + '<br>' + tStr
+        + '<br><span style="color:var(--dim)">Ookla unreachable; HTTP fallback used.<br>'
+        + 'Not an internet outage — speedtest endpoint only.</span>';
+    } else if (hit && hit.kind === 'spike') {
+      const tStr = hit.m.ts.replace('T', ' ').slice(11, 19);
+      tt.innerHTML = '<strong style="color:' + COLORS.red + '">Ping spike</strong>'
+        + '<br>' + tStr
+        + '<br>' + hit.m.ms + 'ms';
+    } else if (hit && hit.kind === 'speed') {
+      hit = hit.m;
       const s = hit.sample;
       const tStr = s.ts.replace('T', ' ').slice(11, 19);
-      tt.innerHTML = '<strong style="color:' + COLORS.magenta + '">Speed test</strong>'
+      tt.innerHTML = '<strong>Speed test</strong>'
         + '<br>' + tStr
-        + '<br>↓ ' + s.dl + ' Mbps · ↑ ' + s.ul + ' Mbps'
+        + '<br><span style="color:' + DL_COLOR + '">↓ ' + s.dl + ' Mbps</span>'
+        + ' · <span style="color:' + UL_COLOR + '">↑ ' + s.ul + ' Mbps</span>'
         + (s.ping != null ? '<br>ping ' + s.ping + 'ms' : '')
         + (s.label ? '<br><span style="color:var(--dim)">' + s.label + '</span>' : '');
     } else if (px >= ML && px <= ML + W && py >= MT && py <= MT + H) {
@@ -4570,7 +6505,15 @@ async function runOutage(inc) {
   const status = document.getElementById('run-status');
   const btns = document.querySelectorAll('.run-btn');
   btns.forEach(b => b.disabled = true);
-  status.textContent = 'Diagnosing outage…';
+  const start = new Date(inc.start);
+  const end   = inc.end ? new Date(inc.end) : new Date();
+  const sec   = (end - start) / 1000;
+  const kindLabel = inc.category === 'outage' ? 'outage'
+                   : inc.category === 'site_loss' ? 'site-loss period'
+                   : 'degraded period';
+  openDiagRunModal(fmtIncidentDuration(sec) + ' ' + kindLabel + ' at ' +
+                   start.toLocaleString());
+  status.textContent = '';
   try {
     const resp = await fetch('/api/diagnose', {
       method: 'POST',
@@ -4586,29 +6529,153 @@ async function runOutage(inc) {
     if (data.id) selectedId = data.id;
     await loadHistory();
     await refreshTimeline();
-    status.textContent = '';
   } catch (e) {
     status.textContent = 'Request failed';
   } finally {
     btns.forEach(b => b.disabled = false);
+    closeDiagRunModal();
   }
 }
 
 let _timelineData = null;
+
+// Per-page kind filter state, persisted in localStorage so the user's
+// preference survives reloads. `kindFilter` is the set of kinds to HIDE.
+function loadKindFilter() {
+  const set = new Set();
+  try {
+    const raw = localStorage.getItem('diagKindFilter');
+    if (raw) JSON.parse(raw).forEach(k => set.add(k));
+  } catch (e) {}
+  return set;
+}
+function saveKindFilter(set) {
+  try { localStorage.setItem('diagKindFilter', JSON.stringify([...set])); } catch (e) {}
+}
+let _kindFilter = loadKindFilter();
+let _showDismissed = (function() {
+  try { return localStorage.getItem('diagShowDismissed') === '1'; }
+  catch (e) { return false; }
+})();
+// Reflect saved state back into the checkboxes once the DOM is parsed.
+document.querySelectorAll('.kind-filter input[type="checkbox"]').forEach(cb => {
+  if (cb.dataset.kind) {
+    cb.checked = !_kindFilter.has(cb.dataset.kind);
+    cb.addEventListener('change', () => {
+      if (cb.checked) _kindFilter.delete(cb.dataset.kind);
+      else            _kindFilter.add(cb.dataset.kind);
+      saveKindFilter(_kindFilter);
+      paintTimeline();
+    });
+  } else if (cb.hasAttribute('data-show-dismissed')) {
+    cb.checked = _showDismissed;
+    cb.addEventListener('change', () => {
+      _showDismissed = cb.checked;
+      try { localStorage.setItem('diagShowDismissed', _showDismissed ? '1' : '0'); }
+      catch (e) {}
+      renderHistory();   // history filtering also depends on this toggle
+      paintTimeline();
+    });
+  }
+});
+
 function paintTimeline() {
   if (!_timelineData) return;
+  // Find the cluster matching the currently-selected diagnosis (if any) so
+  // the timeline outlines it in yellow. For window-based diagnoses (1h/24h)
+  // there's no outage_id — fall back to highlighting the analyzed window.
+  const selDiag = selectedId ? history.find(d => d.id === selectedId) : null;
+  const selOutageId = selDiag ? selDiag.outage_id : null;
+  let selWindow = null;
+  if (!selOutageId && selDiag && selDiag.chart_data
+      && selDiag.chart_data.window_start && selDiag.chart_data.window_end) {
+    selWindow = { start: selDiag.chart_data.window_start,
+                  end:   selDiag.chart_data.window_end };
+  }
+  const dismissedSet = new Set(_timelineData.dismissed_ids || []);
   UptimeTimeline.render(document.getElementById('timelineCanvas'), {
     days: 30,
     clusters: _timelineData.clusters,
     analyzedIds: _timelineData.analyzed_ids,
     titles: _timelineData.titles || {},
     monitorStartedAt: _timelineData.monitor_started_at,
+    monitorGaps: _timelineData.monitor_gaps || [],
     onIncidentClick: onTimelineClick,
+    selectedClusterId: selOutageId,
+    selectedWindow: selWindow,
+    kindFilter: _kindFilter,
+    dismissedClusterIds: dismissedSet,
+    showDismissed: _showDismissed,
   });
   const total = (_timelineData.clusters || []).length;
   const seen = (_timelineData.analyzed_ids || []).length;
+  const dism = (_timelineData.dismissed_ids || []).length;
   const stats = document.getElementById('timeline-stats');
-  if (stats) stats.textContent = total + ' incidents · ' + seen + ' analyzed';
+  if (stats) stats.textContent = total + ' incidents · ' + seen + ' analyzed'
+    + (dism ? (' · ' + dism + ' dismissed') : '');
+}
+
+// ── Analysis-in-progress modal ────────────────────────────────
+// Shown while a new /api/diagnose POST is in flight, hidden on completion.
+// Single source of truth: any code path that fires a diagnosis wraps the
+// fetch with openDiagRunModal() / closeDiagRunModal().
+let _diagRunStartTs = null;
+let _diagRunElapsedTimer = null;
+const _diagRunStatusMessages = [
+  'Building snapshot…',
+  'Compiling ping & speed history…',
+  'Summarizing router events…',
+  'Asking the model to interpret…',
+  'Parsing the response…',
+];
+
+function openDiagRunModal(targetLabel) {
+  let overlay = document.getElementById('diag-run-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'diag-run-overlay';
+    overlay.className = 'diag-run-overlay';
+    overlay.innerHTML =
+      '<div class="diag-run-modal">' +
+        '<div class="diag-run-spinner"></div>' +
+        '<div class="diag-run-title">Diagnosing</div>' +
+        '<div class="diag-run-target" id="diag-run-target"></div>' +
+        '<div class="diag-run-status" id="diag-run-status"></div>' +
+        '<div class="diag-run-elapsed" id="diag-run-elapsed"></div>' +
+      '</div>';
+    document.body.appendChild(overlay);
+  }
+  document.getElementById('diag-run-target').textContent = targetLabel || '';
+  const statusEl = document.getElementById('diag-run-status');
+  const elapsedEl = document.getElementById('diag-run-elapsed');
+  let stage = 0;
+  statusEl.textContent = _diagRunStatusMessages[0];
+  _diagRunStartTs = Date.now();
+  // Cycle through stage messages and bump the elapsed clock every 250ms.
+  // The stages are illustrative — there's no real backend progress event
+  // stream. A typical run takes 5–10 seconds; cycling every ~2s reads as
+  // "things are happening" without overpromising granularity.
+  if (_diagRunElapsedTimer) clearInterval(_diagRunElapsedTimer);
+  _diagRunElapsedTimer = setInterval(() => {
+    const elapsed = (Date.now() - _diagRunStartTs) / 1000;
+    elapsedEl.textContent = elapsed.toFixed(1) + 's elapsed';
+    const newStage = Math.min(_diagRunStatusMessages.length - 1,
+                              Math.floor(elapsed / 2));
+    if (newStage !== stage) {
+      stage = newStage;
+      statusEl.textContent = _diagRunStatusMessages[stage];
+    }
+  }, 250);
+  overlay.style.display = 'flex';
+}
+
+function closeDiagRunModal() {
+  const overlay = document.getElementById('diag-run-overlay');
+  if (overlay) overlay.style.display = 'none';
+  if (_diagRunElapsedTimer) {
+    clearInterval(_diagRunElapsedTimer);
+    _diagRunElapsedTimer = null;
+  }
 }
 async function refreshTimeline() {
   try {
@@ -4653,7 +6720,10 @@ async function runNew(window) {
   const status = document.getElementById('run-status');
   const btns = document.querySelectorAll('.run-btn');
   btns.forEach(b => b.disabled = true);
-  status.textContent = 'Diagnosing ' + window + '…';
+  const labels = {ongoing: 'last 5 minutes (ongoing)',
+                  '1h': 'last 1 hour', '24h': 'last 24 hours'};
+  openDiagRunModal(labels[window] || window);
+  status.textContent = '';
   try {
     const resp = await fetch('/api/diagnose', {
       method: 'POST',
@@ -4665,11 +6735,11 @@ async function runNew(window) {
       selectedId = data.id;
     }
     await loadHistory();
-    status.textContent = '';
   } catch (e) {
     status.textContent = 'Request failed';
   } finally {
     btns.forEach(b => b.disabled = false);
+    closeDiagRunModal();
   }
 }
 
@@ -4697,6 +6767,32 @@ document.getElementById('diag-delete-btn').addEventListener('click', async (evt)
     btn.disabled = false;
   }
 });
+
+document.getElementById('diag-dismiss-btn').addEventListener('click', async (evt) => {
+  const btn = evt.currentTarget;
+  const outageId = btn.dataset.outageId;
+  if (!outageId) return;
+  const wasDismissed = btn.dataset.dismissed === '1';
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/dismiss', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ outage_id: outageId, dismissed: !wasDismissed }),
+    });
+    if (!resp.ok) throw new Error('http ' + resp.status);
+    // Refresh history (for dismissed flags) and timeline (for dismissed_ids).
+    await loadHistory();
+    await refreshTimeline();
+  } catch (e) {
+    window.alert((wasDismissed ? 'Restore' : 'Dismiss') + ' failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// Reflect saved layer-toggle state on the legend immediately at load.
+refreshLegendStrikes();
 
 (async () => {
   await loadHistory();
@@ -4729,6 +6825,140 @@ def api_state():
     if _state is None:
         return jsonify({"error": "not ready"}), 503
     return jsonify(_state.to_dict())
+
+
+def _site_pool_pings(site_ping_hist: Dict[str, list], now: datetime,
+                     hours: int) -> List[float]:
+    """Union of successful pings across all sites, last N hours."""
+    cut_iso = (now - timedelta(hours=hours)).isoformat()
+    out: List[float] = []
+    for h in site_ping_hist.values():
+        for t, ms in h:
+            if ms is not None and t >= cut_iso:
+                out.append(ms)
+    return out
+
+
+def _site_pool_thresholds(site_ping_hist: Dict[str, list],
+                          now: datetime) -> Dict[str, Optional[float]]:
+    """Compute pool P-values used by site verdicts and the modal threshold
+    band. Mirrors the auto-fallback behavior in api_state so the modal lines
+    up with the tile colors exactly."""
+    pool = _site_pool_pings(site_ping_hist, now, SITE_VERDICT_BASELINE_HOURS)
+    window_used = SITE_VERDICT_BASELINE_HOURS
+    if len(pool) < SITE_VERDICT_MIN_SAMPLES:
+        pool = _site_pool_pings(site_ping_hist, now, SITE_VERDICT_FALLBACK_HOURS)
+        window_used = SITE_VERDICT_FALLBACK_HOURS
+    if not pool:
+        return {"great_ms": None, "slow_ms": None, "poor_ms": None,
+                "window_hours": window_used, "samples": 0}
+    pool.sort()
+    return {
+        "great_ms": round(_percentile(pool, SITE_VERDICT_GREAT_PCT), 1),
+        "slow_ms":  round(_percentile(pool, SITE_VERDICT_SLOW_PCT),  1),
+        "poor_ms":  round(_percentile(pool, SITE_VERDICT_POOR_PCT),  1),
+        "window_hours": window_used,
+        "samples": len(pool),
+    }
+
+
+@app.route("/api/site_history")
+def api_site_history():
+    """Per-site ping history for the dashboard's click-to-expand site view.
+    Query: ?host=<hostname>&hours=<int>
+      hours unspecified → auto window: try SITE_VERDICT_BASELINE_HOURS (24h
+        default), fall back to SITE_VERDICT_FALLBACK_HOURS (7d default) if
+        the primary window has < SITE_VERDICT_MIN_SAMPLES successful
+        samples. This matches how the site-tile verdict picks its baseline,
+        so the modal's p10–p90 band reflects the same data shape that
+        graded the tile.
+      hours=<n> → strict — use exactly that window (capped to 30d)."""
+    if _state is None:
+        return jsonify({"error": "not ready"}), 503
+    host = request.args.get("host", "").strip()
+    if not host:
+        return jsonify({"error": "host query param required"}), 400
+
+    hours_param = request.args.get("hours")
+    auto_window = hours_param is None
+    if auto_window:
+        primary_hours = SITE_VERDICT_BASELINE_HOURS
+        fallback_hours = SITE_VERDICT_FALLBACK_HOURS
+    else:
+        try:
+            primary_hours = max(1, min(int(hours_param), 24 * 30))
+        except ValueError:
+            primary_hours = SITE_VERDICT_BASELINE_HOURS
+        fallback_hours = primary_hours
+
+    now_dt = datetime.now()
+    with _state.lock:
+        if host not in _state.site_ping_history:
+            return jsonify({"error": f"unknown host: {host}"}), 404
+        hist = list(_state.site_ping_history[host])
+        name = _state.site_names.get(host) or host
+        all_site_outages = list(_state.site_outages)
+        cur_outage = _state.current_site_outages.get(host)
+        # Snapshot the per-site dict for the pool calculation outside the lock.
+        all_site_hist = {h: list(v) for h, v in _state.site_ping_history.items()}
+
+    pool_thresholds = _site_pool_thresholds(all_site_hist, now_dt)
+
+    def _samples_for(hours: int) -> List[List]:
+        cut_iso = (now_dt - timedelta(hours=hours)).isoformat()
+        return [[ts, ms] for ts, ms in hist if ts >= cut_iso]
+
+    samples = _samples_for(primary_hours)
+    hours_used = primary_hours
+    if auto_window:
+        successes = sum(1 for _, ms in samples if ms is not None)
+        if successes < SITE_VERDICT_MIN_SAMPLES and fallback_hours > primary_hours:
+            samples = _samples_for(fallback_hours)
+            hours_used = fallback_hours
+    cutoff = (now_dt - timedelta(hours=hours_used)).isoformat()
+
+    outages_for_host = [
+        {"start": rec.start.isoformat(timespec="seconds"),
+         "end":   rec.end.isoformat(timespec="seconds") if rec.end else None}
+        for h, rec in all_site_outages
+        if h == host and rec.start.isoformat() >= cutoff
+    ]
+    if cur_outage is not None and cur_outage.start.isoformat() >= cutoff:
+        outages_for_host.append({
+            "start": cur_outage.start.isoformat(timespec="seconds"),
+            "end":   None,
+        })
+    # Quick stats for display.
+    successes = [ms for _, ms in samples if ms is not None]
+    n = len(samples)
+    pct = round(len(successes) / n * 100, 1) if n else None
+    if successes:
+        s = sorted(successes)
+        def _p(q):
+            if len(s) == 1: return s[0]
+            idx = q / 100 * (len(s) - 1)
+            lo, hi = int(idx), min(int(idx) + 1, len(s) - 1)
+            return s[lo] + (s[hi] - s[lo]) * (idx - lo)
+        stats = {"p10": round(_p(10), 1), "p50": round(_p(50), 1),
+                 "p90": round(_p(90), 1), "min": round(s[0], 1),
+                 "max": round(s[-1], 1)}
+    else:
+        stats = {"p10": None, "p50": None, "p90": None, "min": None, "max": None}
+    return jsonify({
+        "host": host,
+        "name": name,
+        "hours": hours_used,
+        "auto_window": auto_window,
+        "primary_hours": primary_hours,
+        "fallback_hours": fallback_hours,
+        "samples": samples,           # [[iso_ts, ms_or_null], ...] @ ~10s cadence
+        "outages": outages_for_host,
+        "reachable_pct": pct,
+        "ping_stats": stats,
+        # Pool thresholds — same data that drives the GREAT/OK/SLOW/POOR
+        # tile verdicts. Drawn as horizontal reference lines on the modal.
+        "pool_thresholds": pool_thresholds,
+    })
 
 
 @app.route("/api/log")
@@ -4828,7 +7058,41 @@ def api_diagnose():
 def api_diagnoses():
     if _state is None:
         return jsonify({"error": "not ready"}), 503
-    return jsonify({"items": _diagnoses_within_30d(_state)})
+    items = _diagnoses_within_30d(_state)
+    # Annotate each diagnosis with its dismissed status (computed from the
+    # underlying cluster id). Diagnoses without an outage_id can never be
+    # dismissed via the cluster mechanism — they're window-based.
+    with _state.lock:
+        dismissed = set(_state.dismissed_outage_ids)
+    for it in items:
+        it["dismissed"] = bool(it.get("outage_id") and it["outage_id"] in dismissed)
+    return jsonify({"items": items})
+
+
+@app.route("/api/dismiss", methods=["POST"])
+def api_dismiss():
+    """Toggle the dismissed flag on a cluster. Body: {outage_id, dismissed}.
+    A dismissed cluster is hidden from the timeline and the history panel
+    unless the "show dismissed" toggle is on."""
+    if _state is None:
+        return jsonify({"error": "not ready"}), 503
+    body = request.get_json(silent=True) or {}
+    outage_id = (body.get("outage_id") or "").strip()
+    dismissed = bool(body.get("dismissed", True))
+    if not outage_id:
+        return jsonify({"ok": False, "error": "outage_id required"}), 400
+    with _state.lock:
+        if dismissed:
+            _state.dismissed_outage_ids.add(outage_id)
+        else:
+            _state.dismissed_outage_ids.discard(outage_id)
+        n = len(_state.dismissed_outage_ids)
+    _state.log(
+        ("Dismissed " if dismissed else "Restored ") + outage_id +
+        f" (total dismissed: {n})", "info",
+    )
+    return jsonify({"ok": True, "dismissed": dismissed,
+                    "total_dismissed": n})
 
 
 @app.route("/api/diagnoses/<diag_id>", methods=["DELETE"])
@@ -4967,6 +7231,80 @@ def _cluster_events(outages: List[OutageRecord],
     return out
 
 
+def _compute_monitor_gaps(state: "MonitorState", cutoff: datetime,
+                          now: datetime, threshold_s: int = 120,
+                          min_report_s: int = MONITOR_GAP_MIN_REPORT_S) -> List[Dict]:
+    """Find windows in [cutoff, now] when the monitor itself wasn't running.
+
+    Uses the UNION of two heartbeats so that neither failure mode can
+    produce a false gap:
+
+      * ping_history_ts        — connectivity_thread, every 2s, appends only
+                                 on probe success. Keeps firing even when the
+                                 OS is throttling background processes (App
+                                 Nap, etc.) — by far the most reliable
+                                 indicator of "the python process is alive."
+                                 But silent during real outages.
+      * ping_accessibility_ts  — site_check_thread, every ~10s, appends
+                                 unconditionally (records pct=0 when nothing
+                                 is reachable). Survives real outages, but
+                                 can stall under aggressive OS throttling.
+
+    A gap exists only when BOTH series have nothing inside the window —
+    i.e. the process truly wasn't writing anything. This matches the
+    user-visible meaning of "monitor not running."
+
+    threshold_s   — gap detection floor: any heartbeat-to-heartbeat delta
+                    above this is treated as "process not running."
+    min_report_s  — gap REPORTING floor: only emit gaps at least this long.
+                    Genuine restarts surface; sub-threshold OS throttling
+                    blips are dropped.
+    """
+    threshold = timedelta(seconds=threshold_s)
+    min_report = timedelta(seconds=min_report_s)
+    samples: List[datetime] = []
+    for series in (state.ping_history_ts, state.ping_accessibility_ts):
+        for entry in series:
+            try:
+                ts = datetime.fromisoformat(entry[0])
+            except (ValueError, TypeError, IndexError):
+                continue
+            if ts < cutoff:
+                continue
+            samples.append(ts)
+    samples.sort()
+
+    install = state.first_seen
+    # The "expected coverage" window is [max(cutoff, install), now]. Anything
+    # before install is "not yet installed" (already rendered dim by the
+    # frontend); we don't emit a gap there.
+    win_start = max(cutoff, install)
+    if win_start >= now:
+        return []
+
+    gaps: List[Dict] = []
+    prev = win_start
+    for ts in samples:
+        if ts <= prev:
+            prev = ts
+            continue
+        if ts - prev > threshold and ts - prev >= min_report:
+            gaps.append({
+                "start": prev.isoformat(timespec="seconds"),
+                "end": ts.isoformat(timespec="seconds"),
+                "duration_s": int((ts - prev).total_seconds()),
+            })
+        prev = ts
+    # Trailing: if heartbeat stopped a while ago, treat as ongoing gap to now.
+    if now - prev > threshold and now - prev >= min_report:
+        gaps.append({
+            "start": prev.isoformat(timespec="seconds"),
+            "end": now.isoformat(timespec="seconds"),
+            "duration_s": int((now - prev).total_seconds()),
+        })
+    return gaps
+
+
 @app.route("/api/timeline")
 def api_timeline():
     if _state is None:
@@ -4985,6 +7323,7 @@ def api_timeline():
         ]
         in_degraded = [d for d in list(_state.degraded_periods) if d.start >= cutoff]
         clusters = _cluster_events(in_outages, in_degraded, now)
+        monitor_gaps = _compute_monitor_gaps(_state, cutoff, now)
 
         # For each saved diagnosis, capture its outage_id, the timestamp
         # implied by that id (the "anchor"), and its title. The anchor lets us
@@ -5040,7 +7379,9 @@ def api_timeline():
         "monitor_started_at": first_seen.isoformat(timespec="seconds"),
         "clusters": clusters,
         "analyzed_ids": analyzed_ids,
+        "dismissed_ids": sorted(_state.dismissed_outage_ids),
         "titles": titles_by_cluster,
+        "monitor_gaps": monitor_gaps,
     })
 
 
