@@ -645,22 +645,6 @@ class MonitorState:
             step = len(ping_ts) / MAX_PING_CHART
             ping_ts = [ping_ts[int(i * step)] for i in range(MAX_PING_CHART)]
 
-        # Downsample accessibility to match ping chart points
-        access_ts_ds = access_ts
-        if len(access_ts) > MAX_PING_CHART:
-            step = len(access_ts) / MAX_PING_CHART
-            access_ts_ds = [access_ts[int(i * step)] for i in range(MAX_PING_CHART)]
-
-        # Hourly percentile buckets for 24h ping chart
-        hourly_buckets: Dict[str, List[float]] = defaultdict(list)
-        for ts_str, v in ping_ts_all:
-            try:
-                dt = datetime.fromisoformat(ts_str)
-                hour_key = dt.strftime("%H:00")
-                hourly_buckets[hour_key].append(v)
-            except ValueError:
-                pass
-
         def _percentile(sorted_vals: List[float], p: float) -> float:
             n = len(sorted_vals)
             if n == 1:
@@ -669,20 +653,58 @@ class MonitorState:
             lo, hi = int(idx), min(int(idx) + 1, n - 1)
             return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (idx - lo)
 
-        # Sort hourly keys chronologically (they are HH:00 strings)
+        # Rolling 24-hour ping+accessibility buckets — 24 complete past hours
+        # ending at the current top-of-hour, ordered chronologically. The old
+        # implementation bucketed by hour-of-day, which collapsed pings from
+        # the same clock hour on different days and rendered the chart out of
+        # order (e.g. 12am-2pm on the left, yesterday's 3pm-11pm on the right).
+        # Excluding the current partial hour leaves a visible gap between the
+        # 24h chart's last bucket and the 5m chart's first sample.
+        current_hour = now.replace(minute=0, second=0, microsecond=0)
+        first_slot_start = current_hour - timedelta(hours=24)
+        ping_buckets: List[List[float]] = [[] for _ in range(24)]
+        access_buckets: List[List[float]] = [[] for _ in range(24)]
+        for ts_str, v in ping_ts_all:
+            try:
+                dt = datetime.fromisoformat(ts_str)
+            except ValueError:
+                continue
+            if dt < first_slot_start or dt >= current_hour:
+                continue
+            idx = int((dt - first_slot_start).total_seconds() // 3600)
+            if 0 <= idx < 24:
+                ping_buckets[idx].append(v)
+        for ts_str, p in access_ts:
+            try:
+                dt = datetime.fromisoformat(ts_str)
+            except ValueError:
+                continue
+            if dt < first_slot_start or dt >= current_hour:
+                continue
+            idx = int((dt - first_slot_start).total_seconds() // 3600)
+            if 0 <= idx < 24:
+                access_buckets[idx].append(p)
+
         ping_hourly = []
-        for hk in sorted(hourly_buckets.keys()):
-            h_int = int(hk[:2])
+        for i in range(24):
+            slot_start = first_slot_start + timedelta(hours=i)
+            h_int = slot_start.hour
             hour_label = f"{h_int % 12 or 12}{'am' if h_int < 12 else 'pm'}"
-            vals = sorted(hourly_buckets[hk])
-            p10 = round(_percentile(vals, 10), 1)
-            p50 = round(_percentile(vals, 50), 1)
-            p90 = round(_percentile(vals, 90), 1)
+            pv = sorted(ping_buckets[i])
+            if pv:
+                p10 = round(_percentile(pv, 10), 1)
+                p50 = round(_percentile(pv, 50), 1)
+                p90 = round(_percentile(pv, 90), 1)
+            else:
+                p10 = p50 = p90 = None
+            av = access_buckets[i]
+            access_pct = round(sum(av) / len(av), 1) if av else None
             ping_hourly.append({
-                "hour": hour_label,
-                "p10":  p10,
-                "p50":  p50,
-                "p90":  p90,
+                "hour":   hour_label,
+                "p10":    p10,
+                "p50":    p50,
+                "p90":    p90,
+                "access": access_pct,
             })
 
         # Filter speed history to last 24 hours only
@@ -906,10 +928,6 @@ class MonitorState:
             "ping_chart_5m": [
                 {"t": t[11:19] if len(t) > 8 else t, "v": round(v, 1)}
                 for t, v in ping_ts_5m
-            ],
-            "access_chart": [
-                {"t": t[11:19] if len(t) > 8 else t, "v": round(p, 1)}
-                for t, p in access_ts_ds
             ],
             "access_chart_5m": [
                 {"t": t[11:19] if len(t) > 8 else t, "v": round(p, 1)}
@@ -2682,35 +2700,20 @@ window.UptimeTimeline = (function () {
           const yA = yOf(minutesOfDay(segEnd >= dayEnd ? new Date(dayEnd.getTime() - 1) : segEnd));
           const yB = yOf(minutesOfDay(segStart));
           const x = dayX[idx] + (colW - barW) / 2;
-          // 30d view bumps bar height by 50% so short incidents are visible.
-          const heightMult = days > 7 ? 1.5 : 1.0;
+          // Natural height with a min-height floor so single-sample events
+          // remain visible. Matches the 7d rendering — earlier 30d also
+          // multiplied by 1.5x, which made long events overflow above/below
+          // the day cell since the expansion lifted bars past midnight.
           const minH = days > 7 ? 3 : 2;
-          const baseH = Math.max(minH, yB - yA);
-          const h = baseH * heightMult;
-          const yTop = yA - (h - (yB - yA)) / 2;
+          const naturalH = yB - yA;
+          let h = Math.max(minH, naturalH);
+          let yTop = yA - (h - naturalH) / 2;
+          // Clamp inside this day's 24h cell so the min-height pad doesn't
+          // push the bar above the top or below the bottom of the column.
+          if (yTop < marginT) yTop = marginT;
+          if (yTop + h > marginT + innerH) yTop = marginT + innerH - h;
           ctx.fillStyle = useStripes ? pattern : memColor;
           ctx.fillRect(x, yTop, barW, h);
-          // Yellow outline + bounding-box accumulation for the selected
-          // cluster (the one the user is currently viewing in the
-          // diagnosis panel).
-          if (cluster.id === selectedClusterId) {
-            const outlinePad = 2;
-            ctx.save();
-            ctx.strokeStyle = '#f1e05a';   // bright yellow, no glow
-            ctx.lineWidth = 1.5;
-            ctx.strokeRect(
-              x - outlinePad,
-              yTop - outlinePad,
-              barW + outlinePad * 2,
-              h + outlinePad * 2,
-            );
-            ctx.restore();
-            selectedBoundsAcc.found = true;
-            selectedBoundsAcc.x  = Math.min(selectedBoundsAcc.x,  x - outlinePad);
-            selectedBoundsAcc.y  = Math.min(selectedBoundsAcc.y,  yTop - outlinePad);
-            selectedBoundsAcc.x2 = Math.max(selectedBoundsAcc.x2, x + barW + outlinePad);
-            selectedBoundsAcc.y2 = Math.max(selectedBoundsAcc.y2, yTop + h + outlinePad);
-          }
           const HIT_PAD_TOP = 4, HIT_PAD_BOT = 3, HIT_PAD_X = 1;
           incidentRects.push({
             x: x - HIT_PAD_X,
@@ -2732,6 +2735,13 @@ window.UptimeTimeline = (function () {
     const visibleClusters = clusters.filter(c =>
       showDismissed || !dismissedIds.has(c.id)
     );
+    // Clip every event-driven primitive (bars, selection outlines, dismissed
+    // overlay, "now" tick) to the 24h day-cell area so short events and 2px
+    // selection padding don't leak into the badge/label margins.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(marginL - 3, marginT, innerW + 6, innerH);
+    ctx.clip();
     // Draw degraded clusters first (so outage clusters render on top, just in
     // case any future data shape allows overlap — server-side they're merged).
     visibleClusters.filter(c => c.category !== 'outage').forEach(drawSpan);
@@ -2759,30 +2769,26 @@ window.UptimeTimeline = (function () {
       ctx.restore();
     }
 
-    // Highlight an arbitrary time slice (used when the selected diagnosis is
-    // window-based — 1h/24h — and isn't tied to a specific cluster). Drawn
-    // as a yellow outline that may span multiple day columns since a 24h
-    // window can cross midnight.
-    if (selectedWindow && selectedWindow.start && selectedWindow.end) {
-      const winStart = new Date(selectedWindow.start);
-      const winEnd   = new Date(selectedWindow.end);
+    // Draw a single yellow outline around the selected cluster's full
+    // evaluated timeframe (one rect per day column it spans) rather than one
+    // outline per member — clusters with multiple chained events otherwise
+    // showed several adjacent boxes that read as separate selections.
+    const drawTimeframeOutline = (sMs, eMs) => {
       ctx.save();
       ctx.strokeStyle = '#f1e05a';
       ctx.lineWidth = 1.5;
       dayStarts.forEach((day, idx) => {
         const dayEnd = new Date(day); dayEnd.setDate(day.getDate() + 1);
-        if (winEnd <= day || winStart >= dayEnd) return;
-        const segStart = (winStart > day) ? winStart : day;
-        const segEnd   = (winEnd   < dayEnd) ? winEnd : dayEnd;
-        const yA = yOf(minutesOfDay(segEnd >= dayEnd ? new Date(dayEnd.getTime() - 1) : segEnd));
+        if (eMs <= day.getTime() || sMs >= dayEnd.getTime()) return;
+        const segStart = new Date(Math.max(sMs, day.getTime()));
+        const segEnd   = new Date(Math.min(eMs, dayEnd.getTime() - 1));
+        const yA = yOf(minutesOfDay(segEnd));
         const yB = yOf(minutesOfDay(segStart));
         const x = dayX[idx] + (colW - barW) / 2 - 2;
         const w = barW + 4;
         const yTop = yA - 2;
         const h = (yB - yA) + 4;
         ctx.strokeRect(x, yTop, w, h);
-        // Report bounding box so caller can react if it wants (mirrors the
-        // selectedClusterId path).
         selectedBoundsAcc.found = true;
         selectedBoundsAcc.x  = Math.min(selectedBoundsAcc.x,  x);
         selectedBoundsAcc.y  = Math.min(selectedBoundsAcc.y,  yTop);
@@ -2790,6 +2796,23 @@ window.UptimeTimeline = (function () {
         selectedBoundsAcc.y2 = Math.max(selectedBoundsAcc.y2, yTop + h);
       });
       ctx.restore();
+    };
+    if (selectedClusterId) {
+      const sel = visibleClusters.find(c => c.id === selectedClusterId);
+      if (sel) {
+        drawTimeframeOutline(
+          new Date(sel.start).getTime(),
+          sel.end ? new Date(sel.end).getTime() : new Date().getTime(),
+        );
+      }
+    }
+    // Window-based diagnoses (1h / 24h) aren't tied to a specific cluster —
+    // outline the analyzed window the same way.
+    if (selectedWindow && selectedWindow.start && selectedWindow.end) {
+      drawTimeframeOutline(
+        new Date(selectedWindow.start).getTime(),
+        new Date(selectedWindow.end).getTime(),
+      );
     }
 
     // "Now" tick on today's column
@@ -2804,6 +2827,8 @@ window.UptimeTimeline = (function () {
       ctx.moveTo(xL - 1, yN); ctx.lineTo(xL + barW + 1, yN);
       ctx.stroke();
     }
+    // End of clip established before the event-drawing pass.
+    ctx.restore();
 
     // Severity badges: longest *outage* (downtime) per day, derived from
     // clusters' total_outage_s. Only shown on 7d to avoid clutter.
@@ -4069,29 +4094,18 @@ function update(d) {
     setEl('stat-router-dns', '—');
   }
 
-  // ── 24h Ping chart: hourly stacked bars + % accessible ───────
+  // ── 24h Ping chart: hourly p10/p50/p90 + % accessible ────────
   if (d.ping_hourly && d.ping_hourly.length > 0) {
     const raw = d.ping_hourly;
     pingChart24h._pingHourlyRaw = raw;
-
-    // Bucket access_chart readings by hour for the overlay line
-    const toHourLabel = t => {
-      const h = parseInt(t.substring(0, 2), 10);
-      return (h % 12 || 12) + (h < 12 ? 'am' : 'pm');
-    };
-    const accessByHour = {};
-    (d.access_chart || []).forEach(pt => {
-      const hour = toHourLabel(pt.t);
-      if (!accessByHour[hour]) accessByHour[hour] = [];
-      accessByHour[hour].push(pt.v);
-    });
-    const avgArr = arr => arr && arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
-
     pingChart24h.data.labels           = raw.map(h => h.hour);
     pingChart24h.data.datasets[0].data = raw.map(h => h.p10);
     pingChart24h.data.datasets[1].data = raw.map(h => h.p50);
     pingChart24h.data.datasets[2].data = raw.map(h => h.p90);
-    pingChart24h.data.datasets[3].data = raw.map(h => avgArr(accessByHour[h.hour]));
+    // Accessibility is now bucketed server-side alongside ping percentiles
+    // (same rolling 24h slots) instead of being re-bucketed here by
+    // hour-of-day. The old client-side bucketing collided across days.
+    pingChart24h.data.datasets[3].data = raw.map(h => h.access);
     pingChart24h.update('none');
   }
 
@@ -6476,6 +6490,18 @@ function fmtIncidentDuration(s) {
   return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
 }
 
+// Naive local-time ISO string matching the server's
+// `datetime.isoformat(timespec="seconds")`. `new Date().toISOString()` emits
+// a UTC string with 'Z' suffix that Python <3.11's `datetime.fromisoformat`
+// rejects — that path silently failed ongoing-incident diagnoses (server
+// returned 400, client kept the previously-selected diagnosis on screen).
+function localIsoNow() {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+    + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+}
+
 function findDiagnosisForOutage(outageId) {
   return history.find(d => d.outage_id === outageId) || null;
 }
@@ -6521,11 +6547,21 @@ async function runOutage(inc) {
       body: JSON.stringify({
         window: 'outage',
         start: inc.start,
-        end:   inc.end || new Date().toISOString(),
+        end:   inc.end || localIsoNow(),
         outage_id: inc.id,
       }),
     });
-    const data = await resp.json();
+    const data = await resp.json().catch(() => ({}));
+    // HTTP errors (400 bad input, 429 already running, 5xx) never produce a
+    // saved diagnosis — surface them instead of silently leaving the
+    // previously-selected diagnosis on screen. AI-step failures still come
+    // back as 200 with `id` set, so the detail panel renders their error.
+    if (!resp.ok) {
+      status.textContent = (data && data.error)
+        ? data.error
+        : ('Request failed (' + resp.status + ')');
+      return;
+    }
     if (data.id) selectedId = data.id;
     await loadHistory();
     await refreshTimeline();
@@ -6814,10 +6850,31 @@ logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 _state: Optional[MonitorState] = None
 
+# Bumps every server start so the browser refetches /static/timeline.js even
+# when an aggressive cache (or a proxy/extension that ignores Cache-Control)
+# would otherwise stick to a previous version. The Cache-Control header on
+# the JS route covers normal browsers; this covers the rest.
+_ASSET_VERSION = str(int(time.time()))
+
+
+def _versioned(html: str) -> str:
+    return html.replace('/static/timeline.js"', f'/static/timeline.js?v={_ASSET_VERSION}"')
+
+
+# Browsers were caching the page HTML and serving stale *inline* JS even after
+# a restart, which made client-side fixes appear not to land. The pages are
+# tiny and always need to reflect the latest server build, so opt out of all
+# caching for them. (The external /static/timeline.js route already has its
+# own no-cache + ?v= cache-bust.)
+_NO_CACHE_HTML = {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+}
+
 
 @app.route("/")
 def index():
-    return DASHBOARD_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+    return _versioned(DASHBOARD_HTML), 200, _NO_CACHE_HTML
 
 
 @app.route("/api/state")
@@ -6983,7 +7040,7 @@ def api_log():
 
 @app.route("/log")
 def log_page():
-    return LOG_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+    return LOG_HTML, 200, _NO_CACHE_HTML
 
 
 def _diagnoses_within_30d(state: MonitorState) -> List[dict]:
@@ -7387,12 +7444,19 @@ def api_timeline():
 
 @app.route("/diagnose")
 def diagnose_page():
-    return DIAGNOSE_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+    return _versioned(DIAGNOSE_HTML), 200, _NO_CACHE_HTML
 
 
 @app.route("/static/timeline.js")
 def static_timeline_js():
-    return TIMELINE_JS, 200, {"Content-Type": "application/javascript; charset=utf-8"}
+    # No-cache: the JS is embedded in the Python source and ships with each
+    # server restart. Without this header the browser's heuristic cache served
+    # stale renderer code after fixes (e.g. timeline overflow clamping) until a
+    # hard refresh — confusing because reloading the page didn't update.
+    return TIMELINE_JS, 200, {
+        "Content-Type": "application/javascript; charset=utf-8",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+    }
 
 
 # ─────────────────────────────────────────────────────────────
