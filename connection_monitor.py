@@ -2932,6 +2932,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Connection Monitor</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="/static/timeline.js"></script>
 <style>
@@ -3464,7 +3465,7 @@ tr:last-child td { border-bottom: none; }
 
   <!-- ── Status Stats ──────────────────────────────────────── -->
   <div class="card col-3">
-    <div class="card-title">Status</div>
+    <div class="card-title"><a href="https://github.com/hjordanh/Connection-test" target="_blank" rel="noopener" aria-label="View project on GitHub"><img src="/static/favicon.svg" alt="" style="height:1em;vertical-align:middle;margin-right:6px"></a>Status</div>
     <div class="stat-row">
       <span class="stat-label">Runtime</span>
       <span class="stat-value" id="stat-runtime">—</span>
@@ -4808,6 +4809,7 @@ LOG_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Connection Monitor — Log</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
 <style>
 :root {
   --bg:      #0d1117;
@@ -5042,6 +5044,7 @@ DIAGNOSE_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Connection Monitor — AI Diagnosis</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
 <script src="/static/timeline.js"></script>
 <style>
 :root {
