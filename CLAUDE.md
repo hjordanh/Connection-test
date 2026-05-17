@@ -1,0 +1,6 @@
+# Rules to follow:
+- Always keep the README.md updated with the current feature set when things change
+- If something can be considered configuration, put a reasonable default value in the code and add an option to read in an override setting in an appropriate configuration file. Have the sample or default config file also be populated with the same default falue.
+- Try to keep things visually and functionally consistent, e.g. use consistent chart colors, graph types for same data, etc. Keep legends matching in look, etc.
+- If a bug is found and fixed, suggest a correction to any data that may have been negatively impacted by the bug.
+- This is a personal hobby project — edit in prod. Always make file edits at the **main checkout path** (`/Users/jordan/claude/Connectiontest/...`), never inside `.claude/worktrees/...`, even if the session was started in a worktree. If the system info reports a worktree path, translate the worktree-relative path to its equivalent under the main checkout (same relative subpath) and edit there. This is so the running LaunchAgent (`monitor.sh`, which executes the main checkout's `connection_monitor.py`) picks up changes on restart without any merge/copy step.

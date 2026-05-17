@@ -1,5 +1,5 @@
-# Runtime data
-connection_monitor_data.json
+# Runtime data + logs
+var/
 
 # Vim swap files
 *.swp
@@ -16,6 +16,5 @@ __pycache__/
 *.env
 .DS_Store
 
-# launchd management script (machine-local) and runtime logs
+# launchd management script (machine-local)
 monitor.sh
-monitor.*.log

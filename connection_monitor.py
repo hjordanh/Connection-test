@@ -113,8 +113,9 @@ except ImportError:
 if os.path.exists(ENV_FILE):
     load_dotenv(ENV_FILE)
 
-import router_log
-import ai_diagnosis
+from lib import router_log
+from lib import ai_diagnosis
+from lib import db
 
 # Optional: speedtest-cli for more accurate measurements
 try:
@@ -124,7 +125,7 @@ except ImportError:
     SPEEDTEST_AVAILABLE = False
 
 PORT = int(os.environ.get("PORT", "8765"))
-DATA_FILE    = os.path.join(SCRIPT_DIR, "connection_monitor_data.json")
+DB_FILE      = os.path.join(SCRIPT_DIR, "var", "connection_monitor.db")
 CONFIG_FILE  = os.path.join(SCRIPT_DIR, "ping_targets.conf")
 _24H = timedelta(hours=24)
 _30D = timedelta(days=30)
@@ -1563,12 +1564,14 @@ def _update_high_ping_degraded(state: "MonitorState", latency_ms: Optional[float
 # Persistence — save/load to disk, purge data older than 24 h
 # ─────────────────────────────────────────────────────────────
 def save_state(state: MonitorState) -> None:
-    """Write speed history, outages, and ping history to disk (atomic write)."""
+    """Flush state deltas to the SQLite store."""
+    if _db is None:
+        return
     try:
         cutoff = datetime.now() - _24H
         cutoff_30d = datetime.now() - _30D
         with state.lock:
-            speed = [
+            speed_samples = [
                 {
                     "timestamp": s.timestamp.isoformat(),
                     "download_mbps": s.download_mbps,
@@ -1580,7 +1583,7 @@ def save_state(state: MonitorState) -> None:
                 for s in state.speed_history
                 if s.timestamp >= cutoff
             ]
-            outages = [
+            outages_list = [
                 {
                     "start": o.start.isoformat(),
                     "end": o.end.isoformat() if o.end else None,
@@ -1598,29 +1601,20 @@ def save_state(state: MonitorState) -> None:
                 for d in state.degraded_periods
                 if d.start >= cutoff_30d
             ]
-            # Ping series retained 30 days so AI diagnoses on older
-            # incidents have full ping context, not just whatever's in the
-            # rolling 24h buffer.
-            # Ping series retained 30 days so AI diagnoses on older
-            # incidents have full ping context, not just whatever's in the
-            # rolling 24h buffer.
             cutoff_30d_iso = cutoff_30d.isoformat()
             ping_ts = [
-                [ts, v]
+                (ts, v)
                 for ts, v in state.ping_history_ts
                 if ts >= cutoff_30d_iso
             ]
             access_ts = [
-                [ts, v]
+                (ts, v)
                 for ts, v in state.ping_accessibility_ts
                 if ts >= cutoff_30d_iso
             ]
-            # Per-site ping history (10s cadence × 30d × N hosts). The bulk
-            # of the long-term ping payload — usually the largest section
-            # of the data file. Filter each host's deque inline.
             site_ping_save = {
                 host: [
-                    [ts, v] for ts, v in hist
+                    (ts, v) for ts, v in hist
                     if ts >= cutoff_30d_iso
                 ]
                 for host, hist in state.site_ping_history.items()
@@ -1629,35 +1623,32 @@ def save_state(state: MonitorState) -> None:
             provider_colors = dict(state.provider_colors)
             current_outage = state.current_outage
             daily_history_snap = list(state.daily_history)
-            # Router events are retained for 30 days (extended from 24h) so
-            # the AI diagnosis can pull a full month of context for any
-            # incident the user clicks on. ~36 MB at current rate.
             router_cutoff_iso = (datetime.now() - _30D).isoformat()
             router_events_to_save = [
                 ev.to_dict()
                 for ev in state.router_events
                 if ev.timestamp >= router_cutoff_iso
             ]
-            # Prune in-memory deque to the same 30d window so live memory
-            # tracks what's on disk (and stays bounded by time, not count).
+            # Keep the in-memory deque bounded by time too (matches what
+            # the DB will hold after the next prune sweep).
             if len(state.router_events) != len(router_events_to_save):
                 state.router_events = deque(
                     (ev for ev in state.router_events if ev.timestamp >= router_cutoff_iso),
                     maxlen=state.router_events.maxlen,
                 )
-            cutoff_30d_iso = (datetime.now() - _30D).isoformat()
             diagnoses_to_save = [
                 d for d in state.diagnoses
                 if (d.get("evaluated_at") or "") >= cutoff_30d_iso
             ]
+            dismissed_ids_snap = set(state.dismissed_outage_ids)
+            first_seen_iso = state.first_seen.isoformat()
 
         # Compute today's daily summary
         now_dt = datetime.now()
         today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
         today_str = today_start.strftime("%Y-%m-%d")
 
-        # Today's outage seconds (from the outages list already read + current_outage)
-        all_today = [o for o in outages if o["start"][:10] == today_str]
+        all_today = [o for o in outages_list if o["start"][:10] == today_str]
         today_outage_secs = 0.0
         for o_dict in all_today:
             o_start = max(datetime.fromisoformat(o_dict["start"]), today_start)
@@ -1665,7 +1656,6 @@ def save_state(state: MonitorState) -> None:
             o_end = min(o_end_raw, now_dt)
             if o_end > o_start:
                 today_outage_secs += (o_end - o_start).total_seconds()
-        # Also account for ongoing outage
         if current_outage and current_outage.start.date() == now_dt.date():
             o_start = max(current_outage.start, today_start)
             today_outage_secs += (now_dt - o_start).total_seconds()
@@ -1673,7 +1663,6 @@ def save_state(state: MonitorState) -> None:
         today_window = (now_dt - today_start).total_seconds()
         today_uptime = round(max(0.0, (today_window - today_outage_secs) / today_window * 100), 2) if today_window > 0 else 100.0
 
-        # Today's pings from the ping_ts list already read in save_state
         today_pings = sorted(v for ts, v in ping_ts if datetime.fromisoformat(ts) >= today_start)
 
         def _pct_simple(sorted_vals, p):
@@ -1698,26 +1687,25 @@ def save_state(state: MonitorState) -> None:
         with state.lock:
             state.daily_history = new_daily_history
 
-        data = {
-            "speed_history": speed,
-            "outages": outages,
-            "ping_history_ts": ping_ts,
-            "ping_accessibility_ts": access_ts,
-            "site_ping_history": site_ping_save,
-            "provider_uptime_secs": provider_uptime,
-            "provider_colors": provider_colors,
-            "daily_history": new_daily_history,
-            "router_events": router_events_to_save,
-            "degraded_periods": degraded,
-            "diagnoses": diagnoses_to_save,
-            "dismissed_outage_ids": sorted(state.dismissed_outage_ids),
-            "first_seen": state.first_seen.isoformat(),
-            "saved_at": datetime.now().isoformat(),
-        }
-        tmp = DATA_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, DATA_FILE)
+        global _cursors
+        _cursors = _db.flush(
+            cursors=_cursors,
+            ping_samples=ping_ts,
+            accessibility_samples=access_ts,
+            site_samples=site_ping_save,
+            speed_samples=speed_samples,
+            outages=outages_list,
+            current_outage=None,  # match legacy behavior — ongoing outage not persisted
+            degraded=degraded,
+            router_events=router_events_to_save,
+            diagnoses=diagnoses_to_save,
+            dismissed_outage_ids=dismissed_ids_snap,
+            daily_summary=new_daily_history,
+            provider_uptime_secs=provider_uptime,
+            provider_colors=provider_colors,
+            first_seen_iso=first_seen_iso,
+            saved_at_iso=datetime.now().isoformat(),
+        )
     except Exception as exc:
         logging.warning("Failed to save state: %s", exc)
 
@@ -1811,43 +1799,56 @@ def _reconstruct_slow_periods_from_speed(
 
 
 def load_state(state: MonitorState) -> None:
-    """Load history from disk; silently skip anything older than 24 hours."""
-    if not os.path.exists(DATA_FILE):
+    """Load history from the SQLite store into in-memory deques."""
+    if _db is None:
         return
     try:
-        with open(DATA_FILE) as f:
-            data = json.load(f)
         cutoff = datetime.now() - _24H
         cutoff_30d = datetime.now() - _30D
+        cutoff_24h_iso = cutoff.isoformat()
+        cutoff_30d_iso = cutoff_30d.isoformat()
+        cutoff_7d_str = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        speed_rows     = _db.load_speed_samples(cutoff_24h_iso)
+        outages_raw    = _db.load_outages(cutoff_30d_iso)
+        degraded_raw   = _db.load_degraded_periods(cutoff_30d_iso)
+        ping_ts_raw    = _db.load_ping_samples(cutoff_30d_iso)
+        access_ts_raw  = _db.load_accessibility_samples(cutoff_30d_iso)
+        site_ts_raw    = _db.load_site_samples(cutoff_30d_iso)
+        router_raw     = _db.load_router_events(cutoff_30d_iso)
+        diag_raw       = _db.load_diagnoses(cutoff_30d_iso)
+        dismissed_set  = _db.load_dismissed_outage_ids()
+        daily          = _db.load_daily_summary(cutoff_7d_str)
+        prov_secs, prov_colors = _db.load_provider_uptime()
+        saved_at_meta  = _db.get_meta("saved_at") or ""
+        first_seen_meta = _db.get_meta("first_seen")
 
         speed: List[SpeedSample] = []
-        for s in data.get("speed_history", []):
-            ts = datetime.fromisoformat(s["timestamp"])
-            if ts >= cutoff:
-                speed.append(SpeedSample(
-                    timestamp=ts,
-                    download_mbps=s["download_mbps"],
-                    upload_mbps=s["upload_mbps"],
-                    ping_ms=s["ping_ms"],
-                    label=s.get("label", ""),
-                    provider=s.get("provider", ""),
-                ))
+        for s in speed_rows:
+            speed.append(SpeedSample(
+                timestamp=datetime.fromisoformat(s["timestamp"]),
+                download_mbps=s["download_mbps"],
+                upload_mbps=s["upload_mbps"],
+                ping_ms=s["ping_ms"],
+                label=s["label"],
+                provider=s["provider"],
+            ))
 
-        # Drop "flap" outages on load — anything shorter than the new
-        # OUTAGE_OPEN_STREAK gate (4 consecutive failed probes × 2s = 8s).
-        # These are records from before the sustained-failure rule landed
-        # (Wi-Fi roams, brief gateway flaps, laptop wake artifacts) that
-        # would not be recorded today. Persist will rewrite the file
-        # without them on the next save.
+        # Re-apply the flap filter so legacy short-outage records from before
+        # the OUTAGE_OPEN_STREAK rule still get filtered out on load. Closed
+        # outages shorter than 8s are flaps (Wi-Fi roams, gateway blips); the
+        # ongoing one (if any) is loaded as state.current_outage.
         FLAP_THRESHOLD = timedelta(seconds=OUTAGE_OPEN_STREAK * 2)
         outages: List[OutageRecord] = []
+        current_outage_from_disk: Optional[OutageRecord] = None
         flap_dropped = 0
-        for o in data.get("outages", []):
+        for o in outages_raw:
             start = datetime.fromisoformat(o["start"])
-            if start < cutoff_30d:
+            end = datetime.fromisoformat(o["end"]) if o["end"] else None
+            if end is None:
+                current_outage_from_disk = OutageRecord(start=start, end=None)
                 continue
-            end = datetime.fromisoformat(o["end"]) if o.get("end") else None
-            if end is not None and (end - start) < FLAP_THRESHOLD:
+            if (end - start) < FLAP_THRESHOLD:
                 flap_dropped += 1
                 continue
             outages.append(OutageRecord(start=start, end=end))
@@ -1855,33 +1856,16 @@ def load_state(state: MonitorState) -> None:
             logging.info("load_state: dropped %d flap outage(s) shorter than %s",
                          flap_dropped, FLAP_THRESHOLD)
 
-        # Load all persisted degraded periods. Previously this path silently
-        # dropped (a) orphans with no end and (b) anything kind=slow/high_ping
-        # longer than 4h, on the theory that they were stuck-state artifacts.
-        # That filter destroyed real long-running events (e.g. a 4-hour
-        # sustained-slow incident) and made the timeline disagree with the AI
-        # diagnoses, which retain their own copies of the event IDs.
-        #
-        # New policy: keep everything inside the 30d window. For orphans
-        # (missing end), close them at the file's saved_at timestamp so they
-        # render with a real bar instead of being dropped. The live close
-        # path will re-open or extend if the condition is still active.
-        saved_at_str = data.get("saved_at") or ""
         try:
-            saved_at_dt = datetime.fromisoformat(saved_at_str) if saved_at_str else datetime.now()
+            saved_at_dt = datetime.fromisoformat(saved_at_meta) if saved_at_meta else datetime.now()
         except ValueError:
             saved_at_dt = datetime.now()
 
         degraded_loaded: List[DegradedPeriod] = []
         closed_orphans = 0
-        for d in data.get("degraded_periods", []):
-            try:
-                start = datetime.fromisoformat(d["start"])
-            except (KeyError, ValueError):
-                continue
-            if start < cutoff_30d:
-                continue
-            end_raw = d.get("end")
+        for d in degraded_raw:
+            start = datetime.fromisoformat(d["start"])
+            end_raw = d["end"]
             if end_raw:
                 try:
                     end = datetime.fromisoformat(end_raw)
@@ -1893,79 +1877,50 @@ def load_state(state: MonitorState) -> None:
                 closed_orphans += 1
             degraded_loaded.append(DegradedPeriod(
                 start=start, end=end,
-                kind=d.get("kind", "slow"),
-                detail=d.get("detail", ""),
+                kind=d["kind"], detail=d["detail"],
             ))
         if closed_orphans:
             logging.info("load_state: closed %d orphan degraded period(s) at saved_at",
                          closed_orphans)
 
-        # All ping series are retained 30d on disk now — load with the 30d
-        # cutoff so AI diagnoses can analyze historical incidents.
-        ping_ts: List[Tuple[str, float]] = [
-            (ts, v)
-            for ts, v in data.get("ping_history_ts", [])
-            if datetime.fromisoformat(ts) >= cutoff_30d
+        ping_ts = list(ping_ts_raw)
+        access_ts = list(access_ts_raw)
+
+        site_ping_loaded: Dict[str, deque] = {
+            host: deque(samples, maxlen=270_000)
+            for host, samples in site_ts_raw.items()
+        }
+
+        router_events_loaded: List = [
+            router_log.RouterEvent(
+                timestamp=r["ts"],
+                src=r["src"], dst=r["dst"], proto=r["proto"],
+                reason=r["reason"], source=r["source"],
+            )
+            for r in router_raw
         ]
-
-        access_ts: List[Tuple[str, float]] = [
-            (ts, v)
-            for ts, v in data.get("ping_accessibility_ts", [])
-            if datetime.fromisoformat(ts) >= cutoff_30d
-        ]
-
-        # Per-site ping history loaded into the same per-host deque structure
-        # the live site_check_thread maintains.
-        site_ping_loaded: Dict[str, deque] = {}
-        site_ping_raw = data.get("site_ping_history", {}) or {}
-        cutoff_30d_iso = cutoff_30d.isoformat()
-        for host, samples in site_ping_raw.items():
-            kept = [(ts, v) for ts, v in samples if ts >= cutoff_30d_iso]
-            if kept:
-                site_ping_loaded[host] = deque(kept, maxlen=270_000)
-
-        # Router events are retained 30 days on disk so historical
-        # diagnoses have context — load with the 30d cutoff, not the
-        # general 24h cutoff used for higher-volume series like ping_ts.
-        router_events_loaded: List = []
-        for r in data.get("router_events", []):
-            ts = r.get("ts", "")
-            try:
-                if ts and datetime.fromisoformat(ts) < cutoff_30d:
-                    continue
-            except ValueError:
-                continue
-            router_events_loaded.append(router_log.RouterEvent(
-                timestamp=ts,
-                src=r.get("src", ""),
-                dst=r.get("dst", ""),
-                proto=r.get("proto", ""),
-                reason=r.get("reason", ""),
-                source=r.get("source", "packet"),
-            ))
 
         with state.lock:
             state.speed_history = speed
             state.outages = outages
+            if current_outage_from_disk:
+                state.current_outage = current_outage_from_disk
             state.ping_history_ts = deque(ping_ts, maxlen=1_400_000)
             state.ping_accessibility_ts = deque(access_ts, maxlen=270_000)
             state.site_ping_history = site_ping_loaded
-            state.provider_uptime_secs = data.get("provider_uptime_secs", {})
-            state.provider_colors = data.get("provider_colors", {})
-            state.daily_history = data.get("daily_history", [])
+            state.provider_uptime_secs = prov_secs
+            state.provider_colors = prov_colors
+            state.daily_history = daily
             state.router_events = deque(router_events_loaded, maxlen=400_000)
             state.degraded_periods = deque(degraded_loaded, maxlen=2000)
 
-            # Restore first_seen — always take the min of (persisted value if
-            # any, current process start, earliest piece of persisted data) so
-            # that long-running installs retain their full history even if the
-            # monitor was restarted recently or this is the first save under
-            # this code version.
+            # Restore first_seen — min of (persisted meta, current process
+            # start, earliest piece of persisted data) so long-running installs
+            # retain their full history across restarts and code versions.
             candidates: List[datetime] = [state.first_seen]
             try:
-                fs = data.get("first_seen")
-                if fs:
-                    candidates.append(datetime.fromisoformat(fs))
+                if first_seen_meta:
+                    candidates.append(datetime.fromisoformat(first_seen_meta))
             except (ValueError, TypeError):
                 pass
             if outages:           candidates.append(min(o.start for o in outages))
@@ -1976,7 +1931,6 @@ def load_state(state: MonitorState) -> None:
                 except (ValueError, TypeError):
                     pass
             if degraded_loaded:   candidates.append(min(d.start for d in degraded_loaded))
-            daily = data.get("daily_history") or []
             if daily:
                 try:
                     candidates.append(datetime.strptime(min(e["date"] for e in daily), "%Y-%m-%d"))
@@ -1984,50 +1938,39 @@ def load_state(state: MonitorState) -> None:
                     pass
             state.first_seen = min(candidates)
 
-            cutoff_30d_iso = (datetime.now() - _30D).isoformat()
-            history_raw = data.get("diagnoses")
-            if history_raw is None:
-                # Backward-compat: previous schema stored a single last_diagnosis.
-                legacy = data.get("last_diagnosis")
-                history_raw = [legacy] if legacy else []
-            kept = []
-            for d in history_raw:
-                if (d.get("evaluated_at") or "") < cutoff_30d_iso:
-                    continue
-                # Backfill missing ids on legacy records so the delete UI can
-                # target them. Synthesize from evaluated_at + a short hash.
-                if not d.get("id"):
-                    base = d.get("evaluated_at") or "unknown"
-                    d["id"] = "legacy-" + str(abs(hash(base)) % 10_000_000)
-                kept.append(d)
-            state.diagnoses = deque(kept, maxlen=500)
-            state.dismissed_outage_ids = set(data.get("dismissed_outage_ids", []) or [])
+            state.diagnoses = deque(diag_raw, maxlen=500)
+            state.dismissed_outage_ids = set(dismissed_set)
             if speed:
                 state.last_speed_test = max(s.timestamp for s in speed)
                 successes = [s for s in speed if s.label != "Outage"]
                 if successes:
                     state.last_speed_success = max(s.timestamp for s in successes)
 
-            # Reconstruct missing slow degraded periods from speed_history.
-            # If a previous build silently dropped a degraded record on load
-            # (or one was never persisted before a crash), the timeline ends
-            # up with no bar even though speed_history clearly shows a
-            # sustained slow run. Walk speed_history once; whenever we see
-            # ≥ SLOW_OPEN_STREAK consecutive non-Outage samples below the
-            # threshold (50% × median of loaded successful samples), and no
-            # existing degraded period overlaps that window, synthesize one.
+            # Reconstruct missing slow degraded periods from speed_history —
+            # same recovery path the JSON loader had, for sustained-slow runs
+            # that aren't in the persisted record but are visible in speed.
             reconstructed = _reconstruct_slow_periods_from_speed(
                 speed, list(state.degraded_periods))
             if reconstructed:
                 state.degraded_periods.extend(reconstructed)
-                # Keep the deque sorted by start so cluster logic is happy.
                 ordered = sorted(state.degraded_periods, key=lambda d: d.start)
                 state.degraded_periods = deque(ordered, maxlen=2000)
                 logging.info("load_state: reconstructed %d slow degraded period(s) "
                              "from speed_history", len(reconstructed))
 
+        # Initialise the persist cursors so the next save_state only inserts
+        # rows the DB doesn't already have.
+        global _cursors
+        _cursors = db.PersistCursors(
+            ping          = ping_ts[-1][0] if ping_ts else "",
+            accessibility = access_ts[-1][0] if access_ts else "",
+            site          = {h: s[-1][0] for h, s in site_ts_raw.items() if s},
+            router        = router_events_loaded[-1].timestamp if router_events_loaded else "",
+            speed         = speed_rows[-1]["timestamp"] if speed_rows else "",
+        )
+
         print(f"  Loaded {len(speed)} speed samples, {len(outages)} outages, "
-              f"{len(ping_ts)} ping points from disk.", flush=True)
+              f"{len(ping_ts)} ping points from DB.", flush=True)
     except Exception as exc:
         logging.warning("Failed to load state: %s", exc)
 
@@ -2112,11 +2055,26 @@ def site_check_thread(state: MonitorState) -> None:
 
 
 def persistence_thread(state: MonitorState) -> None:
-    """Save state to disk every 60 seconds."""
+    """Flush deltas to the SQLite store every 60s. Prune at most once/hour."""
+    global _last_pruned_at
     while state.running:
         time.sleep(60)
-        if state.running:
-            save_state(state)
+        if not state.running:
+            break
+        save_state(state)
+        # Hourly pruning sweep — SQLite handles cheap incremental writes, but
+        # without periodic DELETE-by-time the historical tables would grow
+        # past their retention windows until the next process restart.
+        if _db is not None and (time.time() - _last_pruned_at) >= 3600:
+            try:
+                deleted = _db.prune(db.retention_from_env())
+                total = sum(deleted.values())
+                if total:
+                    logging.info("persistence_thread: pruned %d rows (%s)",
+                                 total, ", ".join(f"{k}={v}" for k, v in deleted.items() if v))
+                _last_pruned_at = time.time()
+            except Exception as exc:
+                logging.warning("Prune failed: %s", exc)
 
 
 def _router_stats(events: List, last_poll: Optional[datetime],
@@ -6849,6 +6807,11 @@ app = Flask(__name__)
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 _state: Optional[MonitorState] = None
+_db: Optional[db.Storage] = None
+_cursors: db.PersistCursors = db.PersistCursors()
+# Wall-clock of the last DB prune, so the persistence thread can ratelimit
+# DELETE WHERE ts < cutoff sweeps (no benefit to running them every 60s).
+_last_pruned_at: float = 0.0
 
 # Bumps every server start so the browser refetches /static/timeline.js even
 # when an aggressive cache (or a proxy/extension that ignores Cache-Control)
@@ -7462,11 +7425,29 @@ def static_timeline_js():
 # ─────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────
+def _init_db() -> None:
+    """Open the SQLite store and prune stale rows once at startup."""
+    global _db, _last_pruned_at
+    db_path = db.db_path_from_env(DB_FILE)
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    _db = db.Storage(db_path)
+    _db.init_schema()
+    try:
+        deleted = _db.prune(db.retention_from_env())
+        total = sum(deleted.values())
+        if total:
+            print(f"  Pruned {total} stale row(s) from DB on startup.", flush=True)
+    except Exception as exc:
+        logging.warning("Startup prune failed: %s", exc)
+    _last_pruned_at = time.time()
+
+
 def main() -> None:
     global _state
     state = MonitorState()
     _state = state
 
+    _init_db()
     load_state(state)
 
     conn_t    = threading.Thread(target=connectivity_thread, args=(state,), daemon=True, name="conn")
@@ -7501,6 +7482,11 @@ def main() -> None:
     finally:
         state.running = False
         save_state(state)
+        if _db is not None:
+            try:
+                _db.close()
+            except Exception:
+                pass
         print("\n  Monitor stopped.\n")
 
 

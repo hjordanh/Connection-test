@@ -2,7 +2,7 @@
 
 A lightweight, self-hosted internet connection monitor with a live web dashboard. Runs in the background and continuously tracks your connection health — no cloud accounts, no telemetry, no subscriptions.
 
-![Connection Monitor dashboard showing the timeline uptime chart, ping history, speed history, site status tiles, and AI-assisted diagnostics button](https://github.com/hjordanh/Connection-test/blob/main/connection_monitor-screenshot.png?raw=true)
+![Connection Monitor dashboard showing the timeline uptime chart, ping history, speed history, site status tiles, and AI-assisted diagnostics button](https://github.com/hjordanh/Connection-test/blob/main/docs/screenshot.png?raw=true)
 
 ---
 
@@ -13,7 +13,7 @@ A lightweight, self-hosted internet connection monitor with a live web dashboard
 - **Speed tests** — automatic download/upload measurements on startup, after outages, and on a periodic schedule; results compared against your hourly baseline so the most recent test is color-coded green/yellow/red
 - **Site status tiles** — monitors named services (Netflix, Xbox Live, Fortnite, etc.) individually and shows a plain-English verdict (GREAT / OK / SLOW / DOWN) with trend arrows
 - **Provider tracking** — detects which ISP or network you're on and tracks per-provider uptime and speed averages
-- **Persistent storage** — history survives restarts; keeps 24 hours of ping data and 30 days of outages, degraded periods, and AI diagnoses on disk
+- **Persistent storage** — history survives restarts; backed by a local SQLite database (`var/connection_monitor.db`) with per-table retention: 30 days of ping/site/outage/degraded/router/diagnosis history, 24 hours of individual speed-test samples, 7 days of the daily uptime chart. All retention windows are env-configurable.
 - **Router log scraping** — for any gateway whose firewall/event log is exposed at an HTTP path (configured in `connection_monitor.env`); polls every 30 s and surfaces firewall drops on the dashboard, including drops of the monitor's own DNS probes (a strong gateway-side root-cause signal)
 - **Timeline uptime chart** — 7-day view on the dashboard, 30-day view on `/diagnose`. Vertical bars show actual time-of-day position of outages (red), degraded periods (yellow stripes for slow speeds or sustained high ping), site-loss periods (teal stripes — a single tracked site flaky while everything else looks fine), and uptime (green). Outages and degraded periods within 30 minutes of each other are clustered into a single incident so the chart is scannable; each member still renders in its own color. Already-analyzed incidents render in a **lighter shade of their category color** with a hover tooltip showing the AI's headline
 - **AI diagnosis** — on-demand "what's actually going on?" summary via Claude on its own page (`/diagnose`) with 30 days of history. Two ways to run:
@@ -112,11 +112,14 @@ cd connection-monitor
 
 Or download these files into a folder:
 
-- `connection_monitor.py` — main script
-- `router_log.py` — router-log scraper module
-- `ai_diagnosis.py` — Claude diagnosis module
+- `connection_monitor.py` — main script (the entrypoint)
+- `lib/router_log.py` — router-log scraper module
+- `lib/ai_diagnosis.py` — Claude diagnosis module
+- `lib/db.py` — SQLite persistence layer
 - `ping_targets.conf` — list of sites to monitor (auto-created on first run if missing)
 - `connection_monitor.env.example` — template for local configuration
+
+Runtime files (the SQLite database, the WAL, and the launchd stdout/stderr logs) live in `var/`, which is created automatically on first run and gitignored.
 
 ### 2. Install optional dependencies
 
@@ -178,6 +181,10 @@ Then edit `connection_monitor.env` and fill in the values you want. The monitor 
 | `SITE_VERDICT_MIN_SAMPLES` | optional | `200` | Minimum number of pool pings required before the primary window is trusted; otherwise the fallback window is used. |
 | `SITE_VERDICT_GREAT_PCT` / `SITE_VERDICT_SLOW_PCT` / `SITE_VERDICT_POOR_PCT` | optional | `10` / `90` / `99` | Pool-percentile boundaries between the latency bands. A site's recent p50 ≤ GREAT% → GREAT, between GREAT% and SLOW% → OK, between SLOW% and POOR% → SLOW, above POOR% → POOR. |
 | `SITE_VERDICT_GREAT_REACH` / `SITE_VERDICT_OK_REACH` / `SITE_VERDICT_SLOW_REACH` | optional | `99` / `95` / `80` | Reachability thresholds (% of probes returning a value). Final verdict = worst of (latency band, reachability band). |
+| `DATA_DB` | optional | `var/connection_monitor.db` (next to script) | Path to the SQLite store. |
+| `RETAIN_PINGS_DAYS` / `RETAIN_SITE_PINGS_DAYS` / `RETAIN_OUTAGES_DAYS` / `RETAIN_DEGRADED_DAYS` / `RETAIN_ROUTER_DAYS` / `RETAIN_DIAGNOSES_DAYS` | optional | `30` each | Retention windows (in days) for each historical table. Rows older than this are pruned at startup and once per hour. |
+| `RETAIN_SPEED_HOURS` | optional | `24` | Retention window (in hours) for individual speed-test samples. |
+| `RETAIN_DAILY_DAYS` | optional | `7` | Retention window (in days) for the daily uptime chart. |
 
 > **Never commit `connection_monitor.env`.** It contains secrets. The repo's `.gitignore` already covers `*.env`.
 
@@ -366,7 +373,7 @@ Then open `http://192.168.x.x:8765` on the other device. No code changes needed 
 
 ## Data & privacy
 
-- All persistent data stays on your machine in `connection_monitor_data.json` (next to the script). Nothing is sent to any cloud service unless you opt in below.
+- All persistent data stays on your machine in `var/connection_monitor.db` (a local SQLite database). Nothing is sent to any cloud service unless you opt in below.
 - **DNS probes** (every 2 s) make TCP connections to `8.8.8.8`, `1.1.1.1`, and `208.67.222.222` on port 53 to detect outages. No DNS queries are actually issued.
 - **Speed tests** make outbound HTTP requests to public test servers (Cloudflare, OVH, Tele2) to measure throughput.
 - **Site monitoring** makes TCP connections to the hostnames in `ping_targets.conf` on port 443.

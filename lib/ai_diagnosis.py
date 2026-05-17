@@ -20,7 +20,7 @@ import subprocess
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-import router_log
+from . import router_log
 
 
 MODEL = "claude-sonnet-4-6"
