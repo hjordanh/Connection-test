@@ -174,6 +174,7 @@ Then edit `connection_monitor.env` and fill in the values you want. The monitor 
 | `ROUTER_SYSLOG_PATH` | optional | — *(blank skips)* | Path for the system event log. AT&T-style gateways use `/cgi-bin/syslog.ha`. |
 | `ROUTER_POLL_INTERVAL` | optional | `30` | Seconds between gateway polls. |
 | `PORT` | optional | `8765` | Port the dashboard listens on. |
+| `BIND_HOST` | optional | `127.0.0.1` | Interface the dashboard binds to. Loopback by default (reachable only from this machine; on a VPS, only via local nginx). Set to `0.0.0.0` to allow access from other devices on your network — pair that with `DASHBOARD_USER`/`DASHBOARD_PASS`. |
 | `MONITOR_GAP_MIN_REPORT_MIN` | optional | `60` | Minimum gap (in minutes) before "monitor not running" downtime is rendered as a dim segment on the timeline. Default of 60 min skips macOS App Nap suspensions (which routinely fully-suspend background python processes for 15–30 min at a stretch) and only flags genuine crashes / long away-from-keyboard windows. Lower this on always-on machines (e.g. `5`) where any gap is news; set to `0` to render every detected gap. |
 | `HIGH_PING_FLOOR_MS` | optional | `75` | Absolute floor (in ms) for high-ping detection. Below this, latency is never considered "high" regardless of network baseline. Useful for very-fast networks where the percentile baseline could otherwise dip too low. |
 | `HIGH_PING_BASELINE_PCT` | optional | `99` | Percentile of your own connectivity-probe pings (over the last 7d, excluding samples inside prior high-ping windows) used as the high-ping trigger. P99 = "your normal worst." Lower this (e.g. `97`) to be more sensitive; raise it (`99.5`) to be stricter. |
@@ -361,14 +362,14 @@ nssm start ConnectionMonitor
 
 ## Accessing from other devices on your network
 
-By default the dashboard only listens on localhost. To access it from your phone or another computer on the same Wi-Fi, find your machine's local IP:
+By default the dashboard only listens on localhost (`127.0.0.1`), so it's reachable only from the machine it runs on. To access it from your phone or another computer on the same Wi-Fi, set `BIND_HOST=0.0.0.0` in `connection_monitor.env` and restart. **Because that opens the dashboard — including its data-mutating endpoints — to everyone on your network, also set `DASHBOARD_USER` and `DASHBOARD_PASS`** so it requires a password. Then find your machine's local IP:
 
 - **macOS/Linux**: `ip addr` or `ifconfig`
 - **Windows**: `ipconfig`
 
-Then open `http://192.168.x.x:8765` on the other device. No code changes needed — Flask will accept connections on all interfaces as long as your firewall allows port 8765.
+Then open `http://192.168.x.x:8765` on the other device (assuming your firewall allows port 8765).
 
-> **Note:** This is only for local network access. Do not expose port 8765 to the public internet without adding authentication.
+> **Note:** This is only for local network access. Do not expose port 8765 to the public internet. For internet-reachable access, use the [VPS deployment](#multi-host--vps-deployment), which fronts the dashboard with nginx + HTTPS + Basic Auth.
 
 ---
 
