@@ -551,7 +551,8 @@ def build_chart_data(state, window: str,
 def build_snapshot(state, window: str,
                    incident_start: Optional[datetime] = None,
                    incident_end: Optional[datetime] = None,
-                   incident_id: Optional[str] = None) -> Dict[str, Any]:
+                   incident_id: Optional[str] = None,
+                   network_names: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Build a JSON-safe snapshot for the AI. `state` is a MonitorState; we read
     under its lock and never hold it during the API call.
 
@@ -568,8 +569,9 @@ def build_snapshot(state, window: str,
         site_targets = list(state.site_targets)
         site_names = dict(state.site_names)
         site_ping_hist = {h: list(state.site_ping_history.get(h, [])) for h in site_targets}
-        provider = state.current_provider
-        provider_uptime = dict(state.provider_uptime_secs)
+        network = state.current_network
+        network_uptime = dict(state.network_uptime_secs)
+        network_changes = list(getattr(state, "network_changes", []))
         router_events = list(getattr(state, "router_events", []))
         router_poll_error = getattr(state, "router_poll_error", None)
         last_router_poll = getattr(state, "last_router_poll", None)
@@ -655,7 +657,7 @@ def build_snapshot(state, window: str,
                 "ul": round(s.upload_mbps, 1),
                 "ping": round(s.ping_ms, 1) if s.ping_ms else None,
                 "label": s.label,
-                "provider": s.provider,
+                "network": s.network,
             }
             for s in speeds[-20:]
         ],
@@ -696,8 +698,13 @@ def build_snapshot(state, window: str,
         "window_seconds": int(window_secs),
         "window_start": cutoff.isoformat(timespec="seconds"),
         "window_end": end_at.isoformat(timespec="seconds"),
-        "current_provider": provider,
-        "provider_uptime_secs_24h": provider_uptime,
+        "current_network": network,
+        "network_uptime_secs_24h": network_uptime,
+        "network_names": network_names or {},
+        "network_changes": [
+            c for c in network_changes
+            if cutoff.isoformat() <= c["ts"] <= end_at.isoformat()
+        ],
         "ping": ping_stats,
         "outages": {
             "count": len(outages_in_window),
@@ -746,14 +753,19 @@ non-empty, the FIRST cause must be gateway-side (but phrase it in plain terms, \
 e.g. "router rejecting the monitor's check-ins" rather than "uRPF dropping \
 DNS probes").
 
+If `network_changes` is non-empty, a Wi-Fi network switch occurred during the \
+window. Use `network_names` to map fingerprints to friendly names in your \
+output. A network switch that coincides with an outage is a strong signal \
+— say so (e.g. "the internet dropped while switching from AT&T to Eero").
+
 **For each cause, populate `signals` with 1-3 dotted-path references to the \
 specific snapshot fields that grounded your conclusion** (e.g. \
 "router_events.dns_probe_drop_count", "ping.p90", "ping.jitter_stdev", \
 "outages.count", "outages.total_downtime_s", "speed.download_mbps.p10", \
-"sites[*].reachable_pct"). These are the verifiable evidence trail. If you \
-cannot point to a specific snapshot field, drop the cause — every cause must \
-be grounded in named evidence. Do not invent field names; only cite paths \
-that actually exist in the snapshot above.\
+"sites[*].reachable_pct", "network_changes"). These are the verifiable \
+evidence trail. If you cannot point to a specific snapshot field, drop the \
+cause — every cause must be grounded in named evidence. Do not invent field \
+names; only cite paths that actually exist in the snapshot above.\
 """
 
 

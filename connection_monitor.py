@@ -19,6 +19,7 @@ import urllib.request
 import urllib.error
 import logging
 import statistics
+import subprocess
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
@@ -135,6 +136,15 @@ GATEWAY_URL            = os.environ.get("GATEWAY_URL", "")
 ROUTER_PACKET_LOG_PATH = os.environ.get("ROUTER_PACKET_LOG_PATH", "")
 ROUTER_SYSLOG_PATH     = os.environ.get("ROUTER_SYSLOG_PATH", "")
 ROUTER_POLL_INTERVAL   = int(os.environ.get("ROUTER_POLL_INTERVAL", "30"))
+
+# ── Multi-host / VPS sync ──────────────────────────────────────
+SERVER_URL             = os.environ.get("SERVER_URL", "").rstrip("/")
+INGEST_API_KEY         = os.environ.get("INGEST_API_KEY", "")
+DASHBOARD_USER         = os.environ.get("DASHBOARD_USER", "")
+DASHBOARD_PASS         = os.environ.get("DASHBOARD_PASS", "")
+DISABLE_SPEED_TESTS    = os.environ.get("DISABLE_SPEED_TESTS", "").lower() in ("true", "1", "yes")
+MONITOR_HOST           = os.environ.get("MONITOR_HOST", "") or socket.gethostname()
+AGGREGATOR             = os.environ.get("AGGREGATOR", "").lower() in ("true", "1", "yes")
 
 # Degraded-period detection thresholds (tuning knobs, not deployment config).
 # ─────────────────────────────────────────────────────────────
@@ -329,7 +339,7 @@ class SpeedSample:
     upload_mbps: float
     ping_ms: float
     label: str = ""
-    provider: str = ""
+    network: str = ""
 
 
 @dataclass
@@ -422,12 +432,13 @@ class MonitorState:
         # ~75 MB on disk, the bulk of the long-term ping retention budget.
         self.site_ping_history: Dict[str, deque] = {}
 
-        # Provider
-        self.current_provider: str = ""
-        self.provider_uptime_secs: Dict[str, float] = {}
-        self.provider_start_time: Dict[str, datetime] = {}
-        self.provider_colors: Dict[str, str] = {}
-        self._provider_color_palette: List[str] = [
+        # Network
+        self.current_network: str = ""
+        self.network_uptime_secs: Dict[str, float] = {}
+        self.network_start_time: Dict[str, datetime] = {}
+        self.network_colors: Dict[str, str] = {}
+        self.network_changes: deque = deque(maxlen=200)
+        self._network_color_palette: List[str] = [
             "#58a6ff", "#3fb950", "#bc8cff", "#39c5cf",
             "#d29922", "#f85149", "#e3b341", "#79c0ff",
         ]
@@ -508,12 +519,12 @@ class MonitorState:
         with self.lock:
             self.events.appendleft((ts, level, msg))
 
-    def assign_provider_color(self, provider: str) -> str:
-        """Return (and cache) a stable color for this provider. Call with lock held."""
-        if provider not in self.provider_colors:
-            idx = len(self.provider_colors) % len(self._provider_color_palette)
-            self.provider_colors[provider] = self._provider_color_palette[idx]
-        return self.provider_colors[provider]
+    def assign_network_color(self, network: str) -> str:
+        """Return (and cache) a stable color for this network. Call with lock held."""
+        if network not in self.network_colors:
+            idx = len(self.network_colors) % len(self._network_color_palette)
+            self.network_colors[network] = self._network_color_palette[idx]
+        return self.network_colors[network]
 
     def avg_ping(self) -> Optional[float]:
         with self.lock:
@@ -521,13 +532,13 @@ class MonitorState:
                 return None
             return sum(self.ping_history) / len(self.ping_history)
 
-    def all_provider_uptimes(self) -> Dict[str, float]:
+    def all_network_uptimes(self) -> Dict[str, float]:
         with self.lock:
             now = datetime.now()
-            result: Dict[str, float] = dict(self.provider_uptime_secs)
-            if self.current_provider and self.current_provider in self.provider_start_time:
-                result[self.current_provider] = result.get(self.current_provider, 0.0) + (
-                    now - self.provider_start_time[self.current_provider]
+            result: Dict[str, float] = dict(self.network_uptime_secs)
+            if self.current_network and self.current_network in self.network_start_time:
+                result[self.current_network] = result.get(self.current_network, 0.0) + (
+                    now - self.network_start_time[self.current_network]
                 ).total_seconds()
             return result
 
@@ -545,12 +556,22 @@ class MonitorState:
     @staticmethod
     def _fmt_dur(secs: float) -> str:
         s = int(secs)
-        h, rem = divmod(s, 3600)
-        m, sec = divmod(rem, 60)
-        if h:
-            return f"{h}h {m:02d}m {sec:02d}s"
-        if m:
-            return f"{m}m {sec:02d}s"
+        minutes, sec = divmod(s, 60)
+        hours, minute = divmod(minutes, 60)
+        days, hour = divmod(hours, 24)
+        total_weeks, day = divmod(days, 7)
+        months, week = divmod(total_weeks, 4)
+
+        if months:
+            return f"{months}mo {week}w" if week else f"{months}mo"
+        if total_weeks:
+            return f"{total_weeks}w {day}d" if day else f"{total_weeks}w"
+        if days:
+            return f"{days}d {hour}h"
+        if hours:
+            return f"{hours}h {minute:02d}m"
+        if minutes:
+            return f"{minutes}m {sec:02d}s"
         return f"{sec}s"
 
     def to_dict(self) -> dict:
@@ -570,8 +591,8 @@ class MonitorState:
             last_speed_success = self.last_speed_success
             events           = list(self.events)
             start_time       = self.start_time
-            current_provider = self.current_provider
-            provider_colors  = dict(self.provider_colors)
+            current_network = self.current_network
+            network_colors  = dict(self.network_colors)
             site_targets_snap = list(self.site_targets)[:12]
             site_names_snap   = dict(self.site_names)
             site_ping_hist_snap = {
@@ -589,7 +610,7 @@ class MonitorState:
         now = datetime.now()
         runtime_secs = (now - start_time).total_seconds()
         avg_p = (sum(ping_hist) / len(ping_hist)) if ping_hist else None
-        provider_uptimes = self.all_provider_uptimes()
+        network_uptimes = self.all_network_uptimes()
         total_out = self.total_outage_secs()
         all_outages = outages + ([cur_out] if cur_out else [])
 
@@ -614,30 +635,15 @@ class MonitorState:
             current_uptime_secs = (now - since).total_seconds()
 
         # 5-minute slices (before downsampling)
+        # ping_ts is sorted (ts_str, value) tuples; bisect on the tuple list
+        # using a 1-element sentinel — shorter tuple is always < any matching
+        # 2-element tuple, so this finds the first entry with ts >= cutoff.
+        import bisect as _bisect
         cutoff_1h = now - timedelta(hours=1)
         cutoff_5m = now - timedelta(minutes=5)
-        ping_ts_5m = [(t, v) for t, v in ping_ts if datetime.fromisoformat(t) >= cutoff_5m]
-
-        # Build accessibility lookup: nearest pct for each ping timestamp
-        # access_ts entries are (iso_ts, pct) at ~10s cadence
-        access_map: Dict[str, float] = {t: p for t, p in access_ts}
-
-        def nearest_pct(ts_str: str) -> Optional[float]:
-            """Find nearest accessibility value for a ping timestamp."""
-            if not access_ts:
-                return None
-            # access_ts is ordered; binary-ish search for nearest
-            best = None
-            best_delta = float("inf")
-            target = datetime.fromisoformat(ts_str)
-            for a_ts, a_pct in access_ts:
-                delta = abs((datetime.fromisoformat(a_ts) - target).total_seconds())
-                if delta < best_delta:
-                    best_delta = delta
-                    best = a_pct
-                elif delta > best_delta + 30:
-                    break
-            return best
+        _cutoff_5m_iso = cutoff_5m.isoformat()
+        _5m_start = _bisect.bisect_left(ping_ts, (_cutoff_5m_iso,))
+        ping_ts_5m = ping_ts[_5m_start:]
 
         # Downsample 24h ping to max 300 points for chart performance
         MAX_PING_CHART = 300
@@ -663,19 +669,28 @@ class MonitorState:
         # 24h chart's last bucket and the 5m chart's first sample.
         current_hour = now.replace(minute=0, second=0, microsecond=0)
         first_slot_start = current_hour - timedelta(hours=24)
+        # ping_ts_all is sorted (ts_str, value) tuples; bisect directly on the
+        # tuple list to find the 24h window start — O(log N), no key copy.
+        import bisect as _bisect
+        first_slot_iso = first_slot_start.isoformat()
+        _slot_start_idx = _bisect.bisect_left(ping_ts_all, (first_slot_iso,))
+        ping_ts_24h = ping_ts_all[_slot_start_idx:]
         ping_buckets: List[List[float]] = [[] for _ in range(24)]
         access_buckets: List[List[float]] = [[] for _ in range(24)]
-        for ts_str, v in ping_ts_all:
+        for ts_str, v in ping_ts_24h:
             try:
                 dt = datetime.fromisoformat(ts_str)
             except ValueError:
                 continue
-            if dt < first_slot_start or dt >= current_hour:
-                continue
+            if dt >= current_hour:
+                break
             idx = int((dt - first_slot_start).total_seconds() // 3600)
             if 0 <= idx < 24:
                 ping_buckets[idx].append(v)
-        for ts_str, p in access_ts:
+        # Slice access_ts to the same 24h window — bisect on tuples directly.
+        _access_start_idx = _bisect.bisect_left(access_ts, (first_slot_iso,))
+        access_ts_24h = access_ts[_access_start_idx:]
+        for ts_str, p in access_ts_24h:
             try:
                 dt = datetime.fromisoformat(ts_str)
             except ValueError:
@@ -730,11 +745,11 @@ class MonitorState:
                 ul_p10 = round(_percentile(uls, 10), 1)
                 ul_p90 = round(_percentile(uls, 90), 1)
                 ul_max = round(uls[-1], 1)
-                provider = tests[-1].provider
+                network = tests[-1].network
             else:
                 dl_p10 = dl_p90 = dl_max = None
                 ul_p10 = ul_p90 = ul_max = None
-                provider = None
+                network = None
             h_int = slot_start.hour
             speed_hourly.append({
                 "hour":        f"{h_int % 12 or 12}{'am' if h_int < 12 else 'pm'}",
@@ -748,7 +763,7 @@ class MonitorState:
                 "ul_p90_maxd": round(max(0, ul_max - ul_p90), 1) if ul_p90 is not None else None,
                 "ul_p90":      ul_p90,
                 "ul_max":      ul_max,
-                "provider":    provider,
+                "network":     network,
             })
 
         # Most recent individual test result (bar 25 on combined chart)
@@ -779,7 +794,7 @@ class MonitorState:
                 "dl_p90":      v_dl, "dl_max": v_dl,
                 "ul_p10":      v_ul, "ul_p10_90d": 0, "ul_p90_maxd": 0,
                 "ul_p90":      v_ul, "ul_max": v_ul,
-                "provider":    latest.provider,
+                "network":     latest.network,
                 "is_latest":   True,
                 "dl_perf":     _perf(v_dl, ref_dls_1h),
                 "ul_perf":     _perf(v_ul, ref_uls_1h),
@@ -852,11 +867,15 @@ class MonitorState:
         cutoff_5m_site  = now - timedelta(minutes=5)
         cutoff_1h_site  = now - timedelta(hours=1)
         cutoff_24h_site = now - timedelta(hours=24)
+        _cut_24h_iso = cutoff_24h_site.isoformat()
+        _cut_1h_iso  = cutoff_1h_site.isoformat()
+        _cut_5m_iso  = cutoff_5m_site.isoformat()
         for host in site_targets_snap:
             hist = site_ping_hist_snap.get(host, [])
-            h5m  = [(t, ms) for t, ms in hist if datetime.fromisoformat(t) >= cutoff_5m_site]
-            h1h  = [(t, ms) for t, ms in hist if datetime.fromisoformat(t) >= cutoff_1h_site]
-            h24h = [(t, ms) for t, ms in hist if datetime.fromisoformat(t) >= cutoff_24h_site]
+            # hist is sorted (ts_str, ms_or_None); bisect on tuples O(log N)
+            h24h = hist[_bisect.bisect_left(hist, (_cut_24h_iso,)):]
+            h1h  = h24h[_bisect.bisect_left(h24h, (_cut_1h_iso,)):]
+            h5m  = h1h[_bisect.bisect_left(h1h,  (_cut_5m_iso,)):]
             p5m,  p10_5m,  p50_5m,  p90_5m  = _site_stats(h5m)
             p1h,  p10_1h,  p50_1h,  p90_1h  = _site_stats(h1h)
             p24h, p10_24h, p50_24h, p90_24h = _site_stats(h24h)
@@ -916,7 +935,8 @@ class MonitorState:
             "connected": connected,
             "last_ping_ms": round(last_ping, 1) if last_ping else None,
             "avg_ping_ms": round(avg_p, 1) if avg_p else None,
-            "current_provider": current_provider,
+            "current_network": current_network,
+            "monitor_host": socket.gethostname(),
             "runtime_secs": round(runtime_secs),
             "runtime_str": self._fmt_dur(runtime_secs),
             "current_uptime_str": self._fmt_dur(current_uptime_secs) if current_uptime_secs else None,
@@ -945,7 +965,7 @@ class MonitorState:
                     "upload_mbps": round(s.upload_mbps, 1),
                     "ping_ms": round(s.ping_ms, 1),
                     "label": s.label,
-                    "provider": s.provider,
+                    "network": s.network,
                 }
                 for s in speed_history
             ],
@@ -956,7 +976,7 @@ class MonitorState:
                     "upload_mbps": round(s.upload_mbps, 1),
                     "ping_ms": round(s.ping_ms, 1),
                     "label": s.label,
-                    "provider": s.provider,
+                    "network": s.network,
                 }
                 for s in speed_history_5m
             ],
@@ -983,18 +1003,19 @@ class MonitorState:
                     "upload_mbps": round(s.upload_mbps, 1),
                     "ping_ms": round(s.ping_ms, 1),
                     "label": s.label,
-                    "provider": s.provider,
+                    "network": s.network,
                 }
                 for s in speed_history_1h
             ],
             "speed_in_progress": in_progress,
             "speed_status": speed_status,
             "next_test_in": int(next_test_in) if next_test_in is not None else None,
-            "provider_uptimes": {
+            "network_uptimes": {
                 k: {"pct": min(100.0, round(v / runtime_secs * 100, 1)) if runtime_secs > 0 else 0.0}
-                for k, v in provider_uptimes.items()
+                for k, v in network_uptimes.items()
             },
-            "provider_colors": provider_colors,
+            "network_colors": network_colors,
+            "network_names": _db.load_network_names(),
             "uptime_pct_24h": uptime_pct_24h,
             "site_matrix": site_matrix,
             "site_pool_thresholds": site_pool_thresholds,
@@ -1013,6 +1034,7 @@ class MonitorState:
             # phase (init / get_best_server / download / upload).
             "primary_fail_reasons": list(self.primary_fail_reasons)[:25],
             "last_diagnosis_at": (last_diagnosis_snap.get("evaluated_at") if last_diagnosis_snap else None),
+            "vps_url": SERVER_URL or None,
         }
 
 
@@ -1083,22 +1105,122 @@ _UL_URLS = [
 _HEADERS = {"User-Agent": "ConnectionMonitor/1.0"}
 
 
-def _detect_provider() -> str:
-    endpoints: List[Tuple[str, object]] = [
-        ("https://ipinfo.io/json", lambda d: " ".join(d.get("org", "").split()[1:]).strip()),
-        ("http://ip-api.com/json",  lambda d: d.get("isp", "").strip()),
-    ]
-    for url, extract in endpoints:
+def _quick_gateway() -> str:
+    """Return the default gateway IP, or '' on failure. Single subprocess call."""
+    try:
+        out = subprocess.check_output(
+            ["route", "-n", "get", "default"],
+            stderr=subprocess.DEVNULL, timeout=3,
+        ).decode()
+        for line in out.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("gateway:"):
+                return stripped.split(":", 1)[1].strip()
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return ""
+
+
+_network_cache: Tuple[Tuple[str, str], float] = (("", ""), 0.0)
+_NETWORK_CACHE_TTL = 120.0
+
+
+def _detect_network() -> Tuple[str, str]:
+    """Detect the network via gateway IP + subnet mask fingerprint.
+
+    Returns (fingerprint, interface_type) where fingerprint is
+    "gateway/prefix" (e.g. "192.168.1.254/24") and interface_type is
+    "wifi" or "wired".  Runs in a daemon thread with a hard 20s cap so
+    subprocess stalls cannot block the speed-test thread.
+    """
+    global _network_cache
+    cached_result, cached_ts = _network_cache
+    if cached_result[0] and (time.time() - cached_ts) < _NETWORK_CACHE_TTL:
+        return cached_result
+
+    result: List[Tuple[str, str]] = [("unknown", "unknown")]
+
+    def _inner() -> None:
+        hw_map: Dict[str, str] = {}
         try:
-            req = urllib.request.Request(url, headers=_HEADERS)
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read())
-                name = extract(data)  # type: ignore[operator]
-                if name:
-                    return name
-        except Exception:
-            continue
-    return "Unknown"
+            hw_out = subprocess.check_output(
+                ["networksetup", "-listallhardwareports"],
+                stderr=subprocess.DEVNULL, timeout=5,
+            ).decode()
+            port: Optional[str] = None
+            for line in hw_out.splitlines():
+                if line.startswith("Hardware Port:"):
+                    port = line.split(":", 1)[1].strip()
+                elif line.startswith("Device:"):
+                    iface = line.split(":", 1)[1].strip()
+                    if port:
+                        hw_map[iface] = port
+                        port = None
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+        active_iface: Optional[str] = None
+        for idx in range(10):
+            iface = f"en{idx}"
+            try:
+                ip = subprocess.check_output(
+                    ["ipconfig", "getifaddr", iface],
+                    stderr=subprocess.DEVNULL, timeout=2,
+                ).decode().strip()
+                if ip:
+                    active_iface = iface
+                    break
+            except (subprocess.SubprocessError, OSError):
+                continue
+
+        if not active_iface:
+            return
+
+        port_type = hw_map.get(active_iface, "")
+        if "Wi-Fi" in port_type or "AirPort" in port_type:
+            iface_type = "wifi"
+        elif port_type:
+            iface_type = "wired"
+        else:
+            iface_type = "wifi"
+
+        gateway = ""
+        try:
+            out = subprocess.check_output(
+                ["route", "-n", "get", "default"],
+                stderr=subprocess.DEVNULL, timeout=3,
+            ).decode()
+            for line in out.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("gateway:"):
+                    gateway = stripped.split(":", 1)[1].strip()
+                    break
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+        if not gateway:
+            result[0] = (iface_type, iface_type)
+            return
+
+        prefix = "24"
+        try:
+            mask = subprocess.check_output(
+                ["ipconfig", "getoption", active_iface, "subnet_mask"],
+                stderr=subprocess.DEVNULL, timeout=2,
+            ).decode().strip()
+            if mask:
+                prefix = str(sum(bin(int(x)).count("1") for x in mask.split(".")))
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pass
+
+        result[0] = (f"{gateway}/{prefix}", iface_type)
+
+    t = threading.Thread(target=_inner, daemon=True, name="network-detect")
+    t.start()
+    t.join(timeout=20)
+
+    _network_cache = (result[0], time.time())
+    return result[0]
 
 
 def _http_download_mbps() -> Optional[float]:
@@ -1183,22 +1305,38 @@ def run_speed_test(state: MonitorState, label: str) -> None:
         if state.speed_in_progress:
             return
         state.speed_in_progress = True
-        state.speed_status = "Detecting provider…"
+        state.speed_status = "Detecting network…"
 
-    provider = _detect_provider()
+    try:
+        fingerprint, iface_type = _detect_network()
+    except Exception as exc:
+        state.log(f"Network detection error: {exc}", "error")
+        fingerprint, iface_type = "unknown", "unknown"
+        with state.lock:
+            state.speed_in_progress = False
+            state.speed_status = ""
+            state.last_speed_test = datetime.now()
+        return
+    _db.register_network(fingerprint, iface_type)
+    network = fingerprint
     with state.lock:
-        old_provider = state.current_provider
+        old_network = state.current_network
         now = datetime.now()
-        if old_provider and old_provider != provider:
-            if old_provider in state.provider_start_time:
-                elapsed = (now - state.provider_start_time[old_provider]).total_seconds()
-                state.provider_uptime_secs[old_provider] = (
-                    state.provider_uptime_secs.get(old_provider, 0.0) + elapsed
+        if old_network and old_network != network:
+            if old_network in state.network_start_time:
+                elapsed = (now - state.network_start_time[old_network]).total_seconds()
+                state.network_uptime_secs[old_network] = (
+                    state.network_uptime_secs.get(old_network, 0.0) + elapsed
                 )
-        if not old_provider or old_provider != provider:
-            state.provider_start_time[provider] = now
-        state.current_provider = provider
-        state.assign_provider_color(provider)
+            state.network_changes.append({
+                "ts": now.isoformat(timespec="seconds"),
+                "from": old_network,
+                "to": network,
+            })
+        if not old_network or old_network != network:
+            state.network_start_time[network] = now
+        state.current_network = network
+        state.assign_network_color(network)
         state.speed_status = "Initialising speed test…"
 
     primary_dl: Optional[float] = None
@@ -1261,7 +1399,7 @@ def run_speed_test(state: MonitorState, label: str) -> None:
                 upload_mbps=primary_ul or 0.0,
                 ping_ms=primary_ping or 0.0,
                 label=label,
-                provider=provider,
+                network=network,
             )
             slow_event: Optional[Tuple[str, str]] = None
             with state.lock:
@@ -1270,7 +1408,7 @@ def run_speed_test(state: MonitorState, label: str) -> None:
                 slow_event = _update_slow_degraded(state, sample, test_end)
             dl_str = f"↓{primary_dl:.1f}" if primary_dl else "↓?"
             ul_str = f"↑{primary_ul:.1f}" if primary_ul else "↑?"
-            state.log(f"Speed [{label}] via {provider}: {dl_str} {ul_str} Mbps")
+            state.log(f"Speed [{label}] via {network}: {dl_str} {ul_str} Mbps")
             if slow_event:
                 state.log(*slow_event)
         elif fallback_ok:
@@ -1563,147 +1701,165 @@ def _update_high_ping_degraded(state: "MonitorState", latency_ms: Optional[float
 # ─────────────────────────────────────────────────────────────
 # Persistence — save/load to disk, purge data older than 24 h
 # ─────────────────────────────────────────────────────────────
+def _build_flush_payload(state: MonitorState) -> dict:
+    """Snapshot state into a dict suitable for db.flush() kwargs and sync POST."""
+    cutoff = datetime.now() - _24H
+    cutoff_30d = datetime.now() - _30D
+    with state.lock:
+        speed_samples = [
+            {
+                "timestamp": s.timestamp.isoformat(),
+                "download_mbps": s.download_mbps,
+                "upload_mbps": s.upload_mbps,
+                "ping_ms": s.ping_ms,
+                "label": s.label,
+                "network": s.network,
+            }
+            for s in state.speed_history
+            if s.timestamp >= cutoff
+        ]
+        outages_list = [
+            {
+                "start": o.start.isoformat(),
+                "end": o.end.isoformat() if o.end else None,
+            }
+            for o in state.outages
+            if o.start >= cutoff_30d
+        ]
+        degraded = [
+            {
+                "start": d.start.isoformat(),
+                "end": d.end.isoformat() if d.end else None,
+                "kind": d.kind,
+                "detail": d.detail,
+            }
+            for d in state.degraded_periods
+            if d.start >= cutoff_30d
+        ]
+        cutoff_30d_iso = cutoff_30d.isoformat()
+        ping_ts = [
+            (ts, v)
+            for ts, v in state.ping_history_ts
+            if ts >= cutoff_30d_iso
+        ]
+        access_ts = [
+            (ts, v)
+            for ts, v in state.ping_accessibility_ts
+            if ts >= cutoff_30d_iso
+        ]
+        site_ping_save = {
+            host: [
+                (ts, v) for ts, v in hist
+                if ts >= cutoff_30d_iso
+            ]
+            for host, hist in state.site_ping_history.items()
+        }
+        network_uptime = dict(state.network_uptime_secs)
+        network_colors = dict(state.network_colors)
+        current_outage = state.current_outage
+        daily_history_snap = list(state.daily_history)
+        router_cutoff_iso = (datetime.now() - _30D).isoformat()
+        router_events_to_save = [
+            ev.to_dict()
+            for ev in state.router_events
+            if ev.timestamp >= router_cutoff_iso
+        ]
+        if len(state.router_events) != len(router_events_to_save):
+            state.router_events = deque(
+                (ev for ev in state.router_events if ev.timestamp >= router_cutoff_iso),
+                maxlen=state.router_events.maxlen,
+            )
+        diagnoses_to_save = [
+            d for d in state.diagnoses
+            if (d.get("evaluated_at") or "") >= cutoff_30d_iso
+        ]
+        dismissed_ids_snap = set(state.dismissed_outage_ids)
+        first_seen_iso = state.first_seen.isoformat()
+
+    now_dt = datetime.now()
+    today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_str = today_start.strftime("%Y-%m-%d")
+
+    all_today = [o for o in outages_list if o["start"][:10] == today_str]
+    today_outage_secs = 0.0
+    for o_dict in all_today:
+        o_start = max(datetime.fromisoformat(o_dict["start"]), today_start)
+        o_end_raw = datetime.fromisoformat(o_dict["end"]) if o_dict.get("end") else now_dt
+        o_end = min(o_end_raw, now_dt)
+        if o_end > o_start:
+            today_outage_secs += (o_end - o_start).total_seconds()
+    if current_outage and current_outage.start.date() == now_dt.date():
+        o_start = max(current_outage.start, today_start)
+        today_outage_secs += (now_dt - o_start).total_seconds()
+
+    today_window = (now_dt - today_start).total_seconds()
+    today_uptime = round(max(0.0, (today_window - today_outage_secs) / today_window * 100), 2) if today_window > 0 else 100.0
+
+    today_pings = sorted(v for ts, v in ping_ts if datetime.fromisoformat(ts) >= today_start)
+
+    def _pct_simple(sorted_vals, p):
+        n = len(sorted_vals)
+        if n == 1:
+            return sorted_vals[0]
+        idx = p / 100 * (n - 1)
+        lo, hi = int(idx), min(int(idx) + 1, n - 1)
+        return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (idx - lo)
+
+    p10_t = round(_pct_simple(today_pings, 10), 1) if len(today_pings) >= 2 else None
+    p50_t = round(_pct_simple(today_pings, 50), 1) if len(today_pings) >= 2 else None
+    p90_t = round(_pct_simple(today_pings, 90), 1) if len(today_pings) >= 2 else None
+
+    today_entry = {"date": today_str, "uptime_pct": today_uptime,
+                   "p10": p10_t, "p50": p50_t, "p90": p90_t}
+
+    cutoff_7d_str = (now_dt - timedelta(days=7)).strftime("%Y-%m-%d")
+    hist_dict = {e["date"]: e for e in daily_history_snap if e["date"] > cutoff_7d_str}
+    hist_dict[today_str] = today_entry
+    new_daily_history = sorted(hist_dict.values(), key=lambda e: e["date"])
+
+    return {
+        "ping_samples": ping_ts,
+        "accessibility_samples": access_ts,
+        "site_samples": site_ping_save,
+        "speed_samples": speed_samples,
+        "outages": outages_list,
+        "degraded": degraded,
+        "router_events": router_events_to_save,
+        "diagnoses": diagnoses_to_save,
+        "dismissed_outage_ids": dismissed_ids_snap,
+        "daily_summary": new_daily_history,
+        "network_uptime_secs": network_uptime,
+        "network_colors": network_colors,
+        "first_seen_iso": first_seen_iso,
+    }
+
+
 def save_state(state: MonitorState) -> None:
     """Flush state deltas to the SQLite store."""
     if _db is None:
         return
     try:
-        cutoff = datetime.now() - _24H
-        cutoff_30d = datetime.now() - _30D
+        payload = _build_flush_payload(state)
         with state.lock:
-            speed_samples = [
-                {
-                    "timestamp": s.timestamp.isoformat(),
-                    "download_mbps": s.download_mbps,
-                    "upload_mbps": s.upload_mbps,
-                    "ping_ms": s.ping_ms,
-                    "label": s.label,
-                    "provider": s.provider,
-                }
-                for s in state.speed_history
-                if s.timestamp >= cutoff
-            ]
-            outages_list = [
-                {
-                    "start": o.start.isoformat(),
-                    "end": o.end.isoformat() if o.end else None,
-                }
-                for o in state.outages
-                if o.start >= cutoff_30d
-            ]
-            degraded = [
-                {
-                    "start": d.start.isoformat(),
-                    "end": d.end.isoformat() if d.end else None,
-                    "kind": d.kind,
-                    "detail": d.detail,
-                }
-                for d in state.degraded_periods
-                if d.start >= cutoff_30d
-            ]
-            cutoff_30d_iso = cutoff_30d.isoformat()
-            ping_ts = [
-                (ts, v)
-                for ts, v in state.ping_history_ts
-                if ts >= cutoff_30d_iso
-            ]
-            access_ts = [
-                (ts, v)
-                for ts, v in state.ping_accessibility_ts
-                if ts >= cutoff_30d_iso
-            ]
-            site_ping_save = {
-                host: [
-                    (ts, v) for ts, v in hist
-                    if ts >= cutoff_30d_iso
-                ]
-                for host, hist in state.site_ping_history.items()
-            }
-            provider_uptime = dict(state.provider_uptime_secs)
-            provider_colors = dict(state.provider_colors)
-            current_outage = state.current_outage
-            daily_history_snap = list(state.daily_history)
-            router_cutoff_iso = (datetime.now() - _30D).isoformat()
-            router_events_to_save = [
-                ev.to_dict()
-                for ev in state.router_events
-                if ev.timestamp >= router_cutoff_iso
-            ]
-            # Keep the in-memory deque bounded by time too (matches what
-            # the DB will hold after the next prune sweep).
-            if len(state.router_events) != len(router_events_to_save):
-                state.router_events = deque(
-                    (ev for ev in state.router_events if ev.timestamp >= router_cutoff_iso),
-                    maxlen=state.router_events.maxlen,
-                )
-            diagnoses_to_save = [
-                d for d in state.diagnoses
-                if (d.get("evaluated_at") or "") >= cutoff_30d_iso
-            ]
-            dismissed_ids_snap = set(state.dismissed_outage_ids)
-            first_seen_iso = state.first_seen.isoformat()
-
-        # Compute today's daily summary
-        now_dt = datetime.now()
-        today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_str = today_start.strftime("%Y-%m-%d")
-
-        all_today = [o for o in outages_list if o["start"][:10] == today_str]
-        today_outage_secs = 0.0
-        for o_dict in all_today:
-            o_start = max(datetime.fromisoformat(o_dict["start"]), today_start)
-            o_end_raw = datetime.fromisoformat(o_dict["end"]) if o_dict.get("end") else now_dt
-            o_end = min(o_end_raw, now_dt)
-            if o_end > o_start:
-                today_outage_secs += (o_end - o_start).total_seconds()
-        if current_outage and current_outage.start.date() == now_dt.date():
-            o_start = max(current_outage.start, today_start)
-            today_outage_secs += (now_dt - o_start).total_seconds()
-
-        today_window = (now_dt - today_start).total_seconds()
-        today_uptime = round(max(0.0, (today_window - today_outage_secs) / today_window * 100), 2) if today_window > 0 else 100.0
-
-        today_pings = sorted(v for ts, v in ping_ts if datetime.fromisoformat(ts) >= today_start)
-
-        def _pct_simple(sorted_vals, p):
-            n = len(sorted_vals)
-            if n == 1:
-                return sorted_vals[0]
-            idx = p / 100 * (n - 1)
-            lo, hi = int(idx), min(int(idx) + 1, n - 1)
-            return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (idx - lo)
-
-        p10_t = round(_pct_simple(today_pings, 10), 1) if len(today_pings) >= 2 else None
-        p50_t = round(_pct_simple(today_pings, 50), 1) if len(today_pings) >= 2 else None
-        p90_t = round(_pct_simple(today_pings, 90), 1) if len(today_pings) >= 2 else None
-
-        today_entry = {"date": today_str, "uptime_pct": today_uptime,
-                       "p10": p10_t, "p50": p50_t, "p90": p90_t}
-
-        cutoff_7d_str = (now_dt - timedelta(days=7)).strftime("%Y-%m-%d")
-        hist_dict = {e["date"]: e for e in daily_history_snap if e["date"] > cutoff_7d_str}
-        hist_dict[today_str] = today_entry
-        new_daily_history = sorted(hist_dict.values(), key=lambda e: e["date"])
-        with state.lock:
-            state.daily_history = new_daily_history
+            state.daily_history = payload["daily_summary"]
 
         global _cursors
         _cursors = _db.flush(
             cursors=_cursors,
-            ping_samples=ping_ts,
-            accessibility_samples=access_ts,
-            site_samples=site_ping_save,
-            speed_samples=speed_samples,
-            outages=outages_list,
-            current_outage=None,  # match legacy behavior — ongoing outage not persisted
-            degraded=degraded,
-            router_events=router_events_to_save,
-            diagnoses=diagnoses_to_save,
-            dismissed_outage_ids=dismissed_ids_snap,
-            daily_summary=new_daily_history,
-            provider_uptime_secs=provider_uptime,
-            provider_colors=provider_colors,
-            first_seen_iso=first_seen_iso,
+            ping_samples=payload["ping_samples"],
+            accessibility_samples=payload["accessibility_samples"],
+            site_samples=payload["site_samples"],
+            speed_samples=payload["speed_samples"],
+            outages=payload["outages"],
+            current_outage=None,
+            degraded=payload["degraded"],
+            router_events=payload["router_events"],
+            diagnoses=payload["diagnoses"],
+            dismissed_outage_ids=payload["dismissed_outage_ids"],
+            daily_summary=payload["daily_summary"],
+            network_uptime_secs=payload["network_uptime_secs"],
+            network_colors=payload["network_colors"],
+            first_seen_iso=payload["first_seen_iso"],
             saved_at_iso=datetime.now().isoformat(),
         )
     except Exception as exc:
@@ -1819,7 +1975,7 @@ def load_state(state: MonitorState) -> None:
         diag_raw       = _db.load_diagnoses(cutoff_30d_iso)
         dismissed_set  = _db.load_dismissed_outage_ids()
         daily          = _db.load_daily_summary(cutoff_7d_str)
-        prov_secs, prov_colors = _db.load_provider_uptime()
+        prov_secs, prov_colors = _db.load_network_uptime()
         saved_at_meta  = _db.get_meta("saved_at") or ""
         first_seen_meta = _db.get_meta("first_seen")
 
@@ -1831,7 +1987,7 @@ def load_state(state: MonitorState) -> None:
                 upload_mbps=s["upload_mbps"],
                 ping_ms=s["ping_ms"],
                 label=s["label"],
-                provider=s["provider"],
+                network=s["network"],
             ))
 
         # Re-apply the flap filter so legacy short-outage records from before
@@ -1908,8 +2064,8 @@ def load_state(state: MonitorState) -> None:
             state.ping_history_ts = deque(ping_ts, maxlen=1_400_000)
             state.ping_accessibility_ts = deque(access_ts, maxlen=270_000)
             state.site_ping_history = site_ping_loaded
-            state.provider_uptime_secs = prov_secs
-            state.provider_colors = prov_colors
+            state.network_uptime_secs = prov_secs
+            state.network_colors = prov_colors
             state.daily_history = daily
             state.router_events = deque(router_events_loaded, maxlen=400_000)
             state.degraded_periods = deque(degraded_loaded, maxlen=2000)
@@ -2075,6 +2231,47 @@ def persistence_thread(state: MonitorState) -> None:
                 _last_pruned_at = time.time()
             except Exception as exc:
                 logging.warning("Prune failed: %s", exc)
+
+
+_sync_cursors: db.PersistCursors = db.PersistCursors()
+
+
+def sync_thread(state: MonitorState) -> None:
+    """Push local data to the central VPS every 60s. Runs in addition to
+    persistence_thread — local DB writes are never affected by sync status."""
+    global _sync_cursors
+    time.sleep(90)  # stagger vs persistence_thread (60s offset)
+    while state.running:
+        if not SERVER_URL:
+            break
+        try:
+            payload = _build_flush_payload(state)
+            payload["monitor_host"] = MONITOR_HOST
+
+            # Convert sets to lists for JSON serialization
+            if isinstance(payload.get("dismissed_outage_ids"), set):
+                payload["dismissed_outage_ids"] = list(payload["dismissed_outage_ids"])
+
+            body = json.dumps(payload, default=str).encode("utf-8")
+            req = urllib.request.Request(
+                f"{SERVER_URL}/api/ingest",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {INGEST_API_KEY}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read())
+                if result.get("ok"):
+                    logging.info("sync: pushed to %s (%s)", SERVER_URL, MONITOR_HOST)
+                else:
+                    logging.warning("sync: server returned error: %s", result)
+        except Exception as exc:
+            logging.warning("sync: push to %s failed: %s", SERVER_URL, exc)
+
+        time.sleep(60)
 
 
 def _router_stats(events: List, last_poll: Optional[datetime],
@@ -2268,7 +2465,35 @@ def speed_test_thread(state: MonitorState) -> None:
             trigger_post  = state.trigger_post_outage_test
             last_attempt  = state.last_speed_test
             outage_active = state.current_outage is not None
-            cur_provider  = state.current_provider
+            cur_network   = state.current_network
+
+        # Quick gateway check — detect network switches within 5s
+        gw = _quick_gateway()
+        if gw and cur_network and gw not in cur_network:
+            try:
+                global _network_cache
+                _network_cache = (("", ""), 0.0)
+                fingerprint, iface_type = _detect_network()
+                if fingerprint != cur_network:
+                    _db.register_network(fingerprint, iface_type)
+                    with state.lock:
+                        now = datetime.now()
+                        if cur_network and cur_network in state.network_start_time:
+                            elapsed = (now - state.network_start_time[cur_network]).total_seconds()
+                            state.network_uptime_secs[cur_network] = (
+                                state.network_uptime_secs.get(cur_network, 0.0) + elapsed
+                            )
+                        state.network_start_time[fingerprint] = now
+                        state.current_network = fingerprint
+                        state.assign_network_color(fingerprint)
+                        state.network_changes.append({
+                            "ts": now.isoformat(timespec="seconds"),
+                            "from": cur_network,
+                            "to": fingerprint,
+                        })
+                    state.log(f"Network changed → {fingerprint}")
+            except Exception as exc:
+                logging.warning("network re-detect failed: %s", exc)
 
         if in_progress:
             continue
@@ -2288,7 +2513,7 @@ def speed_test_thread(state: MonitorState) -> None:
                     upload_mbps=0.0,
                     ping_ms=0.0,
                     label="Outage",
-                    provider=cur_provider,
+                    network=cur_network,
                 )
                 with state.lock:
                     state.speed_history.append(sample)
@@ -2995,7 +3220,7 @@ header {
 #status-text.online  { color: var(--green); }
 #status-text.offline { color: var(--red); }
 
-#header-provider { color: var(--dim); font-size: 12px; }
+#header-network { color: var(--dim); font-size: 12px; }
 #header-ping      { color: var(--cyan); font-size: 12px; }
 
 .spacer { flex: 1; }
@@ -3455,9 +3680,17 @@ tr:last-child td { border-bottom: none; }
 <header>
   <div id="status-dot"></div>
   <span id="status-text" class="online">ONLINE</span>
-  <span id="header-provider"></span>
+  <span id="header-network"></span>
   <span id="header-ping"></span>
+  <span id="host-selector-wrap" style="display:none; margin-left:8px;">
+    <select id="host-selector" style="background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-family:inherit;font-size:12px;">
+      <option value="">All hosts</option>
+    </select>
+    <span id="host-last-seen" style="color:var(--dim);font-size:11px;margin-left:6px;"></span>
+  </span>
+  <span id="control-status" style="display:none; margin-left:8px; font-size:11px;"></span>
   <div class="spacer"></div>
+  <a id="vps-link" href="" target="_blank" style="display:none; color:var(--blue); font-size:11px; text-decoration:none; margin-right:10px;">Central Dashboard</a>
   <span id="last-updated">Connecting…</span>
 </header>
 
@@ -3471,8 +3704,8 @@ tr:last-child td { border-bottom: none; }
       <span class="stat-value" id="stat-runtime">—</span>
     </div>
     <div class="stat-row">
-      <span class="stat-label">Provider</span>
-      <span class="stat-value" id="stat-provider" style="color:var(--magenta)">—</span>
+      <span class="stat-label">Network</span>
+      <span class="stat-value" id="stat-network" style="color:var(--magenta)">—</span>
     </div>
     <div class="stat-row">
       <span class="stat-label">Ping (live)</span>
@@ -3884,13 +4117,13 @@ function updateSpeedBar(chart, slots, pc, isUl, highlightLast) {
 
   chart.data.labels = slots.map(s => s.hour);
 
-  // Per-bar base color: latest bar uses perf color, others use provider color
+  // Per-bar base color: latest bar uses perf color, others use network color
   const barColor = slots.map((s, i) => {
     if (highlightLast && i === last && s.is_latest) {
       const perf = isUl ? s.ul_perf : s.dl_perf;
       return _perfColors[perf] || defColor;
     }
-    return pc[s.provider] || defColor;
+    return pc[s.network] || defColor;
   });
   const isLast = slots.map((_, i) => highlightLast && i === last);
 
@@ -3909,7 +4142,7 @@ function updateSpeedBar(chart, slots, pc, isUl, highlightLast) {
 }
 
 function updateBandwidthCharts(d, mode) {
-  const pc = d.provider_colors || {};
+  const pc = d.network_colors || {};
   const titles = {
     '5m':    ['Upload — 5m recent (Mbps)',               'Download — 5m recent (Mbps)'],
     'split': ['Upload — 24h hourly avg + latest (Mbps)', 'Download — 24h hourly avg + latest (Mbps)'],
@@ -3930,7 +4163,7 @@ function updateBandwidthCharts(d, mode) {
       dl_p90:        s.download_mbps, dl_max:     s.download_mbps,
       ul_p10:        s.upload_mbps,   ul_p10_90d: 0, ul_p90_maxd: 0,
       ul_p90:        s.upload_mbps,   ul_max:     s.upload_mbps,
-      provider: s.provider, is_latest: true,
+      network: s.network, is_latest: true,
     }));
     updateSpeedBar(uploadChartCombined,   slots, pc, true,  false);
     updateSpeedBar(downloadChartCombined, slots, pc, false, false);
@@ -3965,11 +4198,20 @@ function setEl(id, html) {
   if (el) el.innerHTML = html;
 }
 
+// ── Network name resolution ───────────────────────────────────
+function networkDisplayName(fp) {
+  if (!fp) return '—';
+  const names = lastData?.network_names || {};
+  if (names[fp]) return names[fp];
+  if (!/^\d+\.\d+\.\d+\.\d+\/\d+$/.test(fp)) return fp;
+  return 'Unnamed Wi-Fi';
+}
+
 // ── State update ──────────────────────────────────────────────
 function update(d) {
   lastData = d;
-  const pc = d.provider_colors || {};
-  const curProvColor = (d.current_provider && pc[d.current_provider]) ? pc[d.current_provider] : '#bc8cff';
+  const pc = d.network_colors || {};
+  const curNetColor = (d.current_network && pc[d.current_network]) ? pc[d.current_network] : '#bc8cff';
 
   // Header
   const dot  = document.getElementById('status-dot');
@@ -3985,8 +4227,8 @@ function update(d) {
     stxt.textContent = 'OFFLINE';
     document.body.classList.add('offline');
   }
-  setEl('header-provider', d.current_provider
-    ? `&nbsp;<span style="color:var(--dim)">via</span>&nbsp;<span style="color:${curProvColor}">${d.current_provider}</span>`
+  setEl('header-network', d.current_network
+    ? `&nbsp;<span style="color:var(--dim)">via</span>&nbsp;<span style="color:${curNetColor}">${networkDisplayName(d.current_network)}</span>`
     : '');
   setEl('header-ping',     d.last_ping_ms ? `&nbsp;${d.last_ping_ms} ms` : '');
   document.getElementById('last-updated').textContent =
@@ -4011,8 +4253,14 @@ function update(d) {
 
   // Status card
   setEl('stat-runtime',  d.runtime_str || '—');
-  const statProvEl = document.getElementById('stat-provider');
-  if (statProvEl) { statProvEl.textContent = d.current_provider || '—'; statProvEl.style.color = curProvColor; }
+  const statNetEl = document.getElementById('stat-network');
+  if (statNetEl) {
+    const netName = networkDisplayName(d.current_network);
+    statNetEl.textContent = netName;
+    statNetEl.style.color = curNetColor;
+    statNetEl.style.cursor = d.current_network ? 'pointer' : '';
+    statNetEl.title = d.current_network ? 'Click to rename' : '';
+  }
   setEl('stat-ping',     d.last_ping_ms  ? `${d.last_ping_ms} ms`  : '—');
   setEl('stat-avg-ping', d.avg_ping_ms   ? `${d.avg_ping_ms} ms`   : '—');
   if (d.uptime_pct_24h != null) {
@@ -4301,11 +4549,34 @@ function updateDiagLastRun(iso) {
 }
 
 // ── Polling loop ──────────────────────────────────────────────
+let _selectedHost = '';
+
 async function poll() {
   try {
-    const resp = await fetch('/api/state');
+    const url = _selectedHost ? '/api/state?host=' + encodeURIComponent(_selectedHost) : '/api/state';
+    const resp = await fetch(url);
     if (resp.ok) {
-      update(await resp.json());
+      const d = await resp.json();
+      update(d);
+      // Aggregator: show control ping status
+      if (d.control_ping_ms !== undefined) {
+        const ctrl = document.getElementById('control-status');
+        ctrl.style.display = '';
+        const ok = d.control_connected;
+        ctrl.innerHTML = 'Control: ' + (ok
+          ? '<span style="color:var(--green)">' + d.control_ping_ms.toFixed(0) + 'ms</span>'
+          : '<span style="color:var(--red)">down</span>');
+      }
+      // Show last_seen for remote hosts
+      if (d.last_seen && _selectedHost) {
+        const el = document.getElementById('host-last-seen');
+        const ago = Math.round((Date.now() - new Date(d.last_seen).getTime()) / 1000);
+        el.textContent = ago < 120 ? 'synced ' + ago + 's ago'
+                       : ago < 7200 ? 'synced ' + Math.round(ago/60) + 'm ago'
+                       : 'synced ' + Math.round(ago/3600) + 'h ago';
+      } else {
+        document.getElementById('host-last-seen').textContent = '';
+      }
     }
   } catch {
     document.getElementById('last-updated').textContent = 'Reconnecting…';
@@ -4324,6 +4595,42 @@ setInterval(poll, 2000);
 // Timeline refreshes less often; outages don't change every 2 seconds.
 refreshTimeline();
 setInterval(refreshTimeline, 30000);
+
+// ── Multi-host support ───────────────────────────────────────
+(async function initMultiHost() {
+  try {
+    const resp = await fetch('/api/hosts');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const hosts = data.hosts || [];
+    if (hosts.length > 1) {
+      const wrap = document.getElementById('host-selector-wrap');
+      const sel = document.getElementById('host-selector');
+      wrap.style.display = '';
+      hosts.forEach(h => {
+        const opt = document.createElement('option');
+        opt.value = h.monitor_host;
+        opt.textContent = h.display_name || h.monitor_host;
+        sel.appendChild(opt);
+      });
+      sel.addEventListener('change', () => {
+        _selectedHost = sel.value;
+        poll();
+      });
+    }
+    // Show VPS link for local instances that have SERVER_URL configured
+    const stateResp = await fetch('/api/state');
+    if (stateResp.ok) {
+      const st = await stateResp.json();
+      // The server injects vps_url into the state if SERVER_URL is set
+      if (st.vps_url) {
+        const link = document.getElementById('vps-link');
+        link.href = st.vps_url;
+        link.style.display = '';
+      }
+    }
+  } catch {}
+})();
 
 // ── Per-site ping history modal ───────────────────────────────
 function _siteCss(name) {
@@ -4386,6 +4693,22 @@ document.addEventListener('click', (evt) => {
   _saveSiteLayersOff(_siteLayersOff);
   refreshSiteLegendStrikes();
   if (_siteModalData) paintSiteHistory(_siteModalData);
+});
+
+// Click network name to rename
+document.addEventListener('click', (evt) => {
+  const el = evt.target.closest('#stat-network');
+  if (!el || !lastData?.current_network) return;
+  const fp = lastData.current_network;
+  const cur = networkDisplayName(fp);
+  const name = prompt('Name this network:', cur === 'Unnamed Wi-Fi' ? '' : cur);
+  if (name === null) return;
+  fetch('/api/network/rename', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({fingerprint: fp, name: name.trim() || null})
+  }).then(r => r.json()).then(() => {
+    fetch('/api/state').then(r => r.json()).then(d => update(d));
+  });
 });
 
 async function openSiteModal(host) {
@@ -4925,7 +5248,7 @@ a.back-link:hover { color: var(--blue); border-color: var(--blue); }
   <div class="card-title">Speed Tests — last 24h</div>
   <table>
     <thead><tr>
-      <th>Time</th><th>Label</th><th>Provider</th>
+      <th>Time</th><th>Label</th><th>Network</th>
       <th style="text-align:right">Download</th>
       <th style="text-align:right">Upload</th>
       <th style="text-align:right">Ping</th>
@@ -4965,12 +5288,20 @@ function setEl(id, html) {
   const el = document.getElementById(id);
   if (el) el.innerHTML = html;
 }
+let _logNetNames = {};
+function networkDisplayName(fp) {
+  if (!fp) return '—';
+  if (_logNetNames[fp]) return _logNetNames[fp];
+  if (!/^\d+\.\d+\.\d+\.\d+\/\d+$/.test(fp)) return fp;
+  return 'Unnamed Wi-Fi';
+}
 
 async function poll() {
   try {
     const resp = await fetch('/api/log');
     if (!resp.ok) return;
     const d = await resp.json();
+    _logNetNames = d.network_names || {};
 
     document.getElementById('last-updated').textContent =
       'Updated ' + new Date().toLocaleTimeString();
@@ -4980,7 +5311,7 @@ async function poll() {
       const rows = d.speed.map(s => `<tr>
         <td style="color:var(--dim)">${s.ts}</td>
         <td><span class="badge badge-blue">${s.label || '—'}</span></td>
-        <td style="color:var(--magenta)">${s.provider || '—'}</td>
+        <td style="color:var(--magenta)">${networkDisplayName(s.network)}</td>
         <td style="text-align:right;color:var(--cyan)">&#8595; ${s.dl} Mbps</td>
         <td style="text-align:right;color:var(--green)">&#8593; ${s.ul} Mbps</td>
         <td style="text-align:right;color:var(--dim)">${s.ping ? s.ping + ' ms' : '—'}</td>
@@ -6827,15 +7158,305 @@ def _versioned(html: str) -> str:
     return html.replace('/static/timeline.js"', f'/static/timeline.js?v={_ASSET_VERSION}"')
 
 
+def _check_dashboard_auth():
+    """Return a 401 Response if dashboard auth is configured and the request
+    doesn't carry valid HTTP Basic credentials. Returns None if OK."""
+    if not DASHBOARD_USER:
+        return None
+    auth = request.authorization
+    if auth and auth.username == DASHBOARD_USER and auth.password == DASHBOARD_PASS:
+        return None
+    from flask import Response
+    return Response(
+        "Authentication required", 401,
+        {"WWW-Authenticate": 'Basic realm="Connection Monitor"'},
+    )
+
+
+def _check_api_key():
+    """Return a 401 Response if ingest auth is configured and the request
+    doesn't carry a valid Bearer token. Returns None if OK."""
+    if not INGEST_API_KEY:
+        return None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header == f"Bearer {INGEST_API_KEY}":
+        return None
+    return jsonify({"error": "invalid or missing API key"}), 401
+
+
 # Browsers were caching the page HTML and serving stale *inline* JS even after
 # a restart, which made client-side fixes appear not to land. The pages are
 # tiny and always need to reflect the latest server build, so opt out of all
 # caching for them. (The external /static/timeline.js route already has its
 # own no-cache + ?v= cache-bust.)
+def _is_aggregator() -> bool:
+    """True if this instance should show multi-host aggregated data.
+    Only enabled via AGGREGATOR=true env var — not auto-detected by host
+    count, to avoid triggering expensive DB queries on every 2s poll."""
+    return AGGREGATOR
+
+
+def state_from_db(storage: db.Storage, monitor_host: Optional[str] = None) -> dict:
+    """Reconstruct the /api/state response from DB queries.
+
+    Used by the aggregator to serve data for remote hosts, or the "all hosts"
+    aggregate view. Produces the same top-level keys as MonitorState.to_dict()
+    with sensible defaults for live-only fields.
+    """
+    now = datetime.now()
+    cutoff_30d_iso = (now - _30D).isoformat()
+    cutoff_24h_iso = (now - _24H).isoformat()
+    cutoff_7d_str = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    host_filter = monitor_host if monitor_host and monitor_host != "all" else "*"
+
+    ping_ts = storage.load_ping_samples(cutoff_30d_iso, monitor_host=host_filter)
+    access_ts = storage.load_accessibility_samples(cutoff_30d_iso, monitor_host=host_filter)
+    site_samples = storage.load_site_samples(cutoff_30d_iso, monitor_host=host_filter)
+    speed_samples = storage.load_speed_samples(cutoff_24h_iso, monitor_host=host_filter)
+    outages = storage.load_outages(cutoff_30d_iso, monitor_host=host_filter)
+    degraded = storage.load_degraded_periods(cutoff_30d_iso, monitor_host=host_filter)
+    daily_summary = storage.load_daily_summary(cutoff_7d_str, monitor_host=host_filter)
+    net_secs, net_colors = storage.load_network_uptime(monitor_host=host_filter)
+    hosts_list = storage.load_hosts()
+
+    # Determine last_seen for the selected host
+    last_seen = None
+    if host_filter != "*":
+        for h in hosts_list:
+            if h["monitor_host"] == host_filter:
+                last_seen = h.get("last_seen")
+                break
+
+    def _percentile(sorted_vals, p):
+        n = len(sorted_vals)
+        if n == 0:
+            return None
+        if n == 1:
+            return sorted_vals[0]
+        idx = p / 100 * (n - 1)
+        lo, hi = int(idx), min(int(idx) + 1, n - 1)
+        return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (idx - lo)
+
+    # Recent pings for header stats
+    recent_pings = [v for ts, v in ping_ts if v is not None and ts >= cutoff_24h_iso]
+    avg_p = round(sum(recent_pings) / len(recent_pings), 1) if recent_pings else None
+    last_ping = recent_pings[-1] if recent_pings else None
+
+    # Connectivity: inferred from last ping sample
+    connected = bool(recent_pings and recent_pings[-1] is not None)
+
+    # Downsample ping chart
+    MAX_PING_CHART = 300
+    ping_ts_5m = [(t, v) for t, v in ping_ts
+                  if datetime.fromisoformat(t) >= now - timedelta(minutes=5)]
+    ping_chart_data = ping_ts
+    if len(ping_chart_data) > MAX_PING_CHART:
+        step = len(ping_chart_data) / MAX_PING_CHART
+        ping_chart_data = [ping_chart_data[int(i * step)] for i in range(MAX_PING_CHART)]
+
+    # 24-hour hourly ping buckets
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    first_slot_start = current_hour - timedelta(hours=24)
+    ping_buckets = [[] for _ in range(24)]
+    access_buckets = [[] for _ in range(24)]
+    for ts_str, v in ping_ts:
+        try:
+            dt = datetime.fromisoformat(ts_str)
+        except ValueError:
+            continue
+        if dt < first_slot_start or dt >= current_hour:
+            continue
+        idx = int((dt - first_slot_start).total_seconds() // 3600)
+        if 0 <= idx < 24:
+            ping_buckets[idx].append(v)
+    for ts_str, p in access_ts:
+        try:
+            dt = datetime.fromisoformat(ts_str)
+        except ValueError:
+            continue
+        if dt < first_slot_start or dt >= current_hour:
+            continue
+        idx = int((dt - first_slot_start).total_seconds() // 3600)
+        if 0 <= idx < 24:
+            access_buckets[idx].append(p)
+
+    ping_hourly = []
+    for i in range(24):
+        slot_start = first_slot_start + timedelta(hours=i)
+        h_int = slot_start.hour
+        hour_label = f"{h_int % 12 or 12}{'am' if h_int < 12 else 'pm'}"
+        pv = sorted(ping_buckets[i])
+        if pv:
+            p10 = round(_percentile(pv, 10), 1)
+            p50 = round(_percentile(pv, 50), 1)
+            p90 = round(_percentile(pv, 90), 1)
+        else:
+            p10 = p50 = p90 = None
+        av = access_buckets[i]
+        access_pct = round(sum(av) / len(av), 1) if av else None
+        ping_hourly.append({
+            "hour": hour_label, "p10": p10, "p50": p50, "p90": p90,
+            "access": access_pct,
+        })
+
+    # Speed hourly buckets
+    speed_hourly = []
+    for h in range(24, 0, -1):
+        slot_start = current_hour - timedelta(hours=h)
+        slot_end = slot_start + timedelta(hours=1)
+        slot_start_iso = slot_start.isoformat()
+        slot_end_iso = slot_end.isoformat()
+        tests = [s for s in speed_samples
+                 if slot_start_iso <= s["timestamp"] < slot_end_iso]
+        if tests:
+            dls = sorted(s["download_mbps"] for s in tests if s["download_mbps"] is not None)
+            uls = sorted(s["upload_mbps"] for s in tests if s["upload_mbps"] is not None)
+            if dls:
+                dl_p10 = round(_percentile(dls, 10), 1)
+                dl_p90 = round(_percentile(dls, 90), 1)
+                dl_max = round(dls[-1], 1)
+            else:
+                dl_p10 = dl_p90 = dl_max = None
+            if uls:
+                ul_p10 = round(_percentile(uls, 10), 1)
+                ul_p90 = round(_percentile(uls, 90), 1)
+                ul_max = round(uls[-1], 1)
+            else:
+                ul_p10 = ul_p90 = ul_max = None
+            network = tests[-1].get("network")
+        else:
+            dl_p10 = dl_p90 = dl_max = None
+            ul_p10 = ul_p90 = ul_max = None
+            network = None
+        h_int = (current_hour - timedelta(hours=h)).hour
+        speed_hourly.append({
+            "hour": f"{h_int % 12 or 12}{'am' if h_int < 12 else 'pm'}",
+            "dl_p10": dl_p10,
+            "dl_p10_90d": round(max(0, dl_p90 - dl_p10), 1) if dl_p10 is not None and dl_p90 is not None else None,
+            "dl_p90_maxd": round(max(0, dl_max - dl_p90), 1) if dl_p90 is not None and dl_max is not None else None,
+            "dl_p90": dl_p90, "dl_max": dl_max,
+            "ul_p10": ul_p10,
+            "ul_p10_90d": round(max(0, ul_p90 - ul_p10), 1) if ul_p10 is not None and ul_p90 is not None else None,
+            "ul_p90_maxd": round(max(0, ul_max - ul_p90), 1) if ul_p90 is not None and ul_max is not None else None,
+            "ul_p90": ul_p90, "ul_max": ul_max,
+            "network": network,
+        })
+
+    # Uptime % for last 24h
+    outage_secs_24h = 0.0
+    for o in outages:
+        o_start_iso = o["start"]
+        o_end_iso = o.get("end")
+        o_start = max(datetime.fromisoformat(o_start_iso), now - _24H)
+        o_end = min(datetime.fromisoformat(o_end_iso) if o_end_iso else now, now)
+        if o_end > o_start:
+            outage_secs_24h += (o_end - o_start).total_seconds()
+    window_secs = 86400.0
+    uptime_pct_24h = round(max(0.0, (window_secs - outage_secs_24h) / window_secs * 100), 2)
+
+    # 7-day calendar
+    now_date = now.date()
+    uptime_7d = []
+    hist_by_date = {e["date"]: e for e in daily_summary}
+    for d_offset in range(6, -1, -1):
+        day = now_date - timedelta(days=d_offset)
+        day_str = day.strftime("%Y-%m-%d")
+        entry = hist_by_date.get(day_str)
+        date_label = f"{day.month}/{day.day}"
+        if entry:
+            uptime_7d.append({
+                "label": day.strftime("%a"), "date": date_label,
+                "uptime_pct": entry["uptime_pct"],
+                "p10": entry["p10"], "p50": entry["p50"], "p90": entry["p90"],
+            })
+        else:
+            uptime_7d.append({
+                "label": day.strftime("%a"), "date": date_label,
+                "uptime_pct": None, "p10": None, "p50": None, "p90": None,
+            })
+
+    return {
+        "connected": connected,
+        "last_ping_ms": round(last_ping, 1) if last_ping else None,
+        "avg_ping_ms": avg_p,
+        "current_network": None,
+        "monitor_host": host_filter if host_filter != "*" else "all",
+        "runtime_secs": None,
+        "runtime_str": None,
+        "current_uptime_str": None,
+        "total_outage_secs": round(outage_secs_24h),
+        "outage_count": len(outages),
+        "ping_chart": [
+            {"t": t[11:19] if len(t) > 8 else t, "v": round(v, 1)}
+            for t, v in ping_chart_data
+        ],
+        "ping_chart_5m": [
+            {"t": t[11:19] if len(t) > 8 else t, "v": round(v, 1)}
+            for t, v in ping_ts_5m
+        ],
+        "access_chart_5m": [
+            {"t": t[11:19] if len(t) > 8 else t, "v": round(p, 1)}
+            for t, p in access_ts
+            if datetime.fromisoformat(t) >= now - timedelta(minutes=5)
+        ],
+        "ping_hourly": ping_hourly,
+        "speed_hourly": speed_hourly,
+        "speed_latest": None,
+        "speed_history": [
+            {
+                "timestamp": s["timestamp"][11:16] if len(s["timestamp"]) > 11 else s["timestamp"],
+                "download_mbps": round(s["download_mbps"], 1) if s["download_mbps"] else 0,
+                "upload_mbps": round(s["upload_mbps"], 1) if s["upload_mbps"] else 0,
+                "ping_ms": round(s["ping_ms"], 1) if s["ping_ms"] else 0,
+                "label": s.get("label", ""),
+                "network": s.get("network", ""),
+            }
+            for s in speed_samples
+        ],
+        "speed_history_5m": [],
+        "speed_history_1h": [],
+        "outages": [
+            {
+                "start": o["start"][11:19] if len(o["start"]) > 8 else o["start"],
+                "end": o["end"][11:19] if o.get("end") and len(o["end"]) > 8 else o.get("end"),
+                "duration_str": None,
+                "ongoing": o.get("end") is None,
+            }
+            for o in outages[-10:]
+        ],
+        "events": [],
+        "speed_in_progress": False,
+        "speed_status": None,
+        "next_test_in": None,
+        "network_uptimes": {},
+        "network_colors": net_colors,
+        "network_names": storage.load_network_names(),
+        "uptime_pct_24h": uptime_pct_24h,
+        "site_matrix": [],
+        "site_pool_thresholds": {},
+        "uptime_7d": uptime_7d,
+        "router": {"available": False, "poll_error": None, "last_poll": None,
+                    "count_1h": 0, "count_24h": 0, "dns_drops_1h": 0, "dns_drops_24h": 0},
+        "speed_attempts_24h": {"primary_ok": 0, "fallback_ok": 0, "total": 0},
+        "primary_fail_reasons": [],
+        "last_diagnosis_at": None,
+        "last_seen": last_seen,
+        "hosts": hosts_list,
+    }
+
+
 _NO_CACHE_HTML = {
     "Content-Type": "text/html; charset=utf-8",
     "Cache-Control": "no-cache, no-store, must-revalidate",
 }
+
+
+@app.before_request
+def _enforce_dashboard_auth():
+    if request.path == "/api/ingest":
+        return None
+    return _check_dashboard_auth()
 
 
 @app.route("/")
@@ -6845,6 +7466,15 @@ def index():
 
 @app.route("/api/state")
 def api_state():
+    host_param = request.args.get("host", "").strip()
+    if host_param and _db is not None:
+        return jsonify(state_from_db(_db, monitor_host=host_param))
+    if _is_aggregator() and not host_param and _db is not None:
+        result = state_from_db(_db, monitor_host="all")
+        if _state is not None:
+            result["control_ping_ms"] = _state.last_ping_ms
+            result["control_connected"] = _state.connected
+        return jsonify(result)
     if _state is None:
         return jsonify({"error": "not ready"}), 503
     return jsonify(_state.to_dict())
@@ -6995,12 +7625,13 @@ def api_log():
     return jsonify({
         "speed": [{"ts": s.timestamp.strftime("%H:%M:%S"), "dl": round(s.download_mbps, 1),
                    "ul": round(s.upload_mbps, 1), "ping": round(s.ping_ms, 1),
-                   "label": s.label, "provider": s.provider} for s in reversed(speed)],
+                   "label": s.label, "network": s.network} for s in reversed(speed)],
         "outages": [{"start": o.start.strftime("%H:%M:%S"),
                      "end": o.end.strftime("%H:%M:%S") if o.end else None,
                      "duration": o.duration_str, "ongoing": o.ongoing}
                     for o in reversed(outages)],
         "events": [{"ts": ts, "level": lvl, "msg": msg} for ts, lvl, msg in events],
+        "network_names": _db.load_network_names(),
     })
 
 
@@ -7050,6 +7681,7 @@ def api_diagnose():
             incident_start=incident_start,
             incident_end=incident_end,
             incident_id=outage_id,
+            network_names=_db.load_network_names(),
         )
         result = ai_diagnosis.diagnose(snapshot)
         result["id"] = str(int(time.time() * 1000))
@@ -7116,6 +7748,78 @@ def api_dismiss():
     )
     return jsonify({"ok": True, "dismissed": dismissed,
                     "total_dismissed": n})
+
+
+@app.route("/api/network/rename", methods=["POST"])
+def api_network_rename():
+    """Set or clear a friendly name for a network fingerprint.
+    Body: {"fingerprint": "192.168.1.254/24", "name": "AT&T Router"}
+    Pass name as null or empty string to clear."""
+    body = request.get_json(silent=True) or {}
+    fp = (body.get("fingerprint") or "").strip()
+    if not fp:
+        return jsonify({"ok": False, "error": "fingerprint required"}), 400
+    raw_name = body.get("name")
+    name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else None
+    ok = _db.rename_network(fp, name)
+    if not ok:
+        return jsonify({"ok": False, "error": "unknown fingerprint"}), 404
+    return jsonify({"ok": True, "fingerprint": fp, "display_name": name})
+
+
+@app.route("/api/ingest", methods=["POST"])
+def api_ingest():
+    """Receive monitoring data pushed from a remote collector."""
+    auth_err = _check_api_key()
+    if auth_err:
+        return auth_err
+    if _db is None:
+        return jsonify({"error": "database not ready"}), 503
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"error": "JSON body required"}), 400
+
+    remote_host = (body.get("monitor_host") or "").strip()
+    if not remote_host:
+        return jsonify({"error": "monitor_host required"}), 400
+
+    try:
+        _db.flush(
+            cursors=db.PersistCursors(),
+            ping_samples=[(ts, v) for ts, v in body.get("ping_samples", [])],
+            accessibility_samples=[(ts, v) for ts, v in body.get("accessibility_samples", [])],
+            site_samples={
+                host: [(ts, v) for ts, v in samples]
+                for host, samples in body.get("site_samples", {}).items()
+            },
+            speed_samples=body.get("speed_samples", []),
+            outages=body.get("outages", []),
+            current_outage=None,
+            degraded=body.get("degraded", []),
+            router_events=body.get("router_events", []),
+            diagnoses=body.get("diagnoses", []),
+            dismissed_outage_ids=set(body.get("dismissed_outage_ids", [])),
+            daily_summary=body.get("daily_summary", []),
+            network_uptime_secs=body.get("network_uptime_secs", {}),
+            network_colors=body.get("network_colors", {}),
+            first_seen_iso=body.get("first_seen_iso", datetime.now().isoformat()),
+            saved_at_iso=datetime.now().isoformat(),
+            monitor_host_override=remote_host,
+        )
+        _db.update_host_seen(remote_host)
+    except Exception as exc:
+        logging.warning("Ingest from %s failed: %s", remote_host, exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    return jsonify({"ok": True, "monitor_host": remote_host})
+
+
+@app.route("/api/hosts")
+def api_hosts():
+    """List all known monitoring hosts and their last-seen timestamps."""
+    if _db is None:
+        return jsonify({"error": "database not ready"}), 503
+    return jsonify({"hosts": _db.load_hosts()})
 
 
 @app.route("/api/diagnoses/<diag_id>", methods=["DELETE"])
@@ -7454,22 +8158,35 @@ def main() -> None:
     load_state(state)
 
     conn_t    = threading.Thread(target=connectivity_thread, args=(state,), daemon=True, name="conn")
-    speed_t   = threading.Thread(target=speed_test_thread,   args=(state,), daemon=True, name="speed")
     persist_t = threading.Thread(target=persistence_thread,  args=(state,), daemon=True, name="persist")
     site_t    = threading.Thread(target=site_check_thread,   args=(state,), daemon=True, name="sites")
     router_t  = threading.Thread(target=router_log_thread,   args=(state,), daemon=True, name="router")
     conn_t.start()
-    speed_t.start()
     persist_t.start()
     site_t.start()
     router_t.start()
 
+    if DISABLE_SPEED_TESTS:
+        state.log("Speed tests disabled (DISABLE_SPEED_TESTS=true)", "info")
+    else:
+        speed_t = threading.Thread(target=speed_test_thread, args=(state,), daemon=True, name="speed")
+        speed_t.start()
+
+    if SERVER_URL:
+        sync_t = threading.Thread(target=sync_thread, args=(state,), daemon=True, name="sync")
+        sync_t.start()
+        state.log(f"Sync enabled → {SERVER_URL}", "info")
+
     state.log("Monitor started", "info")
-    if SPEEDTEST_AVAILABLE:
+    if SPEEDTEST_AVAILABLE and not DISABLE_SPEED_TESTS:
         state.log("speedtest-cli detected — using for measurements", "info")
 
-    print(f"\n  Connection Monitor")
+    mode_label = "aggregator" if AGGREGATOR else ("collector" if SERVER_URL else "standalone")
+    print(f"\n  Connection Monitor ({mode_label})")
+    print(f"  Host      → {MONITOR_HOST}")
     print(f"  Dashboard → http://localhost:{PORT}")
+    if SERVER_URL:
+        print(f"  Syncing   → {SERVER_URL}")
     print(f"  Stop      → Ctrl+C\n", flush=True)
 
     try:

@@ -12,7 +12,8 @@ A lightweight, self-hosted internet connection monitor with a live web dashboard
 - **Live ping chart** — rolling 5-minute and 24-hour ping history with split view
 - **Speed tests** — automatic download/upload measurements on startup, after outages, and on a periodic schedule; results compared against your hourly baseline so the most recent test is color-coded green/yellow/red
 - **Site status tiles** — monitors named services (Netflix, Xbox Live, Fortnite, etc.) individually and shows a plain-English verdict (GREAT / OK / SLOW / DOWN) with trend arrows
-- **Provider tracking** — detects which ISP or network you're on and tracks per-provider uptime and speed averages
+- **Network tracking** — identifies the active network by its gateway IP + subnet fingerprint (e.g., `192.168.1.254/24`) and tracks per-network uptime and speed averages. Click the network name on the dashboard to assign a friendly label (e.g., "AT&T Router", "Eero")
+- **Multi-host monitoring** — run monitors on multiple machines/networks and aggregate their data on a central VPS. Each local instance keeps its own dashboard; the VPS shows all hosts with a selector, "last synced" timestamps, and its own pings as a control baseline to distinguish "my network is bad" from "the internet is bad." Setup requires only two env vars (`SERVER_URL` and `INGEST_API_KEY`) on the local machines
 - **Persistent storage** — history survives restarts; backed by a local SQLite database (`var/connection_monitor.db`) with per-table retention: 30 days of ping/site/outage/degraded/router/diagnosis history, 24 hours of individual speed-test samples, 7 days of the daily uptime chart. All retention windows are env-configurable.
 - **Router log scraping** — for any gateway whose firewall/event log is exposed at an HTTP path (configured in `connection_monitor.env`); polls every 30 s and surfaces firewall drops on the dashboard, including drops of the monitor's own DNS probes (a strong gateway-side root-cause signal)
 - **Timeline uptime chart** — 7-day view on the dashboard, 30-day view on `/diagnose`. Vertical bars show actual time-of-day position of outages (red), degraded periods (yellow stripes for slow speeds or sustained high ping), site-loss periods (teal stripes — a single tracked site flaky while everything else looks fine), and uptime (green). Outages and degraded periods within 30 minutes of each other are clustered into a single incident so the chart is scannable; each member still renders in its own color. Already-analyzed incidents render in a **lighter shade of their category color** with a hover tooltip showing the AI's headline
@@ -371,9 +372,48 @@ Then open `http://192.168.x.x:8765` on the other device. No code changes needed 
 
 ---
 
+## Multi-host / VPS deployment
+
+You can run multiple monitors on different networks and aggregate their data on a central VPS. Each local instance keeps its full dashboard and local database; the VPS shows all hosts together with a host selector, "last synced" timestamps, and the VPS's own pings as a control baseline (to distinguish "my network is bad" from "the internet is bad").
+
+```
+┌─────────────┐      POST /api/ingest       ┌──────────────┐
+│  Home Mac 1 │ ─────── every 60s ─────────→ │              │
+│  (Wi-Fi A)  │                              │   VPS        │
+└─────────────┘                              │   Dashboard  │
+                                             │   (nginx +   │
+┌─────────────┐      POST /api/ingest       │    HTTPS)    │
+│  Home Mac 2 │ ─────── every 60s ─────────→ │              │
+│  (Wi-Fi B)  │                              └──────────────┘
+└─────────────┘
+```
+
+Every instance runs the same `connection_monitor.py`. Local probes, local SQLite, and the local dashboard are always active regardless of VPS connectivity. The VPS link is an optional async sync layer that activates when `SERVER_URL` is set.
+
+**Full setup instructions:** see **[docs/VPS_DEPLOYMENT.md](docs/VPS_DEPLOYMENT.md)** — covers VPS selection, nginx + Let's Encrypt, systemd, firewall, historical data migration, and troubleshooting.
+
+### Quick reference — local collector config
+
+Once the VPS is running, add three lines to `connection_monitor.env` on each home machine and restart:
+
+```bash
+SERVER_URL=https://monitor.yourdomain.com
+INGEST_API_KEY=<same key as the VPS>
+MONITOR_HOST=jordans-macbook-wifi-a   # optional; defaults to system hostname
+```
+
+Historical data (up to 30 days) syncs automatically on first push — no manual migration needed.
+
+### What you see
+
+- **Local dashboards** — unchanged, showing only that machine's data. A "Central Dashboard" link appears in the header.
+- **VPS dashboard** — host selector dropdown to switch between hosts or view all. Shows "synced Xs ago" per host. The VPS's own ping data serves as a control baseline: when a local host shows high latency but the VPS control is normal, the problem is local.
+
+---
+
 ## Data & privacy
 
-- All persistent data stays on your machine in `var/connection_monitor.db` (a local SQLite database). Nothing is sent to any cloud service unless you opt in below.
+- All persistent data stays on your machine in `var/connection_monitor.db` (a local SQLite database). Nothing is sent to any cloud service unless you enable multi-host sync (by setting `SERVER_URL`), in which case monitoring data is pushed to your own VPS.
 - **DNS probes** (every 2 s) make TCP connections to `8.8.8.8`, `1.1.1.1`, and `208.67.222.222` on port 53 to detect outages. No DNS queries are actually issued.
 - **Speed tests** make outbound HTTP requests to public test servers (Cloudflare, OVH, Tele2) to measure throughput.
 - **Site monitoring** makes TCP connections to the hostnames in `ping_targets.conf` on port 443.
