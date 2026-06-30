@@ -20,6 +20,7 @@ import urllib.error
 import logging
 import statistics
 import subprocess
+import hmac
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
@@ -126,6 +127,11 @@ except ImportError:
     SPEEDTEST_AVAILABLE = False
 
 PORT = int(os.environ.get("PORT", "8765"))
+# Interface the dashboard binds to. Defaults to loopback so a fresh install is
+# NOT silently exposed to the whole LAN (and so a VPS deployment only accepts
+# connections via its local nginx reverse proxy). Set BIND_HOST=0.0.0.0 to allow
+# access from other devices on your network — pair that with DASHBOARD_USER/PASS.
+BIND_HOST = os.environ.get("BIND_HOST", "127.0.0.1")
 DB_FILE      = os.path.join(SCRIPT_DIR, "var", "connection_monitor.db")
 CONFIG_FILE  = os.path.join(SCRIPT_DIR, "ping_targets.conf")
 _24H = timedelta(hours=24)
@@ -4414,15 +4420,21 @@ function update(d) {
           <span class="tt-lat">${fmtLat(p10, p50v, p90)}</span>
         </div>`;
 
-      const displayName = s.name || s.host.replace(/^www\./, '');
-      return `<div class="site-tile ${colorCls}" data-host="${s.host}" title="Click for ping history">
+      // Escape host/name before interpolating into HTML. These can originate
+      // from remote collectors via /api/ingest (aggregator mode), so treat them
+      // as untrusted. Quotes are escaped too since host lands in an attribute.
+      const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g,
+        c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+      const displayName = esc(s.name || s.host.replace(/^www\./, ''));
+      const hostEsc = esc(s.host);
+      return `<div class="site-tile ${colorCls}" data-host="${hostEsc}" title="Click for ping history">
         <div class="site-tile-host">${displayName}</div>
         <div class="site-tile-verdict">
           <span class="site-tile-dot"></span>${verdict}${trendHtml}
         </div>
         <div class="site-tile-sub">${sub}</div>
         <div class="site-tile-tooltip">
-          <div class="tt-head">${s.host}</div>
+          <div class="tt-head">${hostEsc}</div>
           ${mkTtRow('5m',  s.pct_5m,  s.p10_5m,  s.p50_5m,  s.p90_5m)}
           ${mkTtRow('1h',  s.pct_1h,  s.p10_1h,  s.p50_1h,  s.p90_1h)}
           ${mkTtRow('24h', s.pct_24h, s.p10_24h, s.p50_24h, s.p90_24h)}
@@ -7164,7 +7176,8 @@ def _check_dashboard_auth():
     if not DASHBOARD_USER:
         return None
     auth = request.authorization
-    if auth and auth.username == DASHBOARD_USER and auth.password == DASHBOARD_PASS:
+    if auth and hmac.compare_digest(auth.username or "", DASHBOARD_USER) \
+            and hmac.compare_digest(auth.password or "", DASHBOARD_PASS):
         return None
     from flask import Response
     return Response(
@@ -7179,7 +7192,7 @@ def _check_api_key():
     if not INGEST_API_KEY:
         return None
     auth_header = request.headers.get("Authorization", "")
-    if auth_header == f"Bearer {INGEST_API_KEY}":
+    if hmac.compare_digest(auth_header, f"Bearer {INGEST_API_KEY}"):
         return None
     return jsonify({"error": "invalid or missing API key"}), 401
 
@@ -7809,7 +7822,9 @@ def api_ingest():
         _db.update_host_seen(remote_host)
     except Exception as exc:
         logging.warning("Ingest from %s failed: %s", remote_host, exc)
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        # Don't echo internal exception text (table names, paths, SQL) back to
+        # the caller — log it server-side and return a generic message.
+        return jsonify({"ok": False, "error": "ingest failed"}), 500
 
     return jsonify({"ok": True, "monitor_host": remote_host})
 
@@ -8184,14 +8199,21 @@ def main() -> None:
     mode_label = "aggregator" if AGGREGATOR else ("collector" if SERVER_URL else "standalone")
     print(f"\n  Connection Monitor ({mode_label})")
     print(f"  Host      → {MONITOR_HOST}")
-    print(f"  Dashboard → http://localhost:{PORT}")
+    print(f"  Dashboard → http://localhost:{PORT}  (bind {BIND_HOST})")
     if SERVER_URL:
         print(f"  Syncing   → {SERVER_URL}")
+    # Loud warning if the dashboard is reachable beyond loopback with no
+    # password — that exposes every endpoint (including the mutating ones) to
+    # anyone on the network.
+    if BIND_HOST not in ("127.0.0.1", "localhost", "::1") and not DASHBOARD_USER:
+        print(f"  ⚠  WARNING: binding to {BIND_HOST} with no DASHBOARD_USER set —")
+        print(f"     the dashboard is exposed to your whole network without a password.")
+        print(f"     Set DASHBOARD_USER/DASHBOARD_PASS, or use BIND_HOST=127.0.0.1.")
     print(f"  Stop      → Ctrl+C\n", flush=True)
 
     try:
         app.run(
-            host="0.0.0.0",
+            host=BIND_HOST,
             port=PORT,
             debug=False,
             use_reloader=False,
