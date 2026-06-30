@@ -21,6 +21,7 @@ import logging
 import statistics
 import subprocess
 import hmac
+import secrets
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
@@ -97,10 +98,13 @@ def _pip_install(pkg: str) -> None:
     )
 
 try:
-    from flask import Flask, jsonify, request
+    from flask import Flask, jsonify, request, session, redirect, Response
 except ImportError:
     _pip_install("flask")
-    from flask import Flask, jsonify, request
+    from flask import Flask, jsonify, request, session, redirect, Response
+# Werkzeug ships with Flask; its security helpers give a salted KDF for
+# password hashing (no extra dependency, no hand-rolled crypto).
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # Load configuration from connection_monitor.env (next to this script) before
 # reading any constants. Existing shell environment variables take precedence —
@@ -151,6 +155,20 @@ DASHBOARD_PASS         = os.environ.get("DASHBOARD_PASS", "")
 DISABLE_SPEED_TESTS    = os.environ.get("DISABLE_SPEED_TESTS", "").lower() in ("true", "1", "yes")
 MONITOR_HOST           = os.environ.get("MONITOR_HOST", "") or socket.gethostname()
 AGGREGATOR             = os.environ.get("AGGREGATOR", "").lower() in ("true", "1", "yes")
+
+# ── Multi-tenant accounts (cloud/server role) ──────────────────
+# When enabled, the dashboard requires a per-user email+password login and
+# the legacy single-shared-password Basic Auth (DASHBOARD_USER/PASS) is not
+# used. Off by default so standalone/agent installs keep their simple,
+# loopback-only, no-login dashboard.
+MULTI_TENANT           = os.environ.get("MULTI_TENANT", "").lower() in ("true", "1", "yes")
+# Invite code required to register an account. Blank = registration closed
+# (accounts must already exist). Share this with friends so strangers who
+# find the URL can't sign themselves up.
+SIGNUP_CODE            = os.environ.get("SIGNUP_CODE", "")
+# Secret used to sign session cookies. If unset, a random one is generated
+# once and persisted in the DB (meta table) so logins survive restarts.
+SECRET_KEY             = os.environ.get("SECRET_KEY", "")
 
 # Degraded-period detection thresholds (tuning knobs, not deployment config).
 # ─────────────────────────────────────────────────────────────
@@ -7152,6 +7170,17 @@ setInterval(refreshTimeline, 30000);
 app = Flask(__name__)
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
+# Session-cookie hardening for the multi-tenant login. HttpOnly blocks JS from
+# reading the cookie; SameSite=Lax blunts CSRF; Secure keeps the cookie off
+# plain HTTP (the cloud server sits behind nginx TLS). ALLOW_INSECURE_COOKIES
+# is an escape hatch for local http testing only.
+_allow_insecure_cookies = os.environ.get("ALLOW_INSECURE_COOKIES", "").lower() in ("true", "1", "yes")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=MULTI_TENANT and not _allow_insecure_cookies,
+)
+
 _state: Optional[MonitorState] = None
 _db: Optional[db.Storage] = None
 _cursors: db.PersistCursors = db.PersistCursors()
@@ -7168,6 +7197,102 @@ _ASSET_VERSION = str(int(time.time()))
 
 def _versioned(html: str) -> str:
     return html.replace('/static/timeline.js"', f'/static/timeline.js?v={_ASSET_VERSION}"')
+
+
+def _init_session_secret() -> None:
+    """Set app.secret_key for signed session cookies. Prefer the SECRET_KEY env;
+    otherwise generate one once and persist it in the DB so logins survive
+    restarts (a fresh random key each boot would invalidate every session)."""
+    key = SECRET_KEY
+    if not key and _db is not None:
+        key = _db.get_meta("session_secret")
+        if not key:
+            key = secrets.token_hex(32)
+            _db.set_meta("session_secret", key)
+    app.secret_key = key or secrets.token_hex(32)
+
+
+def _valid_email(email: str) -> bool:
+    """Minimal sanity check — not RFC-complete, just enough to reject junk."""
+    if not email or len(email) > 254 or " " in email:
+        return False
+    parts = email.split("@")
+    return len(parts) == 2 and bool(parts[0]) and "." in parts[1] and bool(parts[1])
+
+
+# pbkdf2:sha256 rather than Werkzeug's scrypt default — scrypt needs OpenSSL
+# support in hashlib that isn't present on every build/container base image;
+# pbkdf2 is always available and still a salted, high-iteration KDF.
+_PW_HASH_METHOD = "pbkdf2:sha256"
+
+
+def _hash_password(pw: str) -> str:
+    return generate_password_hash(pw, method=_PW_HASH_METHOD)
+
+
+# Precomputed hash so a login attempt for an unknown email still spends time
+# hashing — response timing then doesn't reveal which emails are registered.
+_DUMMY_PW_HASH = _hash_password(secrets.token_hex(16))
+
+
+def current_user():
+    """Return the logged-in user row (dict) for this request, or None."""
+    if _db is None:
+        return None
+    uid = session.get("uid")
+    if not uid:
+        return None
+    return _db.get_user_by_id(uid)
+
+
+# Self-contained styled page for login/register (the dashboard's CSS vars live
+# inside DASHBOARD_HTML, so these pages carry their own copy of the palette to
+# stay visually consistent).
+_AUTH_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} · Connection Monitor</title>
+<style>
+  :root {{ --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#e6edf3;
+           --dim:#8b949e; --green:#3fb950; --red:#f85149; }}
+  * {{ box-sizing:border-box; }}
+  body {{ background:var(--bg); color:var(--text); font-family:-apple-system,
+          BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:0;
+          min-height:100vh; display:flex; align-items:center; justify-content:center; }}
+  .card {{ background:var(--card); border:1px solid var(--border); border-radius:10px;
+           padding:32px; width:340px; box-shadow:0 8px 32px rgba(0,0,0,0.6); }}
+  h1 {{ font-size:18px; margin:0 0 4px; }}
+  p.sub {{ color:var(--dim); font-size:13px; margin:0 0 20px; }}
+  label {{ display:block; font-size:12px; color:var(--dim); margin:14px 0 4px; }}
+  input {{ width:100%; padding:9px 10px; background:var(--bg); color:var(--text);
+           border:1px solid var(--border); border-radius:6px; font-size:14px; }}
+  button {{ width:100%; margin-top:22px; padding:10px; background:var(--green);
+            color:#06210d; border:none; border-radius:6px; font-size:14px;
+            font-weight:600; cursor:pointer; }}
+  .err {{ background:rgba(248,81,73,0.12); border:1px solid var(--red);
+          color:var(--red); padding:9px 11px; border-radius:6px; font-size:13px;
+          margin-bottom:16px; }}
+  .alt {{ text-align:center; margin-top:18px; font-size:13px; color:var(--dim); }}
+  .alt a {{ color:var(--green); text-decoration:none; }}
+</style></head>
+<body>
+  <form class="card" method="POST" action="{action}">
+    <h1>{heading}</h1>
+    <p class="sub">{subtitle}</p>
+    {error}
+    {fields}
+    <button type="submit">{button}</button>
+    <div class="alt">{alt}</div>
+  </form>
+</body></html>"""
+
+
+def _auth_page(title, heading, subtitle, action, fields, button, alt, error=""):
+    err_html = f'<div class="err">{error}</div>' if error else ""
+    return _AUTH_PAGE.format(
+        title=title, heading=heading, subtitle=subtitle, action=action,
+        fields=fields, button=button, alt=alt, error=err_html,
+    )
 
 
 def _check_dashboard_auth():
@@ -7467,9 +7592,104 @@ _NO_CACHE_HTML = {
 
 @app.before_request
 def _enforce_dashboard_auth():
-    if request.path == "/api/ingest":
+    p = request.path
+    # Ingest authenticates itself with a Bearer token inside the view; static
+    # assets carry no secrets.
+    if p == "/api/ingest" or p.startswith("/static/"):
         return None
+    if MULTI_TENANT:
+        # Login/register pages must be reachable without a session.
+        if p in ("/login", "/register", "/logout"):
+            return None
+        if current_user() is None:
+            # API callers get a clean 401; browsers get bounced to the form.
+            if p.startswith("/api/"):
+                return jsonify({"error": "login required"}), 401
+            return redirect("/login")
+        return None
+    # Single-tenant: legacy shared-password Basic Auth (no-op if unset).
     return _check_dashboard_auth()
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not MULTI_TENANT:
+        return redirect("/")
+    if current_user():
+        return redirect("/")
+    error = ""
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()
+        password = request.form.get("password") or ""
+        user = _db.get_user_by_email(email) if _db else None
+        # Always run a hash check (even on unknown email) so response time
+        # doesn't reveal whether the address exists.
+        ref_hash = user["pw_hash"] if user else _DUMMY_PW_HASH
+        if check_password_hash(ref_hash, password) and user:
+            session.clear()
+            session["uid"] = user["id"]
+            session.permanent = True
+            return redirect("/")
+        error = "Invalid email or password."
+    fields = ('<label>Email</label><input type="email" name="email" required autofocus>'
+              '<label>Password</label><input type="password" name="password" required>')
+    alt = ('Need an account? <a href="/register">Register</a>'
+           if SIGNUP_CODE else 'Registration is closed.')
+    return _auth_page("Sign in", "Sign in", "Connection Monitor", "/login",
+                      fields, "Sign in", alt, error)
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if not MULTI_TENANT:
+        return redirect("/")
+    if not SIGNUP_CODE:
+        return _auth_page(
+            "Registration closed", "Registration closed",
+            "Ask the server owner for an account.", "/register", "", "",
+            '<a href="/login">Back to sign in</a>',
+            error="Registration is not open on this server."), 403
+    if current_user():
+        return redirect("/")
+    error = ""
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()
+        handle = (request.form.get("handle") or "").strip()
+        password = request.form.get("password") or ""
+        code = request.form.get("code") or ""
+        if not hmac.compare_digest(code, SIGNUP_CODE):
+            error = "Invalid invite code."
+        elif not _valid_email(email):
+            error = "Enter a valid email address."
+        elif len(password) < 8:
+            error = "Password must be at least 8 characters."
+        elif not handle:
+            error = "Choose a display name."
+        else:
+            # First account on a fresh server becomes the admin.
+            is_admin = (_db.count_users() == 0) if _db else False
+            uid = _db.create_user(email, _hash_password(password),
+                                  handle, is_admin) if _db else None
+            if uid is None:
+                error = "An account with that email already exists."
+            else:
+                session.clear()
+                session["uid"] = uid
+                session.permanent = True
+                return redirect("/")
+    fields = ('<label>Email</label><input type="email" name="email" required autofocus>'
+              '<label>Display name</label><input type="text" name="handle" required maxlength="40">'
+              '<label>Password</label><input type="password" name="password" required minlength="8">'
+              '<label>Invite code</label><input type="text" name="code" required>')
+    alt = 'Have an account? <a href="/login">Sign in</a>'
+    return _auth_page("Register", "Create account", "Connection Monitor", "/register",
+                      fields, "Create account", alt, error)
+
+
+@app.route("/logout", methods=["GET", "POST"])
+def logout():
+    session.clear()
+    return redirect("/login" if MULTI_TENANT else "/")
 
 
 @app.route("/")
@@ -8154,6 +8374,7 @@ def _init_db() -> None:
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     _db = db.Storage(db_path)
     _db.init_schema()
+    _init_session_secret()
     try:
         deleted = _db.prune(db.retention_from_env())
         total = sum(deleted.values())

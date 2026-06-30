@@ -145,6 +145,18 @@ CREATE TABLE IF NOT EXISTS networks (
     first_seen     TEXT NOT NULL,
     last_seen      TEXT NOT NULL
 );
+
+-- Multi-tenant accounts (cloud/server role only). Empty on single-tenant
+-- installs. pw_hash is a salted KDF digest produced in the app layer
+-- (werkzeug.security); this layer never sees plaintext passwords.
+CREATE TABLE IF NOT EXISTS users (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    email      TEXT NOT NULL UNIQUE,
+    pw_hash    TEXT NOT NULL,
+    handle     TEXT NOT NULL,
+    is_admin   INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -436,6 +448,47 @@ class Storage:
                 (monitor_host, now_iso, now_iso),
             )
             self._conn.commit()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Users (multi-tenant accounts; empty on single-tenant installs)
+    # ──────────────────────────────────────────────────────────────────────
+    def count_users(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
+        return int(row["n"]) if row else 0
+
+    def create_user(self, email: str, pw_hash: str, handle: str,
+                    is_admin: bool = False) -> Optional[int]:
+        """Insert a user. Returns the new id, or None if the email already exists."""
+        now_iso = datetime.now().isoformat()
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "INSERT INTO users(email, pw_hash, handle, is_admin, created_at) "
+                    "VALUES(?, ?, ?, ?, ?)",
+                    (email, pw_hash, handle, 1 if is_admin else 0, now_iso),
+                )
+                self._conn.commit()
+                return int(cur.lastrowid)
+            except sqlite3.IntegrityError:
+                self._conn.rollback()
+                return None
+
+    def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, email, pw_hash, handle, is_admin, created_at "
+                "FROM users WHERE email = ?", (email,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_user_by_id(self, user_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, email, pw_hash, handle, is_admin, created_at "
+                "FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+        return dict(row) if row else None
 
     def close(self) -> None:
         with self._lock:
