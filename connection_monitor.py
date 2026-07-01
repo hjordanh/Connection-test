@@ -4238,7 +4238,7 @@ function networkDisplayName(fp) {
   if (!fp) return '—';
   const names = lastData?.network_names || {};
   if (names[fp]) return names[fp];
-  if (!/^\d+\.\d+\.\d+\.\d+\/\d+$/.test(fp)) return fp;
+  if (!/^\\d+\\.\\d+\\.\\d+\\.\\d+\\/\\d+$/.test(fp)) return fp;
   return 'Unnamed Wi-Fi';
 }
 
@@ -4454,7 +4454,7 @@ function update(d) {
       // as untrusted. Quotes are escaped too since host lands in an attribute.
       const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g,
         c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-      const displayName = esc(s.name || s.host.replace(/^www\./, ''));
+      const displayName = esc(s.name || s.host.replace(/^www\\./, ''));
       const hostEsc = esc(s.host);
       return `<div class="site-tile ${colorCls}" data-host="${hostEsc}" title="Click for ping history">
         <div class="site-tile-host">${displayName}</div>
@@ -5333,7 +5333,7 @@ let _logNetNames = {};
 function networkDisplayName(fp) {
   if (!fp) return '—';
   if (_logNetNames[fp]) return _logNetNames[fp];
-  if (!/^\d+\.\d+\.\d+\.\d+\/\d+$/.test(fp)) return fp;
+  if (!/^\\d+\\.\\d+\\.\\d+\\.\\d+\\/\\d+$/.test(fp)) return fp;
   return 'Unnamed Wi-Fi';
 }
 
@@ -8434,7 +8434,14 @@ def main() -> None:
     if SPEEDTEST_AVAILABLE and not DISABLE_SPEED_TESTS:
         state.log("speedtest-cli detected — using for measurements", "info")
 
-    mode_label = "aggregator" if AGGREGATOR else ("collector" if SERVER_URL else "standalone")
+    if MULTI_TENANT:
+        mode_label = "server · multi-tenant"
+    elif AGGREGATOR:
+        mode_label = "aggregator"
+    elif SERVER_URL:
+        mode_label = "collector"
+    else:
+        mode_label = "standalone"
     print(f"\n  Connection Monitor ({mode_label})")
     print(f"  Host      → {MONITOR_HOST}")
     print(f"  Dashboard → http://localhost:{PORT}  (bind {BIND_HOST})")
