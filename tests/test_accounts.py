@@ -57,12 +57,14 @@ def test_api_requires_login(mt):
     assert r.status_code == 401 and r.get_json()["error"] == "login required"
 
 
-def test_healthz_and_ingest_bypass_login(mt):
+def test_healthz_and_ingest_bypass_session(mt):
     c = mt.app.test_client()
     assert c.get("/healthz").status_code == 200
-    # No INGEST_API_KEY set → ingest reaches its handler (400 missing host),
-    # proving it isn't blocked by the login guard.
-    assert c.post("/api/ingest", json={}).status_code != 401
+    # Ingest is exempt from the login-session guard: an unauthenticated call
+    # gets the token-auth 401 (JSON), not a 302 redirect to /login.
+    r = c.post("/api/ingest", json={})
+    assert r.status_code == 401
+    assert r.get_json()["error"] == "missing API token"
 
 
 # ── Registration + login flow ────────────────────────────────────────────────

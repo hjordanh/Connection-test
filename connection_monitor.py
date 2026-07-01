@@ -21,6 +21,7 @@ import logging
 import statistics
 import subprocess
 import hmac
+import hashlib
 import secrets
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -116,6 +117,7 @@ except ImportError:
 # Werkzeug ships with Flask; its security helpers give a salted KDF for
 # password hashing (no extra dependency, no hand-rolled crypto).
 from werkzeug.security import generate_password_hash, check_password_hash
+from markupsafe import escape as _esc  # ships with Flask; HTML-escapes untrusted text
 
 # Load configuration from connection_monitor.env (next to this script) before
 # reading any constants. Existing shell environment variables take precedence —
@@ -180,6 +182,19 @@ SIGNUP_CODE            = os.environ.get("SIGNUP_CODE", "")
 # Secret used to sign session cookies. If unset, a random one is generated
 # once and persisted in the DB (meta table) so logins survive restarts.
 SECRET_KEY             = os.environ.get("SECRET_KEY", "")
+# Ingest hardening (the endpoint is internet-facing on the cloud server).
+# Max request body — big enough for a first historical sync (up to 30 days),
+# bounded so a single push can't exhaust memory/disk.
+try:
+    INGEST_MAX_MB = max(1, int(float(os.environ.get("INGEST_MAX_MB", "25"))))
+except ValueError:
+    INGEST_MAX_MB = 25
+# Minimum seconds between accepted pushes per agent token (agents push ~60s;
+# this throttles floods without affecting normal operation).
+try:
+    INGEST_MIN_INTERVAL_S = max(0, int(float(os.environ.get("INGEST_MIN_INTERVAL_S", "20"))))
+except ValueError:
+    INGEST_MIN_INTERVAL_S = 20
 
 # Degraded-period detection thresholds (tuning knobs, not deployment config).
 # ─────────────────────────────────────────────────────────────
@@ -7190,6 +7205,8 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=MULTI_TENANT and not _allow_insecure_cookies,
+    # Reject oversized request bodies (Flask returns 413 automatically).
+    MAX_CONTENT_LENGTH=INGEST_MAX_MB * 1024 * 1024,
 )
 
 _state: Optional[MonitorState] = None
@@ -7322,15 +7339,57 @@ def _check_dashboard_auth():
     )
 
 
-def _check_api_key():
-    """Return a 401 Response if ingest auth is configured and the request
-    doesn't carry a valid Bearer token. Returns None if OK."""
+def _hash_token(token: str) -> str:
+    """Fast hash for agent-token lookup. Safe as a plain SHA-256 because tokens
+    are high-entropy random strings (unlike passwords, which need a slow KDF)."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _bearer_token() -> str:
+    auth = request.headers.get("Authorization", "")
+    return auth[7:] if auth.startswith("Bearer ") else ""
+
+
+def _resolve_ingest_identity():
+    """Authenticate an ingest request and decide the stored monitor_host.
+
+    Returns (host_override, error). On success `error` is None and
+    `host_override` is the monitor_host to force ("" means "trust the body's
+    monitor_host", used only in single-tenant mode). On failure `error` is a
+    (json, status) tuple.
+
+    Multi-tenant: the Bearer value is a per-agent token bound server-side to
+    one owner + host, so the caller can only ever write as its own namespaced
+    host ("<user_id>:<host>") — it cannot impersonate another user.
+    Single-tenant: the legacy shared INGEST_API_KEY (or open, if unset).
+    """
+    if MULTI_TENANT:
+        token = _bearer_token()
+        if not token:
+            return None, (jsonify({"error": "missing API token"}), 401)
+        token_hash = _hash_token(token)
+        rec = _db.get_agent_token_by_hash(token_hash) if _db else None
+        if not rec or rec["revoked"]:
+            return None, (jsonify({"error": "invalid or revoked API token"}), 401)
+        # Per-token flood throttle: reject pushes that arrive faster than the
+        # configured floor (normal agents push every ~60s).
+        if INGEST_MIN_INTERVAL_S and rec.get("last_used"):
+            try:
+                since = (datetime.now()
+                         - datetime.fromisoformat(rec["last_used"])).total_seconds()
+                if 0 <= since < INGEST_MIN_INTERVAL_S:
+                    return None, (jsonify({"error": "too many requests"}), 429)
+            except (TypeError, ValueError):
+                pass
+        _db.touch_agent_token(token_hash)
+        return f'{rec["user_id"]}:{rec["monitor_host"]}', None
+    # Single-tenant behaviour (unchanged).
     if not INGEST_API_KEY:
-        return None
-    auth_header = request.headers.get("Authorization", "")
-    if hmac.compare_digest(auth_header, f"Bearer {INGEST_API_KEY}"):
-        return None
-    return jsonify({"error": "invalid or missing API key"}), 401
+        return "", None
+    if hmac.compare_digest(request.headers.get("Authorization", ""),
+                           f"Bearer {INGEST_API_KEY}"):
+        return "", None
+    return None, (jsonify({"error": "invalid or missing API key"}), 401)
 
 
 # Browsers were caching the page HTML and serving stale *inline* JS even after
@@ -7709,6 +7768,137 @@ def healthz():
     return "ok", 200
 
 
+def _valid_host_label(h: str) -> bool:
+    return bool(h) and len(h) <= 60 and all(c.isalnum() or c in "-._" for c in h)
+
+
+_MACHINES_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Machines · Connection Monitor</title>
+<style>
+  :root {{ --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#e6edf3;
+           --dim:#8b949e; --green:#3fb950; --red:#f85149; }}
+  * {{ box-sizing:border-box; }}
+  body {{ background:var(--bg); color:var(--text); font-family:-apple-system,
+          BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:0; padding:24px; }}
+  .wrap {{ max-width:760px; margin:0 auto; }}
+  header {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; }}
+  h1 {{ font-size:20px; margin:0; }}
+  a {{ color:var(--green); text-decoration:none; }}
+  .card {{ background:var(--card); border:1px solid var(--border); border-radius:10px;
+           padding:20px; margin-bottom:18px; }}
+  table {{ width:100%; border-collapse:collapse; font-size:13px; }}
+  th, td {{ text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); }}
+  th {{ color:var(--dim); font-weight:500; }}
+  .revoked {{ color:var(--dim); text-decoration:line-through; }}
+  label {{ display:block; font-size:12px; color:var(--dim); margin:10px 0 4px; }}
+  input {{ width:100%; padding:8px 10px; background:var(--bg); color:var(--text);
+           border:1px solid var(--border); border-radius:6px; font-size:14px; }}
+  button {{ margin-top:14px; padding:8px 14px; background:var(--green); color:#06210d;
+            border:none; border-radius:6px; font-size:13px; font-weight:600; cursor:pointer; }}
+  button.revoke {{ background:transparent; color:var(--red); border:1px solid var(--red);
+                   margin:0; padding:4px 10px; font-weight:500; }}
+  .token-box {{ background:rgba(63,185,80,0.1); border:1px solid var(--green);
+                border-radius:8px; padding:14px; margin-bottom:18px; }}
+  code, pre {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }}
+  pre {{ background:var(--bg); border:1px solid var(--border); border-radius:6px;
+         padding:10px; overflow-x:auto; white-space:pre-wrap; word-break:break-all; }}
+  .err {{ background:rgba(248,81,73,0.12); border:1px solid var(--red); color:var(--red);
+          padding:9px 11px; border-radius:6px; font-size:13px; margin-bottom:16px; }}
+</style></head>
+<body><div class="wrap">
+  <header>
+    <h1>Machines</h1>
+    <div><a href="/">← Dashboard</a> &nbsp; <a href="/logout">Sign out</a></div>
+  </header>
+  {token_box}
+  {error}
+  <div class="card">
+    <table>
+      <tr><th>Machine</th><th>Label</th><th>Last seen</th><th>Status</th><th></th></tr>
+      {rows}
+    </table>
+  </div>
+  <div class="card">
+    <h1 style="font-size:15px;">Add a machine</h1>
+    <p style="color:var(--dim); font-size:13px;">Generates an enrollment token
+       for one agent. The token is shown once.</p>
+    <form method="POST" action="/machines">
+      <label>Machine name (letters, digits, - . _)</label>
+      <input name="monitor_host" placeholder="jordans-macbook" required maxlength="60">
+      <label>Friendly label (optional)</label>
+      <input name="label" placeholder="Jordan's MacBook — home Wi-Fi" maxlength="80">
+      <button type="submit">Generate token</button>
+    </form>
+  </div>
+</div></body></html>"""
+
+
+def _render_machines(user, new_token=None, new_host=None, error=""):
+    tokens = _db.list_agent_tokens(user["id"]) if _db else []
+    rows = []
+    for t in tokens:
+        cls = ' class="revoked"' if t["revoked"] else ""
+        status = "revoked" if t["revoked"] else "active"
+        last = _esc(t["last_used"] or "never")
+        revoke_btn = "" if t["revoked"] else (
+            f'<form method="POST" action="/machines/{t["id"]}/revoke" '
+            f'style="margin:0;"><button class="revoke" type="submit">Revoke</button></form>')
+        rows.append(
+            f'<tr{cls}><td>{_esc(t["monitor_host"])}</td>'
+            f'<td>{_esc(t["label"] or "")}</td><td>{last}</td>'
+            f'<td>{status}</td><td>{revoke_btn}</td></tr>')
+    if not rows:
+        rows.append('<tr><td colspan="5" style="color:var(--dim);">No machines yet.</td></tr>')
+
+    token_box = ""
+    if new_token:
+        base = request.host_url.rstrip("/")
+        env_block = (f"SERVER_URL={base}\n"
+                     f"INGEST_API_KEY={new_token}\n"
+                     f"MONITOR_HOST={new_host}")
+        token_box = (
+            '<div class="token-box"><strong>Token for '
+            f'{_esc(new_host)}</strong> — copy it now, it won\'t be shown again.'
+            f'<pre>{_esc(env_block)}</pre>'
+            'Add these lines to <code>connection_monitor.env</code> on that '
+            'machine and restart the agent.</div>')
+    err_html = f'<div class="err">{_esc(error)}</div>' if error else ""
+    return _MACHINES_PAGE.format(
+        rows="\n".join(rows), token_box=token_box, error=err_html)
+
+
+@app.route("/machines", methods=["GET", "POST"])
+def machines():
+    if not MULTI_TENANT:
+        return redirect("/")
+    user = current_user()
+    if user is None:
+        return redirect("/login")
+    if request.method == "POST":
+        host_label = (request.form.get("monitor_host") or "").strip()
+        label = (request.form.get("label") or "").strip() or None
+        if not _valid_host_label(host_label):
+            return _render_machines(
+                user, error="Machine name must be 1–60 chars: letters, digits, - . _")
+        token = secrets.token_urlsafe(32)
+        _db.create_agent_token(user["id"], host_label, _hash_token(token), label)
+        return _render_machines(user, new_token=token, new_host=host_label)
+    return _render_machines(user)
+
+
+@app.route("/machines/<int:token_id>/revoke", methods=["POST"])
+def revoke_machine(token_id):
+    if not MULTI_TENANT:
+        return redirect("/")
+    user = current_user()
+    if user is None:
+        return redirect("/login")
+    _db.revoke_agent_token(token_id, user["id"])   # scoped to this user
+    return redirect("/machines")
+
+
 @app.route("/")
 def index():
     return _versioned(DASHBOARD_HTML), 200, _NO_CACHE_HTML
@@ -8019,42 +8209,66 @@ def api_network_rename():
 
 @app.route("/api/ingest", methods=["POST"])
 def api_ingest():
-    """Receive monitoring data pushed from a remote collector."""
-    auth_err = _check_api_key()
-    if auth_err:
-        return auth_err
+    """Receive monitoring data pushed from a remote agent.
+
+    In multi-tenant mode the stored monitor_host is derived from the agent
+    token (owner-bound), so a collector can only ever write as its own host.
+    """
     if _db is None:
         return jsonify({"error": "database not ready"}), 503
-    body = request.get_json(silent=True)
-    if not body:
-        return jsonify({"error": "JSON body required"}), 400
 
-    remote_host = (body.get("monitor_host") or "").strip()
+    host_override, err = _resolve_ingest_identity()
+    if err:
+        return err
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "JSON object body required"}), 400
+
+    # Owner-bound host wins; only single-tenant falls back to the body value.
+    remote_host = host_override or (body.get("monitor_host") or "").strip()
     if not remote_host:
         return jsonify({"error": "monitor_host required"}), 400
+
+    # Reject malformed payloads with a clear 400 rather than a generic 500.
+    def _pairs(key):
+        val = body.get(key, [])
+        if not isinstance(val, list):
+            raise ValueError(key)
+        return [(ts, v) for ts, v in val]
+
+    try:
+        if not isinstance(body.get("site_samples", {}), dict):
+            raise ValueError("site_samples")
+        site_samples = {
+            host: [(ts, v) for ts, v in samples]
+            for host, samples in body.get("site_samples", {}).items()
+        }
+        flush_kwargs = dict(
+            ping_samples=_pairs("ping_samples"),
+            accessibility_samples=_pairs("accessibility_samples"),
+            site_samples=site_samples,
+            speed_samples=body.get("speed_samples", []),
+            outages=body.get("outages", []),
+            degraded=body.get("degraded", []),
+            router_events=body.get("router_events", []),
+            diagnoses=body.get("diagnoses", []),
+            daily_summary=body.get("daily_summary", []),
+            network_uptime_secs=body.get("network_uptime_secs", {}),
+            network_colors=body.get("network_colors", {}),
+        )
+    except (ValueError, TypeError):
+        return jsonify({"error": "malformed payload"}), 400
 
     try:
         _db.flush(
             cursors=db.PersistCursors(),
-            ping_samples=[(ts, v) for ts, v in body.get("ping_samples", [])],
-            accessibility_samples=[(ts, v) for ts, v in body.get("accessibility_samples", [])],
-            site_samples={
-                host: [(ts, v) for ts, v in samples]
-                for host, samples in body.get("site_samples", {}).items()
-            },
-            speed_samples=body.get("speed_samples", []),
-            outages=body.get("outages", []),
             current_outage=None,
-            degraded=body.get("degraded", []),
-            router_events=body.get("router_events", []),
-            diagnoses=body.get("diagnoses", []),
             dismissed_outage_ids=set(body.get("dismissed_outage_ids", [])),
-            daily_summary=body.get("daily_summary", []),
-            network_uptime_secs=body.get("network_uptime_secs", {}),
-            network_colors=body.get("network_colors", {}),
             first_seen_iso=body.get("first_seen_iso", datetime.now().isoformat()),
             saved_at_iso=datetime.now().isoformat(),
             monitor_host_override=remote_host,
+            **flush_kwargs,
         )
         _db.update_host_seen(remote_host)
     except Exception as exc:

@@ -157,6 +157,22 @@ CREATE TABLE IF NOT EXISTS users (
     is_admin   INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
+
+-- Per-agent enrollment tokens. Each token is bound server-side to one owner
+-- and one host label, so ingest can force the stored monitor_host and one user
+-- can't push data as another. Only a hash of the token is stored (like a
+-- password); the plaintext is shown to the user once at creation.
+CREATE TABLE IF NOT EXISTS agent_tokens (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash   TEXT NOT NULL UNIQUE,
+    user_id      INTEGER NOT NULL,
+    monitor_host TEXT NOT NULL,
+    label        TEXT,
+    created_at   TEXT NOT NULL,
+    last_used    TEXT,
+    revoked      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_agent_tokens_user ON agent_tokens(user_id);
 """
 
 
@@ -489,6 +505,59 @@ class Storage:
                 "FROM users WHERE id = ?", (user_id,)
             ).fetchone()
         return dict(row) if row else None
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Agent tokens (per-agent ingest credentials, multi-tenant)
+    # ──────────────────────────────────────────────────────────────────────
+    def create_agent_token(self, user_id: int, monitor_host: str,
+                           token_hash: str, label: Optional[str] = None) -> int:
+        now_iso = datetime.now().isoformat()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO agent_tokens(token_hash, user_id, monitor_host, "
+                "label, created_at) VALUES(?, ?, ?, ?, ?)",
+                (token_hash, user_id, monitor_host, label, now_iso),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def get_agent_token_by_hash(self, token_hash: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, user_id, monitor_host, label, last_used, revoked "
+                "FROM agent_tokens WHERE token_hash = ?", (token_hash,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def touch_agent_token(self, token_hash: str) -> None:
+        now_iso = datetime.now().isoformat()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE agent_tokens SET last_used = ? WHERE token_hash = ?",
+                (now_iso, token_hash),
+            )
+            self._conn.commit()
+
+    def list_agent_tokens(self, user_id: int) -> List[Dict[str, Any]]:
+        """Tokens for a user, newest first. Never returns the hash/plaintext."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, monitor_host, label, created_at, last_used, revoked "
+                "FROM agent_tokens WHERE user_id = ? ORDER BY created_at DESC",
+                (user_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def revoke_agent_token(self, token_id: int, user_id: int) -> bool:
+        """Revoke a token, but only if it belongs to user_id."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE agent_tokens SET revoked = 1 "
+                "WHERE id = ? AND user_id = ?",
+                (token_id, user_id),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
 
     def close(self) -> None:
         with self._lock:
