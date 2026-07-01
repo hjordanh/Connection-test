@@ -199,6 +199,11 @@ def _ensure_anthropic():
         return
     except ImportError:
         pass
+    if os.environ.get("NO_AUTO_INSTALL", "").lower() in ("true", "1", "yes"):
+        raise RuntimeError(
+            "'anthropic' is not installed and NO_AUTO_INSTALL is set; "
+            "add it to requirements.txt to enable AI diagnosis in this deploy."
+        )
     print("Installing 'anthropic'…", flush=True)
     subprocess.check_call(
         [sys.executable, "-m", "pip", "install", "-q", "anthropic"],

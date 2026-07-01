@@ -1,0 +1,19 @@
+# Keep the build context small and secrets out of the image.
+.git
+.github
+.gitignore
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+docs/
+var/
+# Never bake secrets or local config into the image.
+*.env
+connection_monitor.env
+# Docs / meta not needed at runtime.
+*.md
+Dockerfile
+.dockerignore
+docker-compose.yml

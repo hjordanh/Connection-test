@@ -90,6 +90,17 @@ logging.basicConfig(
 # Auto-install Flask
 # ─────────────────────────────────────────────────────────────
 def _pip_install(pkg: str) -> None:
+    # In an immutable container (or any locked-down deploy) we must never
+    # pip-install at runtime — dependencies come from the image's
+    # requirements.txt. NO_AUTO_INSTALL=1 (set in the Dockerfile) turns the
+    # convenience auto-install into a clear, fail-fast error. Native installs
+    # leave it unset and keep the auto-install behaviour.
+    if os.environ.get("NO_AUTO_INSTALL", "").lower() in ("true", "1", "yes"):
+        sys.stderr.write(
+            f"Missing dependency {pkg!r} and NO_AUTO_INSTALL is set. "
+            f"Install dependencies with: pip install -r requirements.txt\n"
+        )
+        sys.exit(1)
     import subprocess
     print(f"Installing {pkg!r}…", flush=True)
     subprocess.check_call(
@@ -7594,8 +7605,8 @@ _NO_CACHE_HTML = {
 def _enforce_dashboard_auth():
     p = request.path
     # Ingest authenticates itself with a Bearer token inside the view; static
-    # assets carry no secrets.
-    if p == "/api/ingest" or p.startswith("/static/"):
+    # assets carry no secrets; /healthz must answer for container/LB probes.
+    if p == "/api/ingest" or p == "/healthz" or p.startswith("/static/"):
         return None
     if MULTI_TENANT:
         # Login/register pages must be reachable without a session.
@@ -7690,6 +7701,12 @@ def register():
 def logout():
     session.clear()
     return redirect("/login" if MULTI_TENANT else "/")
+
+
+@app.route("/healthz")
+def healthz():
+    """Unauthenticated liveness probe for containers / load balancers."""
+    return "ok", 200
 
 
 @app.route("/")
@@ -8426,10 +8443,11 @@ def main() -> None:
     # Loud warning if the dashboard is reachable beyond loopback with no
     # password — that exposes every endpoint (including the mutating ones) to
     # anyone on the network.
-    if BIND_HOST not in ("127.0.0.1", "localhost", "::1") and not DASHBOARD_USER:
+    if (BIND_HOST not in ("127.0.0.1", "localhost", "::1")
+            and not DASHBOARD_USER and not MULTI_TENANT):
         print(f"  ⚠  WARNING: binding to {BIND_HOST} with no DASHBOARD_USER set —")
         print(f"     the dashboard is exposed to your whole network without a password.")
-        print(f"     Set DASHBOARD_USER/DASHBOARD_PASS, or use BIND_HOST=127.0.0.1.")
+        print(f"     Set DASHBOARD_USER/DASHBOARD_PASS, enable MULTI_TENANT, or use BIND_HOST=127.0.0.1.")
     print(f"  Stop      → Ctrl+C\n", flush=True)
 
     try:

@@ -1,0 +1,24 @@
+# Minimal compose for running the server image locally or on a single
+# instance. TLS termination (Caddy) is added in the cloud-deploy phase; on its
+# own this exposes the dashboard on the host's port 8765.
+#
+#   cp connection_monitor.env.example connection_monitor.env   # then edit
+#   docker compose up -d
+services:
+  monitor:
+    build: .
+    image: ghcr.io/hjordanh/connection-test:latest
+    restart: unless-stopped
+    env_file:
+      - connection_monitor.env
+    environment:
+      # Server role: per-user accounts, ingest enabled.
+      MULTI_TENANT: "true"
+    ports:
+      - "8765:8765"
+    volumes:
+      # Persist the SQLite DB + WAL across restarts/redeploys.
+      - monitor-data:/app/var
+
+volumes:
+  monitor-data:
