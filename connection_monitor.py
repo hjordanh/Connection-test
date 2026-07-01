@@ -7273,6 +7273,54 @@ def current_user():
     return _db.get_user_by_id(uid)
 
 
+def _csrf_token() -> str:
+    """Per-session CSRF token, created on first use. Embedded as a hidden field
+    in every session-authenticated form and checked on POST."""
+    tok = session.get("csrf")
+    if not tok:
+        tok = secrets.token_urlsafe(32)
+        session["csrf"] = tok
+    return tok
+
+
+def _require_csrf():
+    """Return a 400 response if the form's CSRF token is missing/wrong, else None.
+    SameSite=Lax cookies already blunt cross-site POSTs; this closes the gap."""
+    submitted = request.form.get("csrf", "")
+    expected = session.get("csrf", "")
+    if expected and hmac.compare_digest(submitted, expected):
+        return None
+    return ("Invalid or expired form token. Go back, reload, and try again.", 400)
+
+
+# ── Per-user data isolation (multi-tenant) ────────────────────────────────────
+# Ingested rows are namespaced "<user_id>:<host>" (see _resolve_ingest_identity),
+# so a user's data is exactly the hosts sharing their id prefix.
+def _user_hosts(user) -> list:
+    pfx = f'{user["id"]}:'
+    return [h for h in _db.load_hosts() if h["monitor_host"].startswith(pfx)]
+
+
+def _resolve_user_host(user, requested: str):
+    """Pick which of `user`'s hosts to render. Returns a monitor_host string, or
+    False if `requested` isn't owned by the user (caller should 404). When the
+    user has no data, returns the bare prefix, which matches no rows → empty."""
+    pfx = f'{user["id"]}:'
+    if requested:
+        return requested if requested.startswith(pfx) else False
+    hosts = _user_hosts(user)          # load_hosts orders by last_seen desc
+    return hosts[0]["monitor_host"] if hosts else pfx
+
+
+def _mt_block():
+    """In multi-tenant mode, endpoints backed by the server's own live _state
+    (not per-user DB data) are not served — the full per-machine dashboard lives
+    on each user's native agent. Returns a response, or None to proceed."""
+    if MULTI_TENANT:
+        return jsonify({"error": "not available on the cloud dashboard"}), 404
+    return None
+
+
 # Self-contained styled page for login/register (the dashboard's CSS vars live
 # inside DASHBOARD_HTML, so these pages carry their own copy of the palette to
 # stay visually consistent).
@@ -7305,6 +7353,7 @@ _AUTH_PAGE = """<!DOCTYPE html>
 </style></head>
 <body>
   <form class="card" method="POST" action="{action}">
+    <input type="hidden" name="csrf" value="{csrf}">
     <h1>{heading}</h1>
     <p class="sub">{subtitle}</p>
     {error}
@@ -7320,6 +7369,7 @@ def _auth_page(title, heading, subtitle, action, fields, button, alt, error=""):
     return _AUTH_PAGE.format(
         title=title, heading=heading, subtitle=subtitle, action=action,
         fields=fields, button=button, alt=alt, error=err_html,
+        csrf=_csrf_token(),
     )
 
 
@@ -7660,6 +7710,17 @@ _NO_CACHE_HTML = {
 }
 
 
+# Endpoints backed by the server's own live _state (not per-user DB data) are
+# not served on the multi-tenant cloud dashboard — the full per-machine view
+# lives on each user's native agent. The cloud offers the /compare leaderboard
+# plus the user's own synced summary (/api/state, /api/hosts).
+_MT_BLOCKED_PATHS = frozenset({
+    "/log", "/diagnose",
+    "/api/log", "/api/site_history", "/api/diagnose", "/api/diagnoses",
+    "/api/dismiss", "/api/network/rename", "/api/timeline",
+})
+
+
 @app.before_request
 def _enforce_dashboard_auth():
     p = request.path
@@ -7676,6 +7737,11 @@ def _enforce_dashboard_auth():
             if p.startswith("/api/"):
                 return jsonify({"error": "login required"}), 401
             return redirect("/login")
+        # Logged in: the cloud home is the leaderboard, not the local dashboard.
+        if p == "/":
+            return redirect("/compare")
+        if p in _MT_BLOCKED_PATHS or p.startswith("/api/diagnoses/"):
+            return jsonify({"error": "not available on the cloud dashboard"}), 404
         return None
     # Single-tenant: legacy shared-password Basic Auth (no-op if unset).
     return _check_dashboard_auth()
@@ -7689,6 +7755,9 @@ def login():
         return redirect("/")
     error = ""
     if request.method == "POST":
+        bad = _require_csrf()
+        if bad:
+            return bad
         email = (request.form.get("email") or "").strip().lower()
         password = request.form.get("password") or ""
         user = _db.get_user_by_email(email) if _db else None
@@ -7723,6 +7792,9 @@ def register():
         return redirect("/")
     error = ""
     if request.method == "POST":
+        bad = _require_csrf()
+        if bad:
+            return bad
         email = (request.form.get("email") or "").strip().lower()
         handle = (request.form.get("handle") or "").strip()
         password = request.form.get("password") or ""
@@ -7825,6 +7897,7 @@ _MACHINES_PAGE = """<!DOCTYPE html>
     <p style="color:var(--dim); font-size:13px;">Generates an enrollment token
        for one agent. The token is shown once.</p>
     <form method="POST" action="/machines">
+      <input type="hidden" name="csrf" value="{csrf}">
       <label>Machine name (letters, digits, - . _)</label>
       <input name="monitor_host" placeholder="jordans-macbook" required maxlength="60">
       <label>Friendly label (optional)</label>
@@ -7843,8 +7916,9 @@ def _render_machines(user, new_token=None, new_host=None, error=""):
         status = "revoked" if t["revoked"] else "active"
         last = _esc(t["last_used"] or "never")
         revoke_btn = "" if t["revoked"] else (
-            f'<form method="POST" action="/machines/{t["id"]}/revoke" '
-            f'style="margin:0;"><button class="revoke" type="submit">Revoke</button></form>')
+            f'<form method="POST" action="/machines/{t["id"]}/revoke" style="margin:0;">'
+            f'<input type="hidden" name="csrf" value="{_csrf_token()}">'
+            f'<button class="revoke" type="submit">Revoke</button></form>')
         rows.append(
             f'<tr{cls}><td>{_esc(t["monitor_host"])}</td>'
             f'<td>{_esc(t["label"] or "")}</td><td>{last}</td>'
@@ -7866,7 +7940,8 @@ def _render_machines(user, new_token=None, new_host=None, error=""):
             'machine and restart the agent.</div>')
     err_html = f'<div class="err">{_esc(error)}</div>' if error else ""
     return _MACHINES_PAGE.format(
-        rows="\n".join(rows), token_box=token_box, error=err_html)
+        rows="\n".join(rows), token_box=token_box, error=err_html,
+        csrf=_csrf_token())
 
 
 @app.route("/machines", methods=["GET", "POST"])
@@ -7877,6 +7952,9 @@ def machines():
     if user is None:
         return redirect("/login")
     if request.method == "POST":
+        bad = _require_csrf()
+        if bad:
+            return bad
         host_label = (request.form.get("monitor_host") or "").strip()
         label = (request.form.get("label") or "").strip() or None
         if not _valid_host_label(host_label):
@@ -7895,8 +7973,146 @@ def revoke_machine(token_id):
     user = current_user()
     if user is None:
         return redirect("/login")
+    bad = _require_csrf()
+    if bad:
+        return bad
     _db.revoke_agent_token(token_id, user["id"])   # scoped to this user
     return redirect("/machines")
+
+
+# ── Group comparison leaderboard (multi-tenant) ───────────────────────────────
+def _safe_metrics_for_host(host: str, now: datetime, cut24: str) -> dict:
+    """Non-sensitive 24h metrics for one namespaced host. Deliberately excludes
+    IP/subnet fingerprints, network labels, router-log events, and diagnosis
+    text — only aggregate quality numbers are shared with the group."""
+    pings = _db.load_ping_samples(cut24, monitor_host=host)
+    vals = sorted(p for _, p in pings if p is not None)
+    total = len(pings)
+    speeds = _db.load_speed_values_exact(cut24, host)
+    dls = sorted(d for d, _ in speeds if d is not None)
+    uls = sorted(u for _, u in speeds if u is not None)
+    outages = _db.load_outages(cut24, monitor_host=host)
+    return {
+        "uptime_pct": round(100.0 * len(vals) / total, 1) if total else None,
+        "ping_p50": round(_percentile(vals, 50), 1) if vals else None,
+        "ping_p90": round(_percentile(vals, 90), 1) if vals else None,
+        "download_mbps": round(_percentile(dls, 50), 1) if dls else None,
+        "upload_mbps": round(_percentile(uls, 50), 1) if uls else None,
+        "outages": len(outages),
+        "samples": total,
+    }
+
+
+@app.route("/api/compare")
+def api_compare():
+    """Safe-metrics leaderboard across the whole group (all users' machines)."""
+    if not MULTI_TENANT or _db is None:
+        return jsonify({"error": "not available"}), 404
+    user = current_user()
+    if user is None:
+        return jsonify({"error": "login required"}), 401
+    now = datetime.now()
+    cut24 = (now - _24H).isoformat()
+    handle_cache: Dict[int, str] = {}
+    rows = []
+    for h in _db.load_hosts():
+        mh = h["monitor_host"]
+        uid_str, sep, machine = mh.partition(":")
+        if not sep:
+            continue  # server's own control host (not namespaced) — skip
+        try:
+            uid = int(uid_str)
+        except ValueError:
+            continue
+        if uid not in handle_cache:
+            u = _db.get_user_by_id(uid)
+            handle_cache[uid] = u["handle"] if u else f"user{uid}"
+        row = {"handle": handle_cache[uid], "machine": machine,
+               "is_you": uid == user["id"], "last_seen": h.get("last_seen")}
+        row.update(_safe_metrics_for_host(mh, now, cut24))
+        rows.append(row)
+    # Best uptime first, then lowest median ping.
+    rows.sort(key=lambda r: (-(r["uptime_pct"] or 0), r["ping_p50"] or 9e9))
+    return jsonify({"hosts": rows, "generated_at": now.isoformat()})
+
+
+_COMPARE_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compare · Connection Monitor</title>
+<style>
+  :root { --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#e6edf3;
+          --dim:#8b949e; --green:#3fb950; --red:#f85149; --yellow:#d29922; }
+  * { box-sizing:border-box; }
+  body { background:var(--bg); color:var(--text); font-family:-apple-system,
+         BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:0; padding:24px; }
+  .wrap { max-width:900px; margin:0 auto; }
+  header { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+  h1 { font-size:20px; margin:0; }
+  a { color:var(--green); text-decoration:none; }
+  .sub { color:var(--dim); font-size:13px; margin:0 0 18px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px;
+          padding:6px 4px; overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:right; padding:10px 12px; border-bottom:1px solid var(--border); white-space:nowrap; }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align:left; }
+  th { color:var(--dim); font-weight:500; }
+  tr:last-child td { border-bottom:none; }
+  tr.you { background:rgba(63,185,80,0.08); }
+  .you-tag { color:var(--green); font-size:11px; margin-left:6px; }
+  .g { color:var(--green); } .y { color:var(--yellow); } .r { color:var(--red); }
+  .muted { color:var(--dim); }
+</style></head>
+<body><div class="wrap">
+  <header>
+    <h1>Internet Leaderboard</h1>
+    <div><a href="/machines">Machines</a> &nbsp; <a href="/logout">Sign out</a></div>
+  </header>
+  <p class="sub">Last 24 hours across everyone's machines. Updates every 30s.</p>
+  <div class="card"><table id="board"><thead><tr>
+    <th>Who</th><th>Machine</th><th>Uptime</th><th>Ping p50</th><th>Ping p90</th>
+    <th>Down</th><th>Up</th><th>Outages</th>
+  </tr></thead><tbody id="rows"></tbody></table></div>
+  <p class="sub" id="foot"></p>
+</div>
+<script>
+function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function upCls(p){ if(p==null) return 'muted'; return p>=99?'g':p>=95?'y':'r'; }
+function num(v,unit){ return v==null?'<span class="muted">—</span>':(v+(unit||'')); }
+async function load(){
+  let d;
+  try { const r = await fetch('/api/compare'); if(!r.ok) throw 0; d = await r.json(); }
+  catch(e){ document.getElementById('foot').textContent='Failed to load.'; return; }
+  const tb = document.getElementById('rows'); tb.innerHTML='';
+  if(!d.hosts.length){ tb.innerHTML='<tr><td colspan="8" class="muted">No machines have reported yet. Add one under Machines.</td></tr>'; return; }
+  for(const h of d.hosts){
+    const tr = document.createElement('tr');
+    if(h.is_you) tr.className='you';
+    tr.innerHTML =
+      '<td>'+esc(h.handle)+(h.is_you?'<span class="you-tag">you</span>':'')+'</td>'+
+      '<td>'+esc(h.machine)+'</td>'+
+      '<td class="'+upCls(h.uptime_pct)+'">'+num(h.uptime_pct,'%')+'</td>'+
+      '<td>'+num(h.ping_p50,' ms')+'</td>'+
+      '<td>'+num(h.ping_p90,' ms')+'</td>'+
+      '<td>'+num(h.download_mbps,'')+'</td>'+
+      '<td>'+num(h.upload_mbps,'')+'</td>'+
+      '<td>'+(h.outages||0)+'</td>';
+    tb.appendChild(tr);
+  }
+  document.getElementById('foot').textContent = 'Updated ' + new Date(d.generated_at).toLocaleTimeString();
+}
+load(); setInterval(load, 30000);
+</script>
+</body></html>"""
+
+
+@app.route("/compare")
+def compare_page():
+    if not MULTI_TENANT:
+        return redirect("/")
+    if current_user() is None:
+        return redirect("/login")
+    return _COMPARE_HTML, 200, _NO_CACHE_HTML
 
 
 @app.route("/")
@@ -7907,6 +8123,19 @@ def index():
 @app.route("/api/state")
 def api_state():
     host_param = request.args.get("host", "").strip()
+    if MULTI_TENANT and _db is not None:
+        # Only ever serve the logged-in user's own hosts.
+        user = current_user()
+        if user is None:
+            return jsonify({"error": "login required"}), 401
+        host = _resolve_user_host(user, host_param)
+        if host is False:
+            return jsonify({"error": "not found"}), 404
+        result = state_from_db(_db, monitor_host=host)
+        if _state is not None:
+            result["control_ping_ms"] = _state.last_ping_ms
+            result["control_connected"] = _state.connected
+        return jsonify(result)
     if host_param and _db is not None:
         return jsonify(state_from_db(_db, monitor_host=host_param))
     if _is_aggregator() and not host_param and _db is not None:
@@ -8282,9 +8511,22 @@ def api_ingest():
 
 @app.route("/api/hosts")
 def api_hosts():
-    """List all known monitoring hosts and their last-seen timestamps."""
+    """List monitoring hosts and their last-seen timestamps.
+    In multi-tenant mode, only the logged-in user's own hosts, with the
+    "<user_id>:" prefix stripped from the display name."""
     if _db is None:
         return jsonify({"error": "database not ready"}), 503
+    if MULTI_TENANT:
+        user = current_user()
+        if user is None:
+            return jsonify({"error": "login required"}), 401
+        pfx = f'{user["id"]}:'
+        hosts = []
+        for h in _user_hosts(user):
+            h = dict(h)
+            h["display_name"] = h.get("display_name") or h["monitor_host"][len(pfx):]
+            hosts.append(h)
+        return jsonify({"hosts": hosts})
     return jsonify({"hosts": _db.load_hosts()})
 
 

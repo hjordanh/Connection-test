@@ -633,6 +633,19 @@ class Storage:
             for r in rows
         ]
 
+    def load_speed_values_exact(self, cutoff_iso: str, monitor_host: str
+                               ) -> List[Tuple[Optional[float], Optional[float]]]:
+        """(download, upload) pairs for one host, strict exact match — no legacy
+        monitor_host='' rows. Used for per-user leaderboard aggregates so a
+        user's numbers can't be polluted by the server's own control data."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT download_mbps, upload_mbps FROM speed_samples "
+                "WHERE ts >= ? AND monitor_host = ? ORDER BY ts",
+                (cutoff_iso, monitor_host),
+            ).fetchall()
+        return [(r["download_mbps"], r["upload_mbps"]) for r in rows]
+
     def load_outages(self, cutoff_iso: str, monitor_host: Optional[str] = None) -> List[Dict[str, Any]]:
         with self._lock:
             if monitor_host and monitor_host != "*":
