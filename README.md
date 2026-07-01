@@ -412,6 +412,18 @@ Historical data (up to 30 days) syncs automatically on first push — no manual 
 
 ---
 
+## Multi-tenant cloud server (accounts + leaderboard)
+
+The single-shared-key aggregator above assumes one owner with several of their own machines. For a **group of friends** each running their own agent and comparing results, run the server in **multi-tenant mode** (`MULTI_TENANT=true`). This turns on:
+
+- **Per-user accounts** — email + password login (no shared dashboard password); the first account registered becomes admin. Registration is gated by an invite code (`SIGNUP_CODE`).
+- **Per-agent tokens** — each person adds their machine under **`/machines`** to mint an enrollment token bound to their account. The token is what goes in the agent's `INGEST_API_KEY`. Ingested data is namespaced to the owner, so no one can push or read data as anyone else.
+- **`/compare` leaderboard** — the cloud home page: a group-wide table of *safe* 24h metrics (uptime %, ping p50/p90, download/upload medians, outage count) per machine. Sensitive details (IP/subnet fingerprints, network labels, router-log events, AI-diagnosis text) are deliberately **not** shared — the full per-machine dashboard stays on each person's local agent.
+
+Multi-tenant mode is off by default, so standalone and collector installs are unchanged. Configure it with `MULTI_TENANT`, `SIGNUP_CODE`, and `SECRET_KEY` (see `connection_monitor.env.example`). It runs as a container behind HTTPS; see **[docs/CLOUD_DEPLOYMENT.md](docs/CLOUD_DEPLOYMENT.md)** for the full GitHub Actions → GHCR → AWS (Lightsail/EC2 + Caddy) setup.
+
+---
+
 ## Data & privacy
 
 - All persistent data stays on your machine in `var/connection_monitor.db` (a local SQLite database). Nothing is sent to any cloud service unless you enable multi-host sync (by setting `SERVER_URL`), in which case monitoring data is pushed to your own VPS.

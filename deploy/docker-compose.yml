@@ -1,0 +1,39 @@
+# Production compose for the cloud server (lives at /opt/connection-monitor on
+# the instance). Caddy is the only service with published ports; the monitor is
+# reachable only via Caddy over the internal network.
+#
+# Requires, in the same directory:
+#   - Caddyfile          (from deploy/Caddyfile)
+#   - monitor.env        (secrets; see monitor.env.example — do NOT commit)
+#   - a .env with DOMAIN=monitor.example.com   (for Caddy + compose interpolation)
+services:
+  monitor:
+    image: ghcr.io/hjordanh/connection-test:latest
+    restart: unless-stopped
+    environment:
+      MULTI_TENANT: "true"
+    env_file:
+      - monitor.env
+    volumes:
+      - monitor-data:/app/var      # SQLite DB persists across redeploys
+    # No `ports:` — only Caddy reaches it, over the internal network.
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data           # persists issued certificates
+      - caddy-config:/config
+    depends_on:
+      - monitor
+
+volumes:
+  monitor-data:
+  caddy-data:
+  caddy-config:

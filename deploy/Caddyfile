@@ -1,0 +1,7 @@
+# Caddy terminates TLS (automatic Let's Encrypt) and reverse-proxies to the
+# monitor container over the internal Docker network. The monitor's own port is
+# never published to the host, so the app is only reachable through HTTPS here.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy monitor:8765
+}
